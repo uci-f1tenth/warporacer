@@ -779,7 +779,6 @@ def train(
     logp_b = torch.zeros((rollouts, N), device=device)
     rew_b = torch.zeros((rollouts, N), device=device)
     done_b = torch.zeros((rollouts, N), device=device)
-    term_b = torch.zeros((rollouts, N), device=device)
     val_b = torch.zeros((rollouts, N), device=device)
 
     raw, _ = env.reset()
@@ -807,7 +806,6 @@ def train(
                 ret_rms.update(raw_rew, done)
                 rew_b[t] = ret_rms.normalize(raw_rew)
                 done_b[t] = done
-                term_b[t] = term.float()
                 ep_ret.add_(raw_rew)
                 ep_len.add_(1.0)
                 fin = done.bool()
@@ -820,14 +818,16 @@ def train(
                 obs = obs_rms.normalize(raw)
             next_val = agent.value(obs)
 
-        # GAE
+        # GAE — the kernel resets terminated/truncated envs in-place, so the
+        # obs (and val_ext[t+1]) at a done step is the FRESH spawn of a new
+        # episode, not the dying state. Zero the bootstrap on any done so we
+        # don't credit the new episode's value to the old one's advantage.
         val_ext = torch.cat([val_b, next_val.unsqueeze(0)], 0)
         adv_b = torch.zeros_like(rew_b)
         last = torch.zeros_like(next_val)
         for t in reversed(range(rollouts)):
-            nonterm = 1.0 - term_b[t]
             nondone = 1.0 - done_b[t]
-            delta = rew_b[t] + gamma * val_ext[t + 1] * nonterm - val_b[t]
+            delta = rew_b[t] + gamma * val_ext[t + 1] * nondone - val_b[t]
             last = delta + gamma * gae_lambda * nondone * last
             adv_b[t] = last
         ret_b = adv_b + val_b
