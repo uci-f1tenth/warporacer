@@ -17,7 +17,7 @@ from cv2 import (
     imread,
     polylines,
 )
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import convolve, distance_transform_edt, label
 from scipy.signal import savgol_filter
 from scipy.spatial import KDTree
 from skimage.morphology import skeletonize
@@ -383,36 +383,60 @@ class Map:
             if 0 <= r + dr < h and 0 <= c + dc < w and skel[r + dr, c + dc]
         ]
 
+    @staticmethod
+    def _prune_endpoints(skel):
+        kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
+        skel = skel.copy()
+        while True:
+            counts = convolve(
+                skel.astype(np.uint8), kernel, mode="constant", cval=0
+            )
+            endpoints = skel & (counts <= 1)
+            if not endpoints.any():
+                break
+            skel &= ~endpoints
+        return skel
+
     def _compute_centerline(self, free):
-        skel = skeletonize(free)
+        skel = self._prune_endpoints(skeletonize(free))
+        # Keep the largest connected component — stray skeleton islands
+        # (often from noise outside the track) confuse the loop walk.
+        labels, n_lab = label(skel, structure=np.ones((3, 3), dtype=int))
+        if n_lab == 0:
+            raise RuntimeError("empty skeleton after pruning")
+        sizes = np.bincount(labels.ravel())
+        sizes[0] = 0
+        skel = labels == int(np.argmax(sizes))
+
         h, w = skel.shape
         pts = np.argwhere(skel)
         origin_px = np.array([self.h - 1 + self.oy / self.res, -self.ox / self.res])
         start = tuple(int(x) for x in pts[np.argmin(((pts - origin_px) ** 2).sum(1))])
-        nbrs = self._neighbors(skel, start[0], start[1], h, w)
-        if len(nbrs) < 2:
-            raise RuntimeError(f"Skeleton seed {start} has {len(nbrs)} neighbours")
-        src, target = nbrs[0], nbrs[1]
-        parent = {src: src}
-        q = deque([src])
-        while q:
-            r, c = q.popleft()
-            for nr, nc in self._neighbors(skel, r, c, h, w):
-                n = (nr, nc)
-                if n in parent or n == start:
-                    continue
-                parent[n] = (r, c)
-                if n == target:
-                    q.clear()
-                    break
-                q.append(n)
+
+        nbrs0 = self._neighbors(skel, start[0], start[1], h, w)
+        if len(nbrs0) < 2:
+            raise RuntimeError(f"Skeleton seed {start} has {len(nbrs0)} neighbours")
+
+        # Walk the cycle from start. After endpoint pruning every node on the
+        # surviving skeleton has ≥2 neighbours, so "next = neighbour that
+        # isn't the previous one" traces the loop back to start.
         path = [start]
-        n = target
-        while n != src:
-            path.append(n)
-            n = parent[n]
-        path.append(src)
-        path.reverse()
+        prev = start
+        cur = nbrs0[0]
+        max_len = int(skel.sum()) + 10
+        while cur != start:
+            path.append(cur)
+            if len(path) > max_len:
+                raise RuntimeError("centerline walk did not close")
+            nbrs = [
+                nb
+                for nb in self._neighbors(skel, cur[0], cur[1], h, w)
+                if nb != prev
+            ]
+            if not nbrs:
+                raise RuntimeError(f"centerline walk dead-ended at {cur}")
+            prev, cur = cur, nbrs[0]
+
         rc = np.array(path)
         world = np.column_stack(
             [
@@ -463,7 +487,12 @@ class RacingEnv:
         self.device = str(d)
         self.seed_base = int(seed)
 
-        self.maps = [Map(p) for p in map_paths]
+        self.maps = []
+        for p in map_paths:
+            try:
+                self.maps.append(Map(p))
+            except Exception as e:
+                raise RuntimeError(f"failed to load map {p}: {e}") from e
         n_maps = len(self.maps)
         if num_envs < n_maps:
             raise ValueError(
