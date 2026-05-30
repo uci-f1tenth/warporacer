@@ -12,3 +12,7 @@ wheels/
 logs/
 wandb/
 *.log
+
+# macOS
+.DS_Store
+**/.DS_Store
