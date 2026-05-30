@@ -397,6 +397,39 @@ class Map:
             skel &= ~endpoints
         return skel
 
+    @staticmethod
+    def _best_loop_through(start, skel, h, w):
+        nbrs = Map._neighbors(skel, start[0], start[1], h, w)
+        if len(nbrs) < 2:
+            return None
+        best = None
+        for i in range(len(nbrs)):
+            for j in range(i + 1, len(nbrs)):
+                src, target = nbrs[i], nbrs[j]
+                parent = {src: src}
+                q = deque([src])
+                while q:
+                    u = q.popleft()
+                    if u == target:
+                        break
+                    for v in Map._neighbors(skel, u[0], u[1], h, w):
+                        if v in parent or v == start:
+                            continue
+                        parent[v] = u
+                        q.append(v)
+                if target not in parent:
+                    continue
+                path = [start]
+                n = target
+                while n != src:
+                    path.append(n)
+                    n = parent[n]
+                path.append(src)
+                path.reverse()
+                if best is None or len(path) > len(best):
+                    best = path
+        return best
+
     def _compute_centerline(self, free):
         skel = self._prune_endpoints(skeletonize(free))
         # Keep the largest connected component — stray skeleton islands
@@ -410,34 +443,27 @@ class Map:
 
         h, w = skel.shape
         pts = np.argwhere(skel)
+        if len(pts) == 0:
+            raise RuntimeError("largest skeleton component is empty")
         origin_px = np.array([self.h - 1 + self.oy / self.res, -self.ox / self.res])
-        start = tuple(int(x) for x in pts[np.argmin(((pts - origin_px) ** 2).sum(1))])
+        order = np.argsort(((pts - origin_px) ** 2).sum(1))
 
-        nbrs0 = self._neighbors(skel, start[0], start[1], h, w)
-        if len(nbrs0) < 2:
-            raise RuntimeError(f"Skeleton seed {start} has {len(nbrs0)} neighbours")
+        # Try several candidate starts close to origin and BFS between
+        # each pair of the start's neighbours (avoiding start). The
+        # longest path found is the track centerline; this stays robust
+        # if start lands on a junction or articulation point.
+        best_path = None
+        for k in range(min(32, len(order))):
+            start = tuple(int(x) for x in pts[order[k]])
+            loop = self._best_loop_through(start, skel, h, w)
+            if loop is None:
+                continue
+            if best_path is None or len(loop) > len(best_path):
+                best_path = loop
+        if best_path is None:
+            raise RuntimeError("could not extract a closed centerline loop")
 
-        # Walk the cycle from start. After endpoint pruning every node on the
-        # surviving skeleton has ≥2 neighbours, so "next = neighbour that
-        # isn't the previous one" traces the loop back to start.
-        path = [start]
-        prev = start
-        cur = nbrs0[0]
-        max_len = int(skel.sum()) + 10
-        while cur != start:
-            path.append(cur)
-            if len(path) > max_len:
-                raise RuntimeError("centerline walk did not close")
-            nbrs = [
-                nb
-                for nb in self._neighbors(skel, cur[0], cur[1], h, w)
-                if nb != prev
-            ]
-            if not nbrs:
-                raise RuntimeError(f"centerline walk dead-ended at {cur}")
-            prev, cur = cur, nbrs[0]
-
-        rc = np.array(path)
+        rc = np.array(best_path)
         world = np.column_stack(
             [
                 self.ox + rc[:, 1] * self.res,
