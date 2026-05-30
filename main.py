@@ -444,33 +444,53 @@ class RacingEnv:
     observation_space = gym.spaces.Box(-np.inf, np.inf, (OBS_DIM,), np.float32)
 
     def __init__(
-        self, map_path: Path, num_envs: int, seed: int = 0, device: str | None = None
+        self,
+        map_paths,
+        num_envs: int,
+        seed: int = 0,
+        device: str | None = None,
     ):
         wp.init()
+        if isinstance(map_paths, (str, Path)):
+            map_paths = [map_paths]
+        map_paths = [Path(p) for p in map_paths]
+        if not map_paths:
+            raise ValueError("at least one map path is required")
+
         self.num_envs = num_envs
         requested = device or ("cuda" if torch.cuda.is_available() else "cpu")
         d = wp.get_device(requested)
         self.device = str(d)
-        self.map = Map(map_path)
         self.seed_base = int(seed)
 
-        self.dt_buf = wp.array(self.map.dt.T.astype(np.float32), dtype=float, device=d)
-        self.lut_buf = wp.array(self.map.lut.T.astype(np.int32), dtype=int, device=d)
-        self.centerline_buf = wp.array(
-            np.column_stack([self.map.centerline, self.map.angles]).astype(np.float32),
-            dtype=wp.vec3,
-            device=d,
-        )
-        self.n_cl = len(self.map.centerline)
+        self.maps = [Map(p) for p in map_paths]
+        n_maps = len(self.maps)
+        if num_envs < n_maps:
+            raise ValueError(
+                f"num_envs ({num_envs}) must be >= number of maps ({n_maps})"
+            )
+
+        # Partition envs across maps as evenly as possible.
+        sizes = [
+            num_envs // n_maps + (1 if i < num_envs % n_maps else 0)
+            for i in range(n_maps)
+        ]
+        splits = []
+        cursor = 0
+        for sz in sizes:
+            splits.append((cursor, cursor + sz))
+            cursor += sz
 
         rng = np.random.default_rng(seed)
-        idxs = rng.integers(0, self.n_cl, size=num_envs)
         cars = np.zeros((num_envs, 7), dtype=np.float32)
-        cars[:, 0] = self.map.centerline[idxs, 0]
-        cars[:, 1] = self.map.centerline[idxs, 1]
-        cars[:, 4] = self.map.angles[idxs]
         cars_int = np.zeros((num_envs, 2), dtype=np.int32)
-        cars_int[:, 1] = idxs
+        for i, m in enumerate(self.maps):
+            a, b = splits[i]
+            idxs = rng.integers(0, len(m.centerline), size=b - a)
+            cars[a:b, 0] = m.centerline[idxs, 0]
+            cars[a:b, 1] = m.centerline[idxs, 1]
+            cars[a:b, 4] = m.angles[idxs]
+            cars_int[a:b, 1] = idxs
         dr_init = (
             1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((num_envs, 4), dtype=np.float32)
         )
@@ -487,6 +507,7 @@ class RacingEnv:
         self.done_buf = wp.to_torch(self.done)
         self.cars_buf = wp.to_torch(self.cars)
         self.cars_int_buf = wp.to_torch(self.cars_int)
+        self.car_dr_buf = wp.to_torch(self.car_dr)
         self._step_counter = self.cars_int_buf[:, 0]
 
         angles = np.linspace(-LIDAR_FOV / 2, LIDAR_FOV / 2, NUM_LIDAR, dtype=np.float32)
@@ -496,38 +517,89 @@ class RacingEnv:
             device=d,
         )
         self._zero_act = wp.zeros(num_envs, dtype=wp.vec2, device=d)
+        self._zero_act_torch = wp.to_torch(self._zero_act)
+
+        # Per-map warp buffers + cached sliced views into the per-env tensors.
+        self.map_buffers = []
+        for i, m in enumerate(self.maps):
+            a, b = splits[i]
+            self.map_buffers.append(
+                {
+                    "map": m,
+                    "env_start": a,
+                    "env_end": b,
+                    "n_envs": b - a,
+                    "origin": wp.vec2(m.ox, m.oy),
+                    "res": float(m.res),
+                    "n_cl": int(len(m.centerline)),
+                    "dt": wp.array(m.dt.T.astype(np.float32), dtype=float, device=d),
+                    "lut": wp.array(m.lut.T.astype(np.int32), dtype=int, device=d),
+                    "cl": wp.array(
+                        np.column_stack([m.centerline, m.angles]).astype(np.float32),
+                        dtype=wp.vec3,
+                        device=d,
+                    ),
+                    "cars_v": wp.from_torch(self.cars_buf[a:b]),
+                    "cars_int_v": wp.from_torch(self.cars_int_buf[a:b]),
+                    "car_dr_v": wp.from_torch(self.car_dr_buf[a:b]),
+                    "obs_v": wp.from_torch(self.obs_buf[a:b]),
+                    "rew_v": wp.from_torch(self.rew_buf[a:b]),
+                    "done_v": wp.from_torch(self.done_buf[a:b]),
+                    "zero_act_v": wp.from_torch(
+                        self._zero_act_torch[a:b], dtype=wp.vec2
+                    ),
+                }
+            )
+
         self._call = 0
         # Warm-up reset
-        self._launch(self._zero_act)
+        self._launch_zero()
         self._sanitize()
         self._step_counter.zero_()
         self.rew_buf.zero_()
         self.done_buf.zero_()
 
-    def _launch(self, act):
-        seed = (self.seed_base * 2654435761 + self._call * 83492791) & 0x7FFFFFFF
+    def _launch_one(self, mb, act_w, seed):
         wp.launch(
             step_kernel,
-            dim=self.num_envs,
+            dim=mb["n_envs"],
             inputs=[
-                act,
-                self.obs,
-                self.rew,
-                self.done,
-                self.cars,
-                self.cars_int,
-                self.car_dr,
-                wp.vec2(self.map.ox, self.map.oy),
-                self.map.res,
-                self.dt_buf,
-                self.lut_buf,
-                self.centerline_buf,
-                self.n_cl,
+                act_w,
+                mb["obs_v"],
+                mb["rew_v"],
+                mb["done_v"],
+                mb["cars_v"],
+                mb["cars_int_v"],
+                mb["car_dr_v"],
+                mb["origin"],
+                mb["res"],
+                mb["dt"],
+                mb["lut"],
+                mb["cl"],
+                mb["n_cl"],
                 self.lidar_buf,
                 int(seed),
             ],
             device=self.cars.device,
         )
+
+    def _launch(self, act_torch):
+        seed_step = (
+            self.seed_base * 2654435761 + self._call * 83492791
+        ) & 0x7FFFFFFF
+        for i, mb in enumerate(self.map_buffers):
+            a, b = mb["env_start"], mb["env_end"]
+            act_w = wp.from_torch(act_torch[a:b], dtype=wp.vec2)
+            self._launch_one(mb, act_w, seed_step ^ ((i + 1) * 982451653))
+        wp.synchronize_device(self.cars.device)
+        self._call += 1
+
+    def _launch_zero(self):
+        seed_step = (
+            self.seed_base * 2654435761 + self._call * 83492791
+        ) & 0x7FFFFFFF
+        for i, mb in enumerate(self.map_buffers):
+            self._launch_one(mb, mb["zero_act_v"], seed_step ^ ((i + 1) * 982451653))
         wp.synchronize_device(self.cars.device)
         self._call += 1
 
@@ -545,7 +617,7 @@ class RacingEnv:
 
     def reset(self):
         self._step_counter.fill_(MAX_STEPS)
-        self._launch(self._zero_act)
+        self._launch_zero()
         self._sanitize()
         self._step_counter.zero_()
         self.rew_buf.zero_()
@@ -554,7 +626,7 @@ class RacingEnv:
 
     def step(self, action):
         act = action.detach().to(self.obs_buf.device, non_blocking=True).contiguous()
-        self._launch(wp.from_torch(act, dtype=wp.vec2))
+        self._launch(act)
         self._sanitize()
         return (
             self.obs_buf,
@@ -567,15 +639,20 @@ class RacingEnv:
     def save_state(self):
         return {
             k: getattr(self, k).clone()
-            for k in ("cars_buf", "cars_int_buf", "obs_buf", "rew_buf", "done_buf")
-        } | {
-            "car_dr": wp.to_torch(self.car_dr).clone(),
+            for k in (
+                "cars_buf",
+                "cars_int_buf",
+                "car_dr_buf",
+                "obs_buf",
+                "rew_buf",
+                "done_buf",
+            )
         }
 
     def restore_state(self, s):
         self.cars_buf.copy_(s["cars_buf"])
         self.cars_int_buf.copy_(s["cars_int_buf"])
-        wp.to_torch(self.car_dr).copy_(s["car_dr"])
+        self.car_dr_buf.copy_(s["car_dr_buf"])
         self.obs_buf.copy_(s["obs_buf"])
         self.rew_buf.copy_(s["rew_buf"])
         self.done_buf.copy_(s["done_buf"])
@@ -692,7 +769,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
     was_training = agent.training
     agent.eval()
     try:
-        m = env.map
+        m = env.maps[0]
         corners = np.array(
             [
                 [-LENGTH / 2, -WIDTH / 2],
@@ -941,7 +1018,7 @@ def train(
 
 
 def main(
-    map_yaml: Path,
+    map_yamls: list[Path],
     num_envs: int = 4096,
     iterations: int = 2000,
     seed: int = 0,
@@ -959,19 +1036,19 @@ def main(
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    env = RacingEnv(map_yaml, num_envs=num_envs, seed=seed, device=device or None)
+    env = RacingEnv(map_yamls, num_envs=num_envs, seed=seed, device=device or None)
     agent = Agent(obs_dim=OBS_DIM).to(env.device)
 
     if use_wandb:
         try:
             wandb.init(
                 project="warporacer",
-                name=f"seed{seed}_n{num_envs}",
+                name=f"seed{seed}_n{num_envs}_m{len(map_yamls)}",
                 config={
                     "num_envs": num_envs,
                     "iterations": iterations,
                     "seed": seed,
-                    "map": str(map_yaml),
+                    "maps": [str(p) for p in map_yamls],
                 },
             )
         except Exception as e:
