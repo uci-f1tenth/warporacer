@@ -122,18 +122,24 @@ class Visuals:
         self._setup_map_center_line()
 
     def _setup_map_ground(self) -> None:
-        """Calculates physical matrix scale bounds and draws the underlying track canvas plane."""
+        """Calculates physical matrix scale bounds and draws an un-stretched track canvas plane."""
         physical_width = self.map.w * self.map.res
         physical_length = self.map.h * self.map.res
+        
+        # Calculate the true physical center of the map image
         center_x = self.map.ox + (physical_width / 2.0)
         center_y = self.map.oy + (physical_length / 2.0)
+
+        # Use the maximum dimension to keep the ground plane a perfect square.
+        # This prevents the ground texture grid/squares from stretching on rectangular maps.
+        max_extent = max(physical_width, physical_length)
 
         self.renderer.render_plane(
             name="map_ground",
             pos=[center_x, center_y, 0.0],
             rot=np.array(wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), np.pi / 2.0)),
-            width=physical_width / 2.0,
-            length=physical_length / 2.0,
+            width=max_extent / 2.0,
+            length=max_extent / 2.0,
             color=(0.15, 0.15, 0.15)
         )
     
