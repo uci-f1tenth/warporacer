@@ -22,6 +22,15 @@ class Map:
         if self.raw is None:
             raise FileNotFoundError(f"Could not load image at {self.img_path}")
         
+        # --- NEW: Paint a literal black border directly onto the raw image ---
+        # This guarantees that the 3D visual renderer will spawn an actual wall mesh,
+        # preventing the "hole/cliff" visual artifact on tightly cropped maps.
+        self.raw[0, :] = 0    # Top edge
+        self.raw[-1, :] = 0   # Bottom edge
+        self.raw[:, 0] = 0    # Left edge
+        self.raw[:, -1] = 0   # Right edge
+        # ---------------------------------------------------------------------
+        
         self.free = self.raw >= OCC_THRESH
         self.dt = distance_transform_edt(self.free)
 
