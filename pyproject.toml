@@ -18,7 +18,7 @@ dependencies = [
     "scikit-image>=0.26.0",
     "scipy>=1.17.1",
     "skrl>=2.0.0",
-    "torch>=2.11.0",
+    "torch>=2.12.1",
     # Platform-specific Triton rules:
     "triton-windows>=3.7.0.post26; sys_platform == 'win32'",
     "triton; sys_platform == 'linux'",
@@ -27,3 +27,19 @@ dependencies = [
     "warp-lang>=1.13.0",
     "warp-nn>=0.1.0",
 ]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform == 'macos'" },
+  { index = "pytorch-cu132", marker = "sys_platform != 'macos'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
