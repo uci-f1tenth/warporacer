@@ -14,10 +14,6 @@ from include.constants import *
 
 
 class Map:
-    """
-    Parses an occupancy grid map from a YAML/Image pair, extracts the drivable centerline, 
-    and builds a spatial lookup table (LUT) mapping pixels to the nearest centerline coordinate.
-    """
     def __init__(self, path: Path):
         self.meta = safe_load(path.read_text())
         self.img_path = path.parent / self.meta["image"]
@@ -26,7 +22,6 @@ class Map:
         if self.raw is None:
             raise FileNotFoundError(f"Could not load image at {self.img_path}")
         
-        # Binarize raw map data directly to preserve thin walls completely
         self.free = self.raw >= OCC_THRESH
         self.dt = distance_transform_edt(self.free)
 
@@ -34,27 +29,51 @@ class Map:
         self.h, self.w = self.raw.shape
         self.res = float(self.meta["resolution"])
 
+        # Auto-calculate bounds and force the world to center on (0,0,0)
+        self._calculate_wall_bounds()
+        
         self._compute_centerline()
         self._build_lut()
 
+    def _calculate_wall_bounds(self):
+        """Measures the drivable free space and zero-centers the map origin."""
+        # FIX: Target the free track space, not the occupied void.
+        track_pts = np.argwhere(self.free)
+        if len(track_pts) == 0:
+            min_r, min_c, max_r, max_c = 0, 0, self.h - 1, self.w - 1
+        else:
+            min_r, min_c = track_pts.min(axis=0)
+            max_r, max_c = track_pts.max(axis=0)
+
+        # Calculate the physical dimensions of the track
+        self.wall_width = float((max_c - min_c) * self.res)
+        self.wall_length = float((max_r - min_r) * self.res)
+
+        # Calculate where the center of the track currently is in world-space
+        center_c = (min_c + max_c) / 2.0
+        center_r = (min_r + max_r) / 2.0
+        orig_center_x = self.ox + center_c * self.res
+        orig_center_y = self.oy + (self.h - 1 - center_r) * self.res
+
+        # FIX: Shift the map's underlying origin so the track's center perfectly aligns with (0,0)
+        self.ox -= orig_center_x
+        self.oy -= orig_center_y
+
+        # The center is now exactly 0,0. Add a 2-meter padding so the floor exceeds the walls slightly.
+        self.center_x = 0.0
+        self.center_y = 0.0
+        self.max_extent = float(max(self.wall_width, self.wall_length)) + 2.0
+
     def _compute_centerline(self):
-        """
-        Extracts the skeleton, heals local structural gaps using a spatial KDTree, 
-        prunes dead ends, and computes a safe cost-weighted loop circuit using soft-penalties.
-        """
         skel = skeletonize(self.free)
         pts = np.argwhere(skel)
         
         if len(pts) == 0:
             raise RuntimeError(f"[Map Error] Skeleton is empty on {self.img_path.name}.")
 
-        # ---------------------------------------------------------
-        # PHASE 1: Graph Assembly & KDTree Proximity Gap Healing
-        # ---------------------------------------------------------
         node_to_px = {i: tuple(pt) for i, pt in enumerate(pts)}
         px_to_node = {tuple(pt): i for i, pt in enumerate(pts)}
 
-        # Build initial 8-connected grid adjacency
         adj = {i: set() for i in node_to_px}
         for i, (r, c) in node_to_px.items():
             for dr, dc in ADJ:
@@ -62,9 +81,8 @@ class Map:
                 if (nr, nc) in px_to_node:
                     adj[i].add(px_to_node[(nr, nc)])
 
-        # Heal track gaps: Find dead ends and link them to nearby skeleton segments
         kdtree = KDTree(pts)
-        max_gap_pixels = 12.0  # Bridges gaps up to ~12 pixels wide caused by raw LiDAR/noise
+        max_gap_pixels = 12.0  
         
         endpoints = [i for i, neighbors in adj.items() if len(neighbors) <= 1]
         for u in endpoints:
@@ -72,37 +90,29 @@ class Map:
             indices = kdtree.query_ball_point(u_px, r=max_gap_pixels)
             for idx in indices:
                 v = idx
-                if v == u or v in adj[u]:
-                    continue
+                if v == u or v in adj[u]: continue
                 v_px = node_to_px[v]
-                dist = np.hypot(u_px[0] - v_px[0], u_px[1] - v_px[1])
-                if dist > 1.5:  # Avoid immediate grid neighbors
+                if np.hypot(u_px[0] - v_px[0], u_px[1] - v_px[1]) > 1.5:
                     adj[u].add(v)
                     adj[v].add(u)
 
-        # ---------------------------------------------------------
-        # PHASE 2: Fast Topological Pruning & Component Isolation
-        # ---------------------------------------------------------
         degrees = {i: len(neighbors) for i, neighbors in adj.items()}
         q = deque([i for i, d in degrees.items() if d == 1])
 
-        # Iteratively melt away true dead-end branches (Levine's hallways)
         while q:
             u = q.popleft()
             for v in adj[u]:
                 if u in adj[v]:
                     adj[v].remove(u)
                     degrees[v] -= 1
-                    if degrees[v] == 1:
-                        q.append(v)
+                    if degrees[v] == 1: q.append(v)
             adj[u].clear()
             degrees[u] = 0
 
         valid_nodes = set(i for i, d in degrees.items() if d >= 2)
         if not valid_nodes:
-            raise RuntimeError(f"[Map Error] No closed loop tracks found on {self.img_path.name}.")
+            raise RuntimeError(f"[Map Error] No closed loops found on {self.img_path.name}.")
 
-        # Group remaining loops and keep only the largest connected track component
         visited = set()
         components = []
         for node in valid_nodes:
@@ -121,14 +131,7 @@ class Map:
 
         main_component = set(max(components, key=len))
 
-        # ---------------------------------------------------------
-        # PHASE 3: Soft-Penalty Circuit Reconstructor
-        # ---------------------------------------------------------
-        # Pick a safe source node located in the widest open track space
         start_node = max(main_component, key=lambda n: self.dt[node_to_px[n]])
-        
-        # Enforce car width: half-width of F1TENTH car is ~0.15m. 
-        # Node must have at least this clearance to be traversable.
         min_clearance_px = max(2.0, 0.15 / self.res)
 
         def dijkstra_soft(src, target=None, penalty_nodes=set()):
@@ -138,29 +141,19 @@ class Map:
             
             while pq:
                 curr_cost, u = heapq.heappop(pq)
-                if target is not None and u == target:
-                    break
-                if curr_cost > costs.get(u, float('inf')):
-                    continue
+                if target is not None and u == target: break
+                if curr_cost > costs.get(u, float('inf')): continue
+                
                 for v in adj[u]:
-                    if v not in main_component:
-                        continue
-                    
+                    if v not in main_component: continue
                     u_px, v_px = node_to_px[u], node_to_px[v]
                     clearance = self.dt[v_px]
                     
-                    # Guardrail: Hard block if the physical space cannot fit the car width
-                    if clearance < min_clearance_px:
-                        continue
+                    if clearance < min_clearance_px: continue
                     
                     edge_dist = np.hypot(u_px[0] - v_px[0], u_px[1] - v_px[1])
-                    
-                    # Base weight favors maximum wall distance (Stata's Pillars)
                     weight = edge_dist + (8.0 / (clearance + 1e-3))
-                    
-                    # Soft Penalty: heavily penalize reusing forward path nodes unless absolutely forced
-                    if v in penalty_nodes:
-                        weight += 5000.0
+                    if v in penalty_nodes: weight += 5000.0
                     
                     new_cost = curr_cost + weight
                     if new_cost < costs.get(v, float('inf')):
@@ -169,34 +162,24 @@ class Map:
                         heapq.heappush(pq, (new_cost, v))
             return costs, parent
 
-        # Find the node topologically furthest away from the start
         forward_costs, _ = dijkstra_soft(start_node)
         far_nodes = sorted([n for n in forward_costs if n in main_component], 
                            key=lambda n: forward_costs[n], reverse=True)
         
-        if not far_nodes:
-            raise RuntimeError(f"[Map Error] Map routing disconnected due to car width safety constraints.")
-            
+        if not far_nodes: raise RuntimeError("[Map Error] Routing disconnected.")
         target_node = far_nodes[0]
 
-        # Path 1: Forward from Start to Target
         _, p1_tree = dijkstra_soft(start_node, target_node)
-        path1 = []
-        curr = target_node
+        path1, curr = [], target_node
         while curr is not None:
             path1.append(curr)
             curr = p1_tree[curr]
         path1.reverse()
 
-        # Path 2: Return from Target to Start with Soft Penalties applied to Path 1
         internal_nodes = set(path1[1:-1])
         _, p2_tree = dijkstra_soft(target_node, start_node, penalty_nodes=internal_nodes)
         
-        if start_node not in p2_tree:
-            raise RuntimeError(f"[Map Error] Failed to stitch loop circuit on {self.img_path.name}.")
-            
-        path2 = []
-        curr = start_node
+        path2, curr = [], start_node
         while curr is not None:
             path2.append(curr)
             curr = p2_tree[curr]
@@ -205,8 +188,27 @@ class Map:
         best_circuit = path1 + path2[1:-1]
 
         # ---------------------------------------------------------
-        # PHASE 4: Transform to Real-World Coordinates & Smooth
+        # SAFE PRUNER: Only removes dead-end excursions (small loops)
         # ---------------------------------------------------------
+        simplified_circuit = []
+        max_detour_len = len(best_circuit) * 0.25  # A detour is <25% of track length
+
+        for node in best_circuit:
+            if node in simplified_circuit:
+                idx = simplified_circuit.index(node)
+                # If the loop we found is small, it's a side-alley. Slice it out.
+                if len(simplified_circuit) - idx < max_detour_len:
+                    simplified_circuit = simplified_circuit[:idx+1]
+                else:
+                    # It's a massive loop (the main track crossing or returning). Keep it.
+                    simplified_circuit.append(node)
+            else:
+                simplified_circuit.append(node)
+
+        best_circuit = simplified_circuit
+
+        # ---------------------------------------------------------
+
         best_path_px = np.array([node_to_px[n] for n in best_circuit])
 
         origin_px = np.array([self.h - 1 + self.oy / self.res, -self.ox / self.res])
