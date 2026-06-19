@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
 import numpy as np
 import torch
 import warp as wp
@@ -13,16 +13,16 @@ if TYPE_CHECKING:
     from include.visuals import Visuals
 
 class Environment:
-    # Class attribute type annotations
-    map_yaml: Path
+    # Class attribute type annotations for structural linting and memory layout clarity
+    map_path: Path
     num_envs: int
     seed: int
     seed_base: int
     device: str
     map: Map
-    vs: Visuals
+    vs: Optional['Visuals']
     
-    # Warp array buffers
+    # Native NVIDIA Warp array storage buffers (Resident directly on GPU Device memory)
     dt_buf: wp.array
     lut_buf: wp.array
     centerline_buf: wp.array
@@ -35,10 +35,10 @@ class Environment:
     lidar_buf: wp.array
     _zero_act: wp.array
     
-    # Pre-allocated constant structural types
+    # Pre-allocated structural properties to completely eliminate inside-loop allocations
     map_origin: wp.vec2
     
-    # Interop PyTorch tensor views
+    # Zero-copy interoperability PyTorch tensor views sharing underlying Warp memory layouts
     obs_buf: torch.Tensor
     rew_buf: torch.Tensor
     done_buf: torch.Tensor
@@ -46,46 +46,105 @@ class Environment:
     cars_int_buf: torch.Tensor
     _step_counter: torch.Tensor
     
-    # Pre-allocated optimization buffers
+    # Pre-allocated target optimization masks for high-throughput tensor evaluations
     term_buf: torch.Tensor
     trunc_buf: torch.Tensor
     _empty_info: Dict[str, Any]
     
-    # Scalar trackers
+    # Performance tracking scalars
     n_cl: int
     look_step: int
     _call: int
 
-    def __init__(self,
-                 map_yaml: Path = Path(".\\maps\\berlin.yaml"),
-                 num_envs: int = 1,
-                 seed: int = 0,
-                 live_viewer: bool = True
-        ) -> None:
-        self.map_yaml = map_yaml
+    def __init__(self, map_target: Path, num_envs: int, seed: int, live_viewer: bool):
         self.num_envs = num_envs
         self.seed = seed
-        self.seed_base = seed 
-        self.live_viewer = live_viewer
-
-        self.device = wp.get_device()
-        self.map = Map(self.map_yaml)
-
-        # Initialize core physics tracking variables
-        self._init_cars()
-
-        # Lazy import to keep visuals.py (and pyglet) completely dormant unless requested for Linux machines
-        if self.live_viewer:
+        self.seed_base = seed  # Required for the LCG random seed inside _launch
+        self._call = 0         # Required to track kernel step dispatch offsets
+        self.device = "cuda"   # Bind strictly to CUDA for Warp/PyTorch interoperability
+        
+        # Internally track the map management system
+        self.available_maps = []
+        self.current_map_idx = 0
+        
+        # Discover and populate your track library automatically
+        self._initialize_map_library(map_target)
+        
+        # Load up your initial baseline map choice (which subsequently initializes the physics buffers)
+        self.load_map_by_index(self.current_map_idx)
+        
+        # Handle lazy visual binding structures for optional rendering pipelines
+        self.vs = None
+        if live_viewer:
             from include.visuals import Visuals
             self.vs = Visuals(self, self.map)
+
+    def _initialize_map_library(self, map_target: Path) -> None:
+        """Determines if the target is a single asset or directory and indexes files."""
+        resolved_target = Path(map_target).resolve()
+        
+        if resolved_target.is_file():
+            # Single-map configuration pipeline: Lock strictly to the provided file
+            self.available_maps = [resolved_target]
+            self.current_map_idx = 0
+        elif resolved_target.is_dir():
+            # Multi-map layout directory crawl pipeline: Sort alphabetically for deterministic ordering
+            self.available_maps = sorted(list(resolved_target.glob("*.yaml")), key=lambda p: p.name)
+            if not self.available_maps:
+                raise FileNotFoundError(f"[Env Error] No .yaml configurations found inside: {resolved_target}")
+            self.current_map_idx = 0
         else:
-            self.vs = None
+            raise FileNotFoundError(f"[Env Error] Provided map path target is invalid: {resolved_target}")
+
+    def load_map_by_index(self, idx: int) -> None:
+        """Explicitly sets and activates a track selection based on collection index coordinates."""
+        if not (0 <= idx < len(self.available_maps)):
+            raise IndexError(f"[Env Error] Target index {idx} falls outside map library boundary limits.")
+            
+        self.current_map_idx = idx
+        self.map_path = self.available_maps[self.current_map_idx]
+        
+        # Procedurally instantiate the internal Map data representation
+        print(f"[Environment] Activating track layout [{self.current_map_idx}]: {self.map_path.name}")
+        self.load_map(self.map_path, reset_call_count=True)
+        
+        # Cascading fallback update notice down to the visual layer graphics buffers if mounted
+        if hasattr(self, 'vs') and self.vs is not None:
+            self.vs.switch_track_layout(self.map)
+
+    def cycle_next_map(self, randomize: bool = False) -> None:
+        """Steps or shuffles map tracks programmatically without external directory re-scans."""
+        if len(self.available_maps) <= 1:
+            print("[Environment] Single map lock active. Skipping sequence shift request.")
+            return
+
+        if randomize:
+            # Filter out current index locations to guarantee a distinct layout variation step
+            choices = [i for i in range(len(self.available_maps)) if i != self.current_map_idx]
+            next_idx = int(np.random.choice(choices))
+        else:
+            # Increment step sequence loops sequentially, rolling over at the end of the list
+            next_idx = (self.current_map_idx + 1) % len(self.available_maps)
+            
+        self.load_map_by_index(next_idx)
+
+    def load_map(self, map_path: Path, reset_call_count: bool = False) -> None:
+        """Dynamically shifts environmental maps and re-allocates structural buffers smoothly."""
+        self.map_path = map_path
+        self.map = Map(self.map_path)
+        
+        if reset_call_count:
+            self._call = 0
+
+        # Discard stale physics references and execute fresh object buffer instantiations
+        self._init_cars()
 
     def _init_cars(self) -> None:
+        """Handles physical hardware allocations and maps raw variables into device data layout structures."""
         self.look_step = self.map.look_step
         d: str = self.device
 
-        # Transfer track map data structures to Warp device arrays
+        # Transfer physical track grid properties and structures into persistent Warp device arrays
         self.dt_buf = wp.array(self.map.dt.T.astype(np.float32), dtype=float, device=d)
         self.lut_buf = wp.array(self.map.lut.T.astype(np.int32), dtype=int, device=d)
         self.centerline_buf = wp.array(
@@ -95,27 +154,29 @@ class Environment:
         )
         self.n_cl = len(self.map.centerline)
 
-        # Pre-allocate static map properties to avoid allocation inside launch loop
+        # Pre-allocate static map properties to isolate inputs across parallelized kernel tasks
         self.map_origin = wp.vec2(self.map.ox, self.map.oy)
 
-        # Sample initial spawn points using a randomized generator
+        # Sample uniform random initial spawn positions using an independent host generator seed
         rng: np.random.Generator = np.random.default_rng(self.seed)
         idxs: np.ndarray = rng.integers(0, self.n_cl, size=self.num_envs)
         
-        # State representations: x, y, x_vel, y_vel, theta, angular_vel, steer
+        # State vector topology: [x, y, x_vel, y_vel, theta, angular_vel, steer]
         cars: np.ndarray = np.zeros((self.num_envs, 7), dtype=np.float32)
         cars[:, 0] = self.map.centerline[idxs, 0]
         cars[:, 1] = self.map.centerline[idxs, 1]
         cars[:, 4] = self.map.angles[idxs]
         
+        # Discrete tracking coordinates: [step_counter, target_centerline_index]
         cars_int: np.ndarray = np.zeros((self.num_envs, 2), dtype=np.int32)
         cars_int[:, 1] = idxs
         
+        # Domain Randomization (DR) scaling multipliers to handle heterogeneous asset variance
         dr_init: np.ndarray = (
             1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((self.num_envs, 4), dtype=np.float32)
         )
 
-        # Instantiate native Warp arrays on the designated compute device
+        # Instantiate dedicated Warp buffers strictly on the native hardware compute device
         self.cars = wp.array(cars, dtype=float, device=d)
         self.cars_int = wp.array(cars_int, dtype=int, device=d)
         self.car_dr = wp.array(dr_init, dtype=float, device=d)
@@ -123,7 +184,7 @@ class Environment:
         self.rew = wp.zeros(self.num_envs, dtype=float, device=d)
         self.done = wp.zeros(self.num_envs, dtype=int, device=d)
 
-        # Expose zero-copy PyTorch tensor views sharing the underlying allocations
+        # Construct zero-copy PyTorch tensor viewpoints into identical raw memory allocations
         self.obs_buf = wp.to_torch(self.obs)
         self.rew_buf = wp.to_torch(self.rew)
         self.done_buf = wp.to_torch(self.done)
@@ -131,12 +192,12 @@ class Environment:
         self.cars_int_buf = wp.to_torch(self.cars_int)
         self._step_counter = self.cars_int_buf[:, 0]
 
-        # Pre-allocate static masks to eliminate allocations in the step loop
+        # Allocate static truth masks to protect step-loop performance profiles from GC pauses
         self.term_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.obs_buf.device)
         self.trunc_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.obs_buf.device)
         self._empty_info = {}
 
-        # Compute fixed relative angles for the onboard Lidar array
+        # Compute spatial directional unit rays for the multi-channel onboard Lidar configuration
         angles: np.ndarray = np.linspace(-LIDAR_FOV / 2, LIDAR_FOV / 2, NUM_LIDAR, dtype=np.float32)
         self.lidar_buf = wp.array(
             np.column_stack([np.cos(angles), np.sin(angles)]),
@@ -144,9 +205,8 @@ class Environment:
             device=d,
         )
         self._zero_act = wp.zeros(self.num_envs, dtype=wp.vec2, device=d)
-        self._call = 0
 
-        # Execute warm-up sequence to force lazy initialization components
+        # Dispatch warm-up sequence loop to safely force GPU kernel initialization compilation
         self._launch(self._zero_act)
         self._sanitize()
         self._step_counter.zero_()
@@ -154,11 +214,11 @@ class Environment:
         self.done_buf.zero_()
 
     def step(self, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
-        # Cast PyTorch action tensors directly to Warp vectors and step the physics
+        """Maps torch tensor actions over to hardware vector blocks and runs a physics updates step."""
         self._launch(wp.from_torch(action.detach().contiguous(), dtype=wp.vec2))
         self._sanitize()
         
-        # Write termination states into pre-allocated memory masks
+        # Populate pre-allocated outcome masks directly in hardware without causing OS allocations
         torch.eq(self.done_buf, DONE_TERMINATED, out=self.term_buf)
         torch.eq(self.done_buf, DONE_TRUNCATED, out=self.trunc_buf)
 
@@ -171,6 +231,7 @@ class Environment:
         )
     
     def reset(self) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Forces full environmental state overrides to bring agents back to baseline configurations."""
         self._step_counter.fill_(MAX_STEPS)
         self._launch(self._zero_act)
         self._sanitize()
@@ -180,6 +241,7 @@ class Environment:
         return self.obs_buf, self._empty_info
 
     def save_state(self) -> Dict[str, Any]:
+        """Creates a standalone deep-copy snapshot dict mapping current environment tensors."""
         return {
             k: getattr(self, k).clone()
             for k in ("cars_buf", "cars_int_buf", "obs_buf", "rew_buf", "done_buf")
@@ -188,6 +250,7 @@ class Environment:
         }
 
     def restore_state(self, s: Dict[str, Any]) -> None:
+        """In-place writes an upstream state checkpoint back down into hardware device tracks."""
         self.cars_buf.copy_(s["cars_buf"])
         self.cars_int_buf.copy_(s["cars_int_buf"])
         wp.to_torch(self.car_dr).copy_(s["car_dr"])
@@ -196,7 +259,8 @@ class Environment:
         self.done_buf.copy_(s["done_buf"])
 
     def _launch(self, act: wp.array) -> None:
-        # Linear congruential generation style sequence for deterministic pseudo-random seeds
+        """Launches the massive GPU-parallel physics kernel using a Linear Congruential Generator step."""
+        # Bitwise mask guarantees the seed stays within standard 32-bit integer limits
         seed: int = (self.seed_base * 2654435761 + self._call * 83492791) & 0x7FFFFFFF
         wp.launch(
             step_kernel,
@@ -209,7 +273,7 @@ class Environment:
                 self.cars,
                 self.cars_int,
                 self.car_dr,
-                self.map_origin,  # Passed pre-allocated structural object reference
+                self.map_origin,
                 self.map.res,
                 self.dt_buf,
                 self.lut_buf,
@@ -223,8 +287,7 @@ class Environment:
         self._call += 1
     
     def _sanitize(self) -> None:
-        # Globally repair any numerical instability markers in-place
-        # (The kernel now sets the 'done' flags for these automatically on-device)
+        """Performs localized repairs across buffer horizons to instantly isolate numerical explosions."""
         torch.nan_to_num_(self.obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)
         torch.nan_to_num_(self.cars_buf, nan=0.0, posinf=0.0, neginf=0.0)
         torch.nan_to_num_(self.rew_buf, nan=0.0, posinf=0.0, neginf=0.0)

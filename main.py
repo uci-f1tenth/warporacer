@@ -1,24 +1,30 @@
 from pathlib import Path
+from typing import Optional
 
-import torch
 import numpy as np
-import warp as wp
-from typer import run
-import os
+import torch
+import typer
 import wandb
 
-from include.agent import Agent, train, record_rollout
+import warp as wp
+
+from include.agent import Agent, record_rollout, train
 from include.constants import *
 from include.environment import Environment
 
-# If you see this error and you have more than one GPU (iGPU & eGPU):
+# ---------------------------------------------------------------------------------
+# Hardware Troubleshooting Note:
+# If you encounter the following error across dual-GPU environments (iGPU & eGPU setups):
 #   "Warp UserWarning: Could not register GL buffer since CUDA/OpenGL interoperability is not available.
-#   Falling back to copy operations between the Warp array and the OpenGL buffer."
-# Then you have to make sure ALL aspects of the Python program is running on GPU. On Windows you find
-# the Python executable and set to "High Performance" in Windows Graphics settings.
+#    Falling back to copy operations between the Warp array and the OpenGL buffer."
+#
+# Fix: Ensure all underlying Python execution stacks utilize the exact same high-performance GPU.
+# On Windows, register the target python.exe binary explicitly inside "Graphics Settings" 
+# and switch its resource allocation profile preference to "High Performance".
+# ---------------------------------------------------------------------------------
 
 def main(
-    map_yaml: Path =  Path(".\\maps\\berlin.yaml"),
+    map_path: Path = Path("maps/berlin.yaml"),  # FIXED: Platform-agnostic forward slashes
     num_envs: int = 1024,
     seed: int = 0,
     interactive: bool = True,
@@ -26,34 +32,75 @@ def main(
     iterations: int = 2000,
     record_every: int = 100,
     record_steps: int = 2000,
-    device: str = None,
+    switch_map_iter: int = 10,  # Training step interval between layout rotations (0 to disable)
+    device: Optional[str] = None, # FIXED: Added Optional type hint
     use_wandb: bool = False,
     log_dir: Path = Path("./logs"),
 ):
+    """
+    Main entry point for handling parallelized reinforcement learning or interactive car runs.
+    Manages global random seed distribution, CUDA/TensorFloat32 compilation pathways, 
+    and bootstraps physical map setups before handing control off to execution streams.
+    """
     
-    # Interactive mode overrides
+    # Force localized parameter overrides whenever direct manual driving is requested
     if interactive:
         num_envs = 1
         live_viewer = True
 
+    # Fall back to native NVIDIA Warp global runtime selection configurations if unspecified
     if not device:
-        device = wp.get_device()
+        target_device = wp.get_device()
+    else:
+        target_device = wp.get_device(device)
 
+    # Safely assert log target presence ahead of downstream validation check blocks
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # Distribute tracking values across separate execution frameworks to ensure run reproducibility
     np.random.seed(seed)
     torch.manual_seed(seed)
+    
+    # Fast compilation and execution optimizations for modern Ampere+ GPU architectures
     torch.backends.cudnn.benchmark = True
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    with wp.ScopedDevice(device):
-        env = Environment(map_yaml, num_envs, seed, live_viewer)
+    # Map Mode Selection & Validation Pipelines
+    # -----------------------------------------------------------------------------
+    if switch_map_iter == 0:
+        # Single-map mode validation: map_path target must point explicitly to a file asset
+        if not map_path.is_file():
+            raise FileNotFoundError(
+                f"[Error] switch_map_iter is 0 (Single Map Mode), "
+                f"but map_path is not a valid file: {map_path}"
+            )
+        available_maps = [map_path]
+        print(f"[Mode] Single Map Mode. Running exclusively on: {map_path.name}")
+    else:
+        # Multi-map mode validation: map_path target must point explicitly to a directory asset
+        if not map_path.is_dir():
+            raise NotADirectoryError(
+                f"[Error] switch_map_iter is {switch_map_iter} (Multi-Map Mode), "
+                f"but map_path is not a valid directory: {map_path}"
+            )
+        available_maps = list(map_path.glob("*.yaml"))
+        if not available_maps:
+            raise FileNotFoundError(f"[Error] No .yaml map files found in directory: {map_path}")
+        print(f"[Mode] Multi-Map Mode. Loaded {len(available_maps)} maps from: {map_path.name}")
+
+    # Bind the contextual physical compute resource block
+    with wp.ScopedDevice(target_device):
+        # Simply pass whatever path argument parameter choice was specified at execution runtime.
+        # The Environment auto-sorts files vs directories and mounts individual collection indexes itself.
+        env = Environment(map_path, num_envs, seed, live_viewer)
 
         if interactive:
+            # Drop structural execution logic straight over to manual keyboard loop threads
             env.vs.interactive_render_loop()
         else:
+            # Instantiate Weights & Biases (WandB) logger sessions for hyperparameter analytics tracking
             if use_wandb:
                 try:
                     wandb.init(
@@ -63,13 +110,21 @@ def main(
                             "num_envs": num_envs,
                             "iterations": iterations,
                             "seed": seed,
-                            "map": str(map_yaml),
+                            "maps_directory": str(map_path),
+                            "switch_map_iter": switch_map_iter,
                         },
                     )
                 except Exception as e:
                     print(f"[WandB] Init failed: {e}")
+                    use_wandb = False  # FIXED: Soft fallback to prevent downstream logging crashes
                     
-            agent = torch.compile(Agent(obs_dim=OBS_DIM).to(str(env.device)))
+            # Instantiate the network onto the environment's target device execution context
+            raw_agent = Agent(obs_dim=OBS_DIM).to(str(env.device))
+            
+            # Wrap standard Agent modules inside torch.compile paths to trigger Graph optimization benefits
+            agent = torch.compile(raw_agent)
+            
+            # FIXED: Explicitly pass multi-map tracking arguments down to the trainer pipeline
             elapsed, obs_rms, ret_rms, step = train(
                 env,
                 agent,
@@ -77,39 +132,40 @@ def main(
                 log_dir=log_dir,
                 record_every=record_every,
                 record_steps=record_steps,
-                use_wandb_train=use_wandb
+                use_wandb_train=use_wandb,
+                available_maps=available_maps,       # Added parameter
+                switch_map_iter=switch_map_iter,     # Added parameter
             )
 
-            print(f"[Done!] {elapsed:.1f}s")
+            print(f"[Done!] Optimization path complete in {elapsed:.1f}s")
 
+            # FIXED: Extract clean state_dict without compiler prefix noise (_orig_mod.)
+            clean_state_dict = getattr(agent, "_orig_mod", agent).state_dict()
+
+            # Persist policy network configurations and running observation statistics down onto disk structures
             torch.save(
                 {
-                    "agent": agent.state_dict(),
+                    "agent": clean_state_dict,
                     "obs_mean": obs_rms.mean.cpu(),
                     "obs_var": obs_rms.var.cpu(),
                     "obs_count": obs_rms.count,
                 },
                 log_dir / "agent_final.pt",
             )
+            print(f"[Saved!] State file weights dumped successfully.")
 
-            print(f"[Saved!]")
-
+            # Record a standalone baseline test tracking validation run video
             out = log_dir / "rollout_final.mp4"
             record_rollout(env, agent, record_steps, out, obs_rms=obs_rms)
 
+            # Export validation video telemetry channels back up to active logging dashboards
             if use_wandb:
                 try:
                     wandb.log({"rollout_final": wandb.Video(str(out), format="mp4")}, step=step)
+                    wandb.finish()  # FIXED: Cleanly close connection context loops
                 except Exception as e:
-                    print(f"[WandB] Final rollout video failed: {e}")
+                    print(f"[WandB] Final log cleanup or video upload failed: {e}")
 
 if __name__ == "__main__":
-    run(main)
-
-# Notes:
-# main(interactive=False, num_envs=16384, map_yaml=Path(".//maps//berlin.yaml"))
-# if os.name == "nt":
-#     main(interactive=False, num_envs=1024, map_yaml=Path(".//maps//berlin.yaml"))
-# else:
-#     main(interactive=False, num_envs=1024, map_yaml=Path("./maps/berlin.yaml"))
-# env.vs.render() # Live rendering of training
+    # Typer command parsing layer wraps execution parameters cleanly
+    typer.run(main)
