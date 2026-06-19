@@ -108,7 +108,7 @@ class Agent(nn.Module):
         log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - math.log(math.sqrt(2 * math.pi))
         log_prob = log_prob.sum(-1)
         
-        entropy: torch.Tensor = (0.5 + 0.5 * math.log(2 * math.pi) + ls).sum(-1).expand_as(log_prob)
+        entropy: torch.Tensor = (0.5 + 0.5 * math.log(2 * math.pi) + ls).sum(-1).expand_as(log_prob).clone()
         
         return action, log_prob, entropy, self.critic(obs).squeeze(-1)
 
@@ -118,7 +118,7 @@ class Agent(nn.Module):
         var: torch.Tensor = ls.exp().pow(2)
         
         log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - math.log(math.sqrt(2 * math.pi))
-        entropy: torch.Tensor = (0.5 + 0.5 * math.log(2 * math.pi) + ls).sum(-1).expand_as(log_prob[:, 0])
+        entropy: torch.Tensor = (0.5 + 0.5 * math.log(2 * math.pi) + ls).sum(-1).expand_as(log_prob[:, 0]).clone()
         
         return log_prob.sum(-1), entropy, self.critic(obs).squeeze(-1)
 
