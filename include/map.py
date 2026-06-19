@@ -14,7 +14,29 @@ from include.constants import *
 
 
 class Map:
+    # Create a class-level cache dictionary
+    _cache = {}
+
+    def __new__(cls, path: Path):
+        # 2. Use the absolute path as the unique cache key
+        abs_path = path.resolve()
+        
+        if abs_path not in cls._cache:
+            # If not in cache, allocate memory for a new instance
+            instance = super().__new__(cls)
+            instance._initialized = False
+            cls._cache[abs_path] = instance
+            
+        # Return the cached instance
+        return cls._cache[abs_path]
+
     def __init__(self, path: Path):
+        # 3. If this instance was pulled from the cache, skip the heavy math
+        if getattr(self, "_initialized", False):
+            return
+
+        print(f"Processing and caching new map: {path.name}...")
+
         self.meta = safe_load(path.read_text())
         self.img_path = path.parent / self.meta["image"]
 
@@ -22,14 +44,11 @@ class Map:
         if self.raw is None:
             raise FileNotFoundError(f"Could not load image at {self.img_path}")
         
-        # --- NEW: Paint a literal black border directly onto the raw image ---
-        # This guarantees that the 3D visual renderer will spawn an actual wall mesh,
-        # preventing the "hole/cliff" visual artifact on tightly cropped maps.
-        self.raw[0, :] = 0    # Top edge
-        self.raw[-1, :] = 0   # Bottom edge
-        self.raw[:, 0] = 0    # Left edge
-        self.raw[:, -1] = 0   # Right edge
-        # ---------------------------------------------------------------------
+        # Paint a literal black border directly onto the raw image
+        self.raw[0, :] = 0    
+        self.raw[-1, :] = 0   
+        self.raw[:, 0] = 0    
+        self.raw[:, -1] = 0   
         
         self.free = self.raw >= OCC_THRESH
         self.dt = distance_transform_edt(self.free)
@@ -38,11 +57,12 @@ class Map:
         self.h, self.w = self.raw.shape
         self.res = float(self.meta["resolution"])
 
-        # Auto-calculate bounds and force the world to center on (0,0,0)
         self._calculate_wall_bounds()
-        
         self._compute_centerline()
         self._build_lut()
+
+        # 4. Mark as initialized so future calls bypass this block
+        self._initialized = True
 
     def _calculate_wall_bounds(self):
         """Measures the drivable free space and zero-centers the map origin."""
