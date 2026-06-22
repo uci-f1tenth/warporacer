@@ -34,7 +34,7 @@ STEER_MIN = -0.4189
 STEER_MAX = 0.4189
 STEER_V_MAX = 3.2
 A_MAX = 9.51
-V_MIN = -5.0
+V_MIN = 1.0
 V_MAX = 20.0
 
 # Car
