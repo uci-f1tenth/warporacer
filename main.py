@@ -74,7 +74,7 @@ VESC_TAU = 0.15  # s, first-order speed-loop time constant (~3*tau ≈ 0.45 s to
 V_LEAD_MARGIN = 2.0  # m/s, cap how far the speed setpoint leads actual v (matches the node)
 MU_DR_LO = 0.70  # grip domain randomization: a_max scale low bound ...
 MU_DR_HI = 1.10  # ... and high bound (real track grip is usually below MU)
-LATENCY_MAX_STEPS = 3  # max randomized actuation/sensing delay, in control steps (0=off)
+LATENCY_MAX_STEPS = 0  # max randomized actuation/sensing delay, control steps (raise to ~3 to harden)
 
 
 @wp.struct
@@ -253,11 +253,13 @@ def step_kernel(
     elif 2 * d_wp < -n_cl:
         d_wp += n_cl
 
-    # Reward forward speed itself, NOT alignment with the centerline tangent:
-    # the old v*cos(psi - centerline_heading) term penalized the across-corner
-    # yaw a racing line needs at hairpins. With realistic VESC/grip dynamics the
-    # wide, early-throttle line is now genuinely faster, so plain speed suffices.
-    v_along = v
+    # Speed projected on the track DIRECTION (centerline tangent). This is the
+    # safety lever: going fast straight at a wall (psi far from the upcoming
+    # track heading) earns almost nothing, so the policy slows and turns for
+    # corners. Decoupling it to plain `v` made the car floor it into walls and
+    # treat the -10 crash as a cheap respawn — do NOT remove the cos term.
+    cth = centerline[new_wp][2]
+    v_along = v * wp.cos(psi - cth)
     progress = (
         wp.float32(d_wp)
         / wp.float32(n_cl)
