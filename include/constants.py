@@ -46,7 +46,7 @@ DT_SUB_SIX = DT_SUB / 6.0            # [s] Cache constant for solver
 PROGRESS_SCALE = 0.8                 # INCREASING: Prioritize raw downward track progression
 PROGRESS_V_COEF = 0.8                # INCREASING: Reward velocity aligned with the path horizon
 BACKWARDS_PROGRESS_PENALTY_MUL = 24.0 # INCREASING: Explicitly kill wrong-way wiggling immediately
-TERM_PENALTY = -200.0                # INCREASING: Give crashing a sharper, distinct penalty drop
+TERM_PENALTY = -300.0                # INCREASING: Give crashing a sharper, distinct penalty drop
 
 IDLE_PENALTY = -0.4                  # INCREASING: Make loitering or oscillation hurt more
 # RESTORING: Bring this back to a modest value. This forces the agent to keep 
@@ -54,7 +54,7 @@ IDLE_PENALTY = -0.4                  # INCREASING: Make loitering or oscillation
 LATERAL_PENALTY = -0.05
 
 MAX_CENTERLINE_DEV = 2.0             # [m] Track boundary containment zone
-STALL_VELOCITY = 1.0
+STALL_VELOCITY = 0.5
 STALL_SECONDS_TO_STEPS = 1.0 / DT
 
 # =========================================================================
