@@ -30,22 +30,6 @@ DT_SUB_SIX = DT_SUB / 6.0
 
 DR_FRAC = 0.15
 
-# Things to reward
-# - Following centerline
-# - Going forward fast
-# - Reaching checkpoints
-# - Completing laps fast
-# - Smooth steering (no jitter)
-#
-# Things to penalize
-# - Going backwards
-# - Diverging from centerline a lot
-# - Going in reverse of centerline direction
-# - Staying in the same area
-# - Going too slow
-# - Hitting obstacles
-# - Eratic steering
-
 PROGRESS_SCALE = 0.5
 PROGRESS_V_COEF = 0.25
 BACKWARDS_PROGRESS_PENALTY_MUL = 10.0
@@ -71,6 +55,22 @@ SMOOTH_WINDOW = 51
 ADJ = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 DONE_TERMINATED = 1
 DONE_TRUNCATED = 2
+
+# Things to reward
+# - Following centerline
+# - Going forward fast
+# - Reaching checkpoints
+# - Completing laps fast
+# - Smooth steering (no jitter)
+#
+# Things to penalize
+# - Going backwards
+# - Diverging from centerline a lot
+# - Going in reverse of centerline direction
+# - Staying in the same area
+# - Going too slow
+# - Hitting obstacles
+# - Eratic steering
 
 # =========================================================================
 # REWARD & PENALTY CONFIGURATION NOTES (Racing Line Discovery)
