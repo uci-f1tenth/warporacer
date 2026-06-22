@@ -52,7 +52,7 @@ DR_FRAC = 0.15
 
 PROGRESS_SCALE = 100.0
 PROGRESS_V_COEF = 10.0
-TERM_PENALTY = 10.0
+TERM_PENALTY = 25.0  # crash cost; must dominate the pre-crash progress a floored corner can farm
 
 NUM_LIDAR = 108
 LIDAR_FOV = np.radians(270.0)
@@ -267,8 +267,9 @@ def step_kernel(
         * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
     )
 
-    term_pen = wp.where(term, -TERM_PENALTY, 0.0)
-    reward[i] = progress + term_pen
+    # On a crash, pay ONLY the terminal penalty — no speed-progress refund — so
+    # flooring a corner into the wall can never net out cheaper than slowing.
+    reward[i] = wp.where(term, -TERM_PENALTY, progress)
 
     if term:
         done[i] = DONE_TERMINATED
