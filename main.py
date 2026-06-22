@@ -79,7 +79,7 @@ V_LEAD_MARGIN = (
 MU_DR_LO = 0.70  # grip domain randomization: a_max scale low bound ...
 MU_DR_HI = 1.10  # ... and high bound (real track grip is usually below MU)
 LATENCY_MAX_STEPS = (
-    3  # max randomized actuation/sensing delay, control steps (raise to ~3 to harden)
+    0  # max randomized actuation/sensing delay, control steps (raise to ~3 to harden)
 )
 
 
