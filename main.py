@@ -29,7 +29,6 @@ MU = 1.0489
 LF = 0.15875
 LR = 0.17145
 LWB = LF + LR
-MASS = 3.74
 
 STEER_MIN = -0.4189
 STEER_MAX = 0.4189
@@ -37,8 +36,6 @@ STEER_V_MAX = 3.2
 A_MAX = 9.51
 V_MIN = -5.0
 V_MAX = 20.0
-PSI_PRIME_MAX = 6.0
-BETA_MAX = 1.2
 
 # Car
 WIDTH = 0.31
@@ -71,14 +68,20 @@ ADJ = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 DONE_TERMINATED = 1
 DONE_TRUNCATED = 2
 
+# --- Sim-to-real / racing-line config (retrain-only; toggle each independently) ---
+LIDAR_MOUNT_X = 0.2733  # m, real base_link->laser offset (sim raytraced from LF before)
+VESC_TAU = 0.15  # s, first-order speed-loop time constant (~3*tau ≈ 0.45 s to settle)
+V_LEAD_MARGIN = 2.0  # m/s, cap how far the speed setpoint leads actual v (matches the node)
+MU_DR_LO = 0.70  # grip domain randomization: a_max scale low bound ...
+MU_DR_HI = 1.10  # ... and high bound (real track grip is usually below MU)
+LATENCY_MAX_STEPS = 3  # max randomized actuation/sensing delay, in control steps (0=off)
+
 
 @wp.struct
 class VDeriv:
     d_x: float
     d_y: float
     d_psi: float
-    d_psip: float
-    d_beta: float
     d_v: float
 
 
@@ -87,12 +90,8 @@ def st_deriv(
     delta: float,
     v: float,
     psi: float,
-    psip: float,
-    beta: float,
-    steer_v: float,
-    accel: float,
+    v_cmd: float,
     mu_s: float,
-    mass_s: float,
     lf_s: float,
     lr_s: float,
 ) -> VDeriv:
@@ -116,9 +115,9 @@ def st_deriv(
     out.d_x = v * cp
     out.d_y = v * sp
     out.d_psi = d_psi
-    out.d_v = wp.clamp(accel, -a_long_max, a_long_max)
-    out.d_psip = 0.0
-    out.d_beta = 0.0
+    # Speed-loop tracking: close on the commanded setpoint with lag VESC_TAU,
+    # bounded by the longitudinal friction budget (mirrors the real VESC).
+    out.d_v = wp.clamp((v_cmd - v) / VESC_TAU, -a_long_max, a_long_max)
     return out
 
 
@@ -127,29 +126,22 @@ def rk4_step(
     delta: float,
     v: float,
     psi: float,
-    psip: float,
-    beta: float,
     steer_v: float,
-    accel: float,
+    v_cmd: float,
     mu_s: float,
-    mass_s: float,
     lf_s: float,
     lr_s: float,
 ) -> VDeriv:
     dd = steer_v * DT_SUB_HALF
     dd_full = steer_v * DT_SUB
 
-    k1 = st_deriv(delta, v, psi, psip, beta, steer_v, accel, mu_s, mass_s, lf_s, lr_s)
+    k1 = st_deriv(delta, v, psi, v_cmd, mu_s, lf_s, lr_s)
     k2 = st_deriv(
         delta + dd,
         v + k1.d_v * DT_SUB_HALF,
         psi + k1.d_psi * DT_SUB_HALF,
-        psip + k1.d_psip * DT_SUB_HALF,
-        beta + k1.d_beta * DT_SUB_HALF,
-        steer_v,
-        accel,
+        v_cmd,
         mu_s,
-        mass_s,
         lf_s,
         lr_s,
     )
@@ -157,12 +149,8 @@ def rk4_step(
         delta + dd,
         v + k2.d_v * DT_SUB_HALF,
         psi + k2.d_psi * DT_SUB_HALF,
-        psip + k2.d_psip * DT_SUB_HALF,
-        beta + k2.d_beta * DT_SUB_HALF,
-        steer_v,
-        accel,
+        v_cmd,
         mu_s,
-        mass_s,
         lf_s,
         lr_s,
     )
@@ -170,12 +158,8 @@ def rk4_step(
         delta + dd_full,
         v + k3.d_v * DT_SUB,
         psi + k3.d_psi * DT_SUB,
-        psip + k3.d_psip * DT_SUB,
-        beta + k3.d_beta * DT_SUB,
-        steer_v,
-        accel,
+        v_cmd,
         mu_s,
-        mass_s,
         lf_s,
         lr_s,
     )
@@ -184,12 +168,6 @@ def rk4_step(
     out.d_y = (k1.d_y + 2.0 * k2.d_y + 2.0 * k3.d_y + k4.d_y) * DT_SUB_SIX
     out.d_psi = (k1.d_psi + 2.0 * k2.d_psi + 2.0 * k3.d_psi + k4.d_psi) * DT_SUB_SIX
     out.d_v = (k1.d_v + 2.0 * k2.d_v + 2.0 * k3.d_v + k4.d_v) * DT_SUB_SIX
-    out.d_psip = (
-        k1.d_psip + 2.0 * k2.d_psip + 2.0 * k3.d_psip + k4.d_psip
-    ) * DT_SUB_SIX
-    out.d_beta = (
-        k1.d_beta + 2.0 * k2.d_beta + 2.0 * k3.d_beta + k4.d_beta
-    ) * DT_SUB_SIX
     return out
 
 
@@ -217,12 +195,10 @@ def step_kernel(
     delta = cars[i, 2]
     v = cars[i, 3]
     psi = cars[i, 4]
-    psip = cars[i, 5]
-    beta = cars[i, 6]
+    v_cmd = cars[i, 5]
     steps = cars_int[i, 0]
     wp_i = cars_int[i, 1]
     mu_s = car_dr[i, 0]
-    mass_s = car_dr[i, 1]
     lf_s = car_dr[i, 2]
     lr_s = car_dr[i, 3]
 
@@ -235,21 +211,21 @@ def step_kernel(
     if (steer_v < 0.0 and delta <= STEER_MIN) or (steer_v > 0.0 and delta >= STEER_MAX):
         steer_v = 0.0
     accel = wp.clamp(actions[i][1], -1.0, 1.0) * A_MAX
-    if (accel < 0.0 and v <= V_MIN) or (accel > 0.0 and v >= V_MAX):
-        accel = 0.0
 
     dd_sub = steer_v * DT_SUB
     for _ in range(SUBSTEPS):
+        # VESC speed-loop: the action drives a speed SETPOINT (v_cmd); the car's
+        # actual speed tracks it with first-order lag inside st_deriv.
+        v_cmd = wp.clamp(
+            v_cmd + accel * DT_SUB, V_MIN, wp.min(V_MAX, v + V_LEAD_MARGIN)
+        )
         d = rk4_step(
             delta,
             v,
             psi,
-            psip,
-            beta,
             steer_v,
-            accel,
+            v_cmd,
             mu_s,
-            mass_s,
             lf_s,
             lr_s,
         )
@@ -258,13 +234,9 @@ def step_kernel(
         delta += dd_sub
         v += d.d_v
         psi += d.d_psi
-        psip += d.d_psip
-        beta += d.d_beta
 
     delta = wp.clamp(delta, STEER_MIN, STEER_MAX)
     v = wp.clamp(v, V_MIN, V_MAX)
-    psip = wp.clamp(psip, -PSI_PRIME_MAX, PSI_PRIME_MAX)
-    beta = wp.clamp(beta, -BETA_MAX, BETA_MAX)
 
     # Reward + done
     px = wp.clamp(wp.int32((x - origin[0]) / res), 0, mw - 1)
@@ -281,8 +253,11 @@ def step_kernel(
     elif 2 * d_wp < -n_cl:
         d_wp += n_cl
 
-    cth = centerline[new_wp][2]
-    v_along = v * wp.cos(beta + psi - cth)
+    # Reward forward speed itself, NOT alignment with the centerline tangent:
+    # the old v*cos(psi - centerline_heading) term penalized the across-corner
+    # yaw a racing line needs at hairpins. With realistic VESC/grip dynamics the
+    # wide, early-throttle line is now genuinely faster, so plain speed suffices.
+    v_along = v
     progress = (
         wp.float32(d_wp)
         / wp.float32(n_cl)
@@ -310,11 +285,10 @@ def step_kernel(
         psi = rpt[2]
         delta = 0.0
         v = 0.0
-        psip = 0.0
-        beta = 0.0
+        v_cmd = 0.0
         steps = 0
         new_wp = rnd
-        car_dr[i, 0] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
+        car_dr[i, 0] = MU_DR_LO + (MU_DR_HI - MU_DR_LO) * wp.randf(rng)
         car_dr[i, 1] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 2] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 3] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
@@ -322,8 +296,8 @@ def step_kernel(
     # Lidar
     sh = wp.sin(psi)
     ch = wp.cos(psi)
-    lx = x + LF * ch
-    ly = y + LF * sh
+    lx = x + LIDAR_MOUNT_X * ch
+    ly = y + LIDAR_MOUNT_X * sh
     lpx = wp.clamp(wp.int32((lx - origin[0]) / res), 0, mw - 1)
     lpy = wp.clamp(wp.int32(mh_f - (ly - origin[1]) / res), 0, mh - 1)
     lpos = wp.vec2(wp.float32(lpx), wp.float32(lpy))
@@ -353,8 +327,7 @@ def step_kernel(
     cars[i, 2] = delta
     cars[i, 3] = v
     cars[i, 4] = psi
-    cars[i, 5] = psip
-    cars[i, 6] = beta
+    cars[i, 5] = v_cmd
     cars_int[i, 0] = steps
     cars_int[i, 1] = new_wp
 
@@ -549,6 +522,10 @@ class RacingEnv:
         dr_init = (
             1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((num_envs, 4), dtype=np.float32)
         )
+        # Grip (column 0 -> mu_s) gets its own realistic, wider range.
+        dr_init[:, 0] = MU_DR_LO + (MU_DR_HI - MU_DR_LO) * rng.random(
+            num_envs, dtype=np.float32
+        )
 
         self.cars = wp.array(cars, dtype=float, device=d)
         self.cars_int = wp.array(cars_int, dtype=int, device=d)
@@ -573,6 +550,20 @@ class RacingEnv:
         )
         self._zero_act = wp.zeros(num_envs, dtype=wp.vec2, device=d)
         self._zero_act_torch = wp.to_torch(self._zero_act)
+
+        # Actuation/sensing latency: apply a per-env, episode-randomized delay of
+        # 0..LATENCY_MAX_STEPS control steps to the action the policy commands.
+        self._lat = int(LATENCY_MAX_STEPS)
+        if self._lat > 0:
+            self._act_hist = torch.zeros(
+                (self._lat + 1, num_envs, ACT_DIM),
+                dtype=self.obs_buf.dtype,
+                device=self.obs_buf.device,
+            )
+            self._act_delay = torch.randint(
+                0, self._lat + 1, (num_envs,), device=self.obs_buf.device
+            )
+            self._env_ix = torch.arange(num_envs, device=self.obs_buf.device)
 
         # Per-map warp buffers + cached sliced views into the per-env tensors.
         self.map_buffers = []
@@ -677,12 +668,30 @@ class RacingEnv:
         self._step_counter.zero_()
         self.rew_buf.zero_()
         self.done_buf.zero_()
+        if self._lat > 0:
+            self._act_hist.zero_()
+            self._act_delay = torch.randint(
+                0, self._lat + 1, (self.num_envs,), device=self.obs_buf.device
+            )
         return self.obs_buf, {}
 
     def step(self, action):
         act = action.detach().to(self.obs_buf.device, non_blocking=True).contiguous()
+        if self._lat > 0:
+            self._act_hist = torch.roll(self._act_hist, 1, dims=0)
+            self._act_hist[0] = act
+            act = self._act_hist[self._act_delay, self._env_ix].contiguous()
         self._launch(act)
         self._sanitize()
+        if self._lat > 0:
+            # Re-randomize the delay for envs that just reset and clear their
+            # stale history so a prior episode's commands don't leak across.
+            fresh = self.done_buf != 0
+            if bool(fresh.any()):
+                self._act_delay[fresh] = torch.randint(
+                    0, self._lat + 1, (int(fresh.sum()),), device=self.obs_buf.device
+                )
+                self._act_hist[:, fresh] = 0.0
         return (
             self.obs_buf,
             self.rew_buf,
@@ -711,6 +720,9 @@ class RacingEnv:
         self.obs_buf.copy_(s["obs_buf"])
         self.rew_buf.copy_(s["rew_buf"])
         self.done_buf.copy_(s["done_buf"])
+        if self._lat > 0:
+            # Don't carry an eval rollout's action history back into training.
+            self._act_hist.zero_()
 
 
 # PPO components
