@@ -43,10 +43,10 @@ DT_SUB_SIX = DT_SUB / 6.0            # [s] Cache constant for solver
 # =========================================================================
 # 4. Reward Shaping & Normalization Weights (Generalization Tuned)
 # =========================================================================
-PROGRESS_SCALE = 1.2                 # INCREASING: Prioritize raw downward track progression
-PROGRESS_V_COEF = 1.2                # INCREASING: Reward velocity aligned with the path horizon
-BACKWARDS_PROGRESS_PENALTY_MUL = 20.0 # INCREASING: Explicitly kill wrong-way wiggling immediately
-TERM_PENALTY = -150.0                # INCREASING: Give crashing a sharper, distinct penalty drop
+PROGRESS_SCALE = 0.8                 # INCREASING: Prioritize raw downward track progression
+PROGRESS_V_COEF = 0.8                # INCREASING: Reward velocity aligned with the path horizon
+BACKWARDS_PROGRESS_PENALTY_MUL = 24.0 # INCREASING: Explicitly kill wrong-way wiggling immediately
+TERM_PENALTY = -200.0                # INCREASING: Give crashing a sharper, distinct penalty drop
 
 IDLE_PENALTY = -0.4                  # INCREASING: Make loitering or oscillation hurt more
 # RESTORING: Bring this back to a modest value. This forces the agent to keep 
@@ -54,10 +54,8 @@ IDLE_PENALTY = -0.4                  # INCREASING: Make loitering or oscillation
 LATERAL_PENALTY = -0.05
 
 MAX_CENTERLINE_DEV = 2.0             # [m] Track boundary containment zone
-STALL_VELOCITY = 1.5
-# DECREASING: Drop from 1.0s to 0.4s. At 60Hz, 0.4 seconds means if it 
-# sits there wiggling for more than 24 frames, it gets instantly terminated.
-STALL_SECONDS_TO_STEPS = 0.4 / DT
+STALL_VELOCITY = 1.0
+STALL_SECONDS_TO_STEPS = 1.0 / DT
 
 # =========================================================================
 # 5. Sensors & Observation Tensor Offsets

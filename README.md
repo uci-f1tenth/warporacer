@@ -1,0 +1,1 @@
+uv run .\main.py --no-use-wandb --maps-dir-str ./maps/ --switch-map-iter 25 --no-interactive --live-viewer --record-every-iteration 0 --num-envs 8192

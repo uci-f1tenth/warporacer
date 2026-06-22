@@ -102,7 +102,7 @@ class Agent(nn.Module):
 
     def act_value(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         mean: torch.Tensor = self.actor(obs)
-        # Smoothly scales unconstrained parameter space to your min/max window
+        # Smooth Sigmoid scaling mapping unconstrained space to [LOGSTD_MIN, LOGSTD_MAX]
         ls = self.LOGSTD_MIN + (self.LOGSTD_MAX - self.LOGSTD_MIN) * torch.sigmoid(self.log_std)
         std: torch.Tensor = ls.exp()
         
@@ -111,18 +111,18 @@ class Agent(nn.Module):
         action_clamped = torch.clamp(action, -1.0, 1.0)
         
         var: torch.Tensor = std.pow(2)
-        # Calculate log_prob using the RAW action to preserve clean continuous gradients
         log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - self.HALF_LOG_TWO_PI
         log_prob = log_prob.sum(-1)
         
         entropy: torch.Tensor = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1).expand_as(log_prob)
         
-        # Return BOTH raw and clamped actions
         return action, action_clamped, log_prob, entropy, self.critic(obs).squeeze(-1)
 
     def evaluate(self, obs: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mean: torch.Tensor = self.actor(obs)
-        ls: torch.Tensor = self.log_std.clamp(self.LOGSTD_MIN, self.LOGSTD_MAX)
+        
+        # FIX: Must use identical Sigmoid scaling here as well!
+        ls = self.LOGSTD_MIN + (self.LOGSTD_MAX - self.LOGSTD_MIN) * torch.sigmoid(self.log_std)
         var: torch.Tensor = ls.exp().pow(2)
         
         log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - self.HALF_LOG_TWO_PI
@@ -311,8 +311,8 @@ def compute_gae(
 def train(
     env: Environment,
     agent: Agent,
-    iterations: int = 2000,
-    rollouts: int = 128,         
+    iterations: int = 10000,
+    rollouts: int = 64,         
     epochs: int = 4,             
     gamma: float = 0.985,        
     gae_lambda: float = 0.95,
@@ -462,7 +462,8 @@ def train(
         
         tot_pg, tot_v, tot_ent, tot_kl, tot_clip = 0.0, 0.0, 0.0, 0.0, 0.0
         n_upd: int = 0
-        current_ent_coef = max(0.001, ent_coef * (1.0 - (it / iterations)))
+        # Change the minimum from 0.001 to a slightly more protective baseline
+        current_ent_coef = max(0.0025, ent_coef * (1.0 - (it / iterations)))
         permutation_indices = torch.arange(B, device=device)
 
         for epoch in range(current_epochs):  
