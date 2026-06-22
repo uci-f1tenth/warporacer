@@ -913,7 +913,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
 def train(
     env,
     agent,
-    iterations=4000,
+    iterations=2000,
     rollouts=24,
     epochs=5,
     minibatches=4,
