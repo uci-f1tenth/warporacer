@@ -1,21 +1,18 @@
 from collections import deque
-import math
 from pathlib import Path
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from cv2 import COLOR_GRAY2RGB, cvtColor, fillPoly, polylines
 import imageio.v2 as imageio
 import numpy as np
-import psutil  # Native package overhead profiling
+import psutil
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
 import wandb
 
 from include.constants import *
 from include.environment import Environment
-from include.map import Map
 
 # Fast matrix multiplication layout alignment configurations
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -98,14 +95,14 @@ class Agent(nn.Module):
         std: torch.Tensor = ls.exp()
         
         noise: torch.Tensor = torch.randn_like(mean)
-        action: torch.Tensor = mean + noise * std
+        action = mean + noise * std
+        action_clamped = torch.clamp(action, -1.0, 1.0)
         
         var: torch.Tensor = std.pow(2)
-        log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - self.HALF_LOG_TWO_PI
+        log_prob: torch.Tensor = -((action_clamped - mean) ** 2) / (2 * var) - ls - self.HALF_LOG_TWO_PI
         log_prob = log_prob.sum(-1)
         
-        action_clamped = torch.clamp(action, -1.0, 1.0)
-        entropy: torch.Tensor = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1).expand_as(log_prob).clone()
+        entropy: torch.Tensor = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1).expand_as(log_prob)
         
         return action_clamped, log_prob, entropy, self.critic(obs).squeeze(-1)
 
@@ -115,7 +112,7 @@ class Agent(nn.Module):
         var: torch.Tensor = ls.exp().pow(2)
         
         log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - self.HALF_LOG_TWO_PI
-        entropy: torch.Tensor = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1).expand_as(log_prob[:, 0]).clone()
+        entropy: torch.Tensor = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1).expand_as(log_prob[:, 0])
         
         return log_prob.sum(-1), entropy, self.critic(obs).squeeze(-1)
 
@@ -156,7 +153,7 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
     agent.eval()
     
     try:
-        m: "Map" = env.map
+        m = env.map
         corners: np.ndarray = np.array(
             [
                 [-LENGTH / 2, -WIDTH / 2],
@@ -269,7 +266,7 @@ def _train_step_compiled(
     return loss, pg, v_loss, ent.mean(), approx_kl, clipfrac
 
 
-@torch.compile(mode="reduce-overhead", fullgraph=True)
+@torch.compile
 def compute_gae(
     rew_b: torch.Tensor,
     val_b: torch.Tensor,
@@ -300,9 +297,8 @@ def train(
     env: Environment,
     agent: Agent,
     iterations: int = 2000,
-    rollouts: int = 32,          
+    rollouts: int = 128,         
     epochs: int = 4,             
-    minibatches: int = 32,       
     gamma: float = 0.985,        
     gae_lambda: float = 0.95,
     clip: float = 0.2,
@@ -322,6 +318,31 @@ def train(
     process_profile = psutil.Process()
     N: int = env.num_envs
     
+    # -------------------------------------------------------------------------
+    # PARAMETER & HYPERPARAMETER TELEMETRY
+    # -------------------------------------------------------------------------
+    total_params = sum(p.numel() for p in agent.parameters())
+    trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
+    total_batch_size = rollouts * N
+    
+    print("=" * 80)
+    print(f"[{'TRAINING PIPELINE INITIALIZATION':^74}]")
+    print("=" * 80)
+    print(f" -> Compute Device      : {device}")
+    print(f" -> Parallel Envs (N)   : {N:,}")
+    print(f" -> Rollout Steps (T)   : {rollouts}")
+    print(f" -> Total Batch Size (B): {total_batch_size:,} steps/iteration")
+    print(f" -> Optimization Epochs : {epochs}")
+    print(f" -> Base Learning Rate  : {lr:<10} | Target KL Threshold: {target_kl}")
+    print(f" -> GAE Gamma           : {gamma:<10} | GAE Lambda        : {gae_lambda}")
+    print(f" -> Policy Clip Bounds  : {clip:<10} | Value Clip Bounds  : {vf_clip}")
+    print(f" -> Loss Weights        : Value: {vf_coef:<6} | Entropy: {ent_coef}")
+    print("-" * 80)
+    print(f" -> Total Parameters    : {total_params:,}")
+    print(f" -> Trainable Params    : {trainable_params:,}")
+    print("=" * 80)
+    # -------------------------------------------------------------------------
+
     opt: torch.optim.Optimizer = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5, fused=True)
     sched: KLAdaptiveLR = KLAdaptiveLR(opt, target_kl=target_kl)
     sensory_dim = OBS_DIM - 3
@@ -390,11 +411,15 @@ def train(
 
         obs_rms.update(raw_obs_b[..., 3:])
 
-        adv_b: torch.Tensor = compute_gae(rew_b, val_b, next_val, term_b, done_b, gamma, gae_lambda, rollouts).clone()
+        adv_b: torch.Tensor = compute_gae(rew_b, val_b, next_val, term_b, done_b, gamma, gae_lambda, rollouts)
         ret_b: torch.Tensor = adv_b + val_b
         
         B: int = rollouts * N
         global_step += B
+
+        TARGET_MINIBATCH_SIZE = 32768  
+        calculated_minibatches = max(1, B // TARGET_MINIBATCH_SIZE)
+        mb: int = B // calculated_minibatches
 
         b_obs: torch.Tensor = obs_b.reshape(B, OBS_DIM)
         b_act: torch.Tensor = act_b.reshape(B, ACT_DIM)
@@ -402,11 +427,11 @@ def train(
         b_adv: torch.Tensor = adv_b.reshape(B)
         b_ret: torch.Tensor = ret_b.reshape(B)
         b_val: torch.Tensor = val_b.reshape(B)
-        mb: int = B // minibatches
 
         agent.train()
         
-        epoch_stats = torch.zeros(5, dtype=torch.float32, device=device)
+        # Tracking metrics as Python variables to keep graph execution fully unblocked
+        tot_pg, tot_v, tot_ent, tot_kl, tot_clip = 0.0, 0.0, 0.0, 0.0, 0.0
         n_upd: int = 0
         current_ent_coef = max(0.001, ent_coef * (1.0 - (it / iterations)))
         
@@ -417,7 +442,6 @@ def train(
             
             for start in range(0, B, mb):
                 idx = perm[start : start + mb]
-                
                 opt.zero_grad(set_to_none=True)
                 
                 loss, pg, v_loss, ent_m, approx_kl, clipfrac = _train_step_compiled(
@@ -432,17 +456,16 @@ def train(
                 scaler.step(opt)
                 scaler.update()
 
-                epoch_stats[0].add_(pg.detach())
-                epoch_stats[1].add_(v_loss.detach())
-                epoch_stats[2].add_(ent_m.detach())
-                epoch_stats[3].add_(approx_kl.detach())
-                epoch_stats[4].add_(clipfrac.detach())
+                tot_pg += pg.item()
+                tot_v += v_loss.item()
+                tot_ent += ent_m.item()
+                tot_kl += approx_kl.item()
+                tot_clip += clipfrac.item()
                 n_upd += 1
                 
-        epoch_stats.div_(max(n_upd, 1))
-        stats_cpu = epoch_stats.to("cpu", non_blocking=True).numpy()
+        denom = max(n_upd, 1)
+        avg_pg, avg_v, avg_ent, final_kl, avg_clip = tot_pg/denom, tot_v/denom, tot_ent/denom, tot_kl/denom, tot_clip/denom
         
-        final_kl = float(stats_cpu[3])
         sched.step(final_kl)
         
         if final_kl > 1.5 * target_kl:
@@ -455,11 +478,11 @@ def train(
         last_t = now
         
         log: Dict[str, Any] = {
-            "policy_loss": float(stats_cpu[0]),
-            "value_loss": float(stats_cpu[1]),
-            "entropy": float(stats_cpu[2]),
+            "policy_loss": avg_pg,
+            "value_loss": avg_v,
+            "entropy": avg_ent,
             "approx_kl": final_kl,
-            "clipfrac": float(stats_cpu[4]),
+            "clipfrac": avg_clip,
             "current_epochs": current_epochs,  
             "log_std": agent.log_std.mean().item(),
             "iter_lr": sched.lr,
@@ -494,8 +517,8 @@ def train(
 
             print(
                 f"[{it:4d}] Real:{real_str} Sim:{sim_str} | {sps:>5d} SPS | "
-                f"R:{er:6.1f} L:{el:5.1f} Ent:{stats_cpu[2]:.3f} | "
-                f"V:{stats_cpu[1]:.3f} P:{stats_cpu[0]:.3f} Clp:{stats_cpu[4]:.2f} KL:{final_kl:.3f} | "
+                f"R:{er:6.1f} L:{el:5.1f} Ent:{avg_ent:.3f} | "
+                f"V:{avg_v:.3f} P:{avg_pg:.3f} Clp:{avg_clip:.2f} KL:{final_kl:.3f} | "
                 f"LR:{sched.lr:.1e} Ep:{current_epochs} | RAM:{ram:4.0f}M CPU:{cpu:4.1f}%"
             )
             

@@ -23,8 +23,8 @@ STEER_V_MAX = 4.5                    # [rad/s] Fast high-end steering servo limi
 A_MAX = 16.5                         # [m/s^2] 4S instantaneous peak torque acceleration (~1.68G)
 V_MIN = -4.0                         # [m/s] Capped reverse velocity
 V_MAX = 16.0                         # [m/s] ~35 mph ceiling for an indoor track setup
-PSI_PRIME_MAX = 5.5                  # [rad/s] Max yaw velocity rate
-BETA_MAX = 0.35                      # [rad] Tight body slip angle cap to emulate traction rolls
+PSI_PRIME_MAX = 7.5                  # [rad/s] Max yaw velocity rate
+BETA_MAX = 0.5                      # [rad] Tight body slip angle cap to emulate traction rolls
 
 MU = 1.15                            # [-] Mechanical traction coefficient of carpet tires on carpet
 DR_FRAC = 0.18                       # [-] Domain Randomization variance envelope (18% parameter flux)
