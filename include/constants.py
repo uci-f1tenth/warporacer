@@ -30,9 +30,13 @@ DT_SUB_SIX = DT_SUB / 6.0
 
 DR_FRAC = 0.15
 
-PROGRESS_SCALE = 200.0 #100.0
-PROGRESS_V_COEF = 400.0 #10.0
-TERM_PENALTY = 20.0 #10.0
+PROGRESS_SCALE = 1.0
+PROGRESS_V_COEF = 0.1
+TERM_PENALTY = -500.0
+BACKWARDS_PROGRESS_PENALTY_MUL = 100.0
+BACKWARDS_PENALTY_MUL = 50.0 # If velocity backward (v_along < 0), multiply the penalty by 5.0
+IDLE_PENALTY = -0.1 # -0.1 per step at 60Hz = -6.0 per second.
+LATERAL_PENALTY = -1.0  # Tunes how aggressively it hugs the center
 
 NUM_LIDAR = 108
 LIDAR_FOV = np.radians(270.0)

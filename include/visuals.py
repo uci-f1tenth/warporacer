@@ -106,11 +106,13 @@ class Visuals:
         sim_time = self.env._call * DT 
         self.renderer.begin_frame(sim_time)
         
+        self._render_user_car()
+
         # Direct routing handles individual agents or multi-agent swarm updates smoothly
-        if self.env.num_envs > 1:
-            self._render_all_agents()
-        else:
-            self._render_user_car()
+        # if self.env.num_envs > 1:
+        #     self._render_all_agents()
+        # else:
+        #     self._render_user_car()
             
         self._render_user_lidar()
         self.renderer.end_frame()

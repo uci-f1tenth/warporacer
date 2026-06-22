@@ -133,6 +133,7 @@ class ImGuiManager:
             # NOTE: We only pull agent 0 to the CPU to prevent massive frame drops.
             # Pulling thousands of agents to the CPU every frame for UI will destroy performance.
             car_state = self.env.cars_buf[0].cpu().numpy()
+            car_reward = self.env.rew_buf[0].cpu().numpy()
             
             car_x = car_state[0]
             car_y = car_state[1]
@@ -146,6 +147,7 @@ class ImGuiManager:
             imgui.text(f"Heading (Yaw): {np.degrees(car_yaw):.2f} deg")
             imgui.text(f"Velocity: {car_vel:.3f} m/s")
             imgui.text(f"Steering Angle: {np.degrees(car_steer):.2f} deg")
+            imgui.text(f"Reward: {car_reward:.3f}")
             
             imgui.separator()
             

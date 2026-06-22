@@ -12,7 +12,8 @@ from typing import TYPE_CHECKING # Forward declaration
 if TYPE_CHECKING:
     from include.visuals import Visuals
 
-# TODO : Enable randomize CW/CCW map directions
+# TODO : Enable randomize CW/CCW map directions (if doing idea below, have two versions?)
+# TODO : Instead of loading one map at a time, have them all load at once but isolated?
 
 class Environment:
     # Class attribute type annotations for structural linting and memory layout clarity

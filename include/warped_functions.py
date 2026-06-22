@@ -215,19 +215,6 @@ def step_kernel(
     elif 2 * d_wp < -n_cl:
         d_wp += n_cl
 
-    # Compute directional progress velocities and rewards
-    cth = centerline[new_wp][2]
-    v_along = v * wp.cos(beta + psi - cth)
-    progress = (
-        wp.float32(d_wp)
-        / wp.float32(n_cl)
-        * PROGRESS_SCALE
-        * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
-    )
-
-    term_pen = wp.where(term, -TERM_PENALTY, 0.0)
-    reward[i] = progress + term_pen
-
     # Assign state outcome flags to the shared global status array
     if term:
         done[i] = DONE_TERMINATED
@@ -236,7 +223,41 @@ def step_kernel(
     else:
         done[i] = 0
 
-    # Auto-Reset Logic Block
+    # =========================================================================
+    # PHASE 1: PRE-RESET REWARD CALCULATION
+    # Evaluate performance before modifying variables in the reset block
+    # =========================================================================
+    cpt_reward = centerline[new_wp]
+    cth_reward = cpt_reward[2]
+    
+    # 1. Asymmetric Waypoint Progress Penalty
+    base_progress = wp.where(
+        d_wp < 0,
+        (wp.float32(d_wp) / wp.float32(n_cl)) * PROGRESS_SCALE * BACKWARDS_PROGRESS_PENALTY_MUL,
+        (wp.float32(d_wp) / wp.float32(n_cl)) * PROGRESS_SCALE
+    )
+
+    # 2. Linear Velocity Progress (Cosine Trap Bug Fixed)
+    v_along = v * wp.cos(beta + psi - cth_reward)
+    vel_progress = v_along * PROGRESS_V_COEF
+
+    # 3. Crash / Termination Penalty
+    term_pen = wp.where(term, TERM_PENALTY, 0.0)
+    
+    # 4. Constant Existence Penalty (Anti-Idleness)
+    idle_pen = IDLE_PENALTY
+
+    # 5. Cross-Track / Lateral Error Penalty
+    lat_err_reward = -(x - cpt_reward[0]) * wp.sin(cth_reward) + (y - cpt_reward[1]) * wp.cos(cth_reward)
+    lat_pen = wp.abs(lat_err_reward) * LATERAL_PENALTY
+
+    # Summate total reward configuration
+    reward[i] = base_progress + vel_progress + term_pen + idle_pen + lat_pen
+
+    # =========================================================================
+    # PHASE 2: AUTO-RESET LOGIC BLOCK
+    # Teleport failed/finished lanes to a clean, safe state
+    # =========================================================================
     if term or trunc:
         rng = wp.rand_init(seed_base + i * 73 + steps * 31 + new_wp * 17)
         
@@ -262,7 +283,10 @@ def step_kernel(
         car_dr[i, 2] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 3] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
 
-    # Raymarching-based Lidar Scan Pass
+    # =========================================================================
+    # PHASE 3: POST-RESET OBSERVATION CALCULATION
+    # Extract sensory metrics matching the state the network faces next step
+    # =========================================================================
     sh = wp.sin(psi)
     ch = wp.cos(psi)
     lx = x + LF * ch
@@ -272,6 +296,7 @@ def step_kernel(
     lpos = wp.vec2(wp.float32(lpx), wp.float32(lpy))
     lrange_px = LIDAR_RANGE / res
     
+    # Raymarching-based Lidar Scan Pass
     for j in range(lidar_dirs.shape[0]):
         ca = lidar_dirs[j][0]
         sa = lidar_dirs[j][1]
@@ -304,11 +329,13 @@ def step_kernel(
     obs[i, OBS_FRENET_OFF] = heading_err
     obs[i, OBS_FRENET_OFF + 1] = lateral_err
 
-    # Compute Forward Track Lookahead Steps
+    # Compute Dynamic Forward Track Lookahead Steps
+    speed_factor = wp.max(1.0, v / 5.0) 
+    dynamic_look_step = wp.int32(wp.float32(look_step) * speed_factor)
+
     idx = new_wp
     for k in range(NUM_LOOKAHEAD):
-        idx += look_step
-        # API FIX: Replaced wp.select with modern wp.where syntax
+        idx += dynamic_look_step
         idx = wp.where(idx >= n_cl, idx - n_cl, idx)
         
         w = centerline[idx]
@@ -317,7 +344,7 @@ def step_kernel(
         obs[i, OBS_LOOK_OFF + k * 2] = dx * ch + dy * sh
         obs[i, OBS_LOOK_OFF + k * 2 + 1] = -dx * sh + dy * ch
 
-    # Flush local calculations to global memory blocks
+    # Flush final execution calculations back to global memory blocks
     obs[i, 0] = delta
     obs[i, 1] = v
     obs[i, 2] = psip
