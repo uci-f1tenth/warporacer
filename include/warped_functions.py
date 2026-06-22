@@ -198,15 +198,6 @@ def step_kernel(
     px = wp.clamp(wp.int32((x - origin[0]) / res), 0, mw - 1)
     py = wp.clamp(wp.int32(mh_f - (y - origin[1]) / res), 0, mh - 1)
     
-    # Look up distance values from the track distance transform field
-    edt_val = dt_map[px, py] * res
-    
-    # Combined standard track boundary failures with numerical stability guards
-    is_stable = wp.isfinite(x) and wp.isfinite(y) and wp.isfinite(v) and wp.isfinite(psi)
-    term = (edt_val < CAR_HALF_DIAG) or (not is_stable)
-    trunc = steps >= MAX_STEPS
-    steps += 1
-
     # Extract target progression waypoints
     new_wp = cl_lut[px, py]
     d_wp = new_wp - wp_i
@@ -215,7 +206,28 @@ def step_kernel(
     elif 2 * d_wp < -n_cl:
         d_wp += n_cl
 
-    # Assign state outcome flags to the shared global status array
+    # --- NEW OFF-TRACK KILL SWITCH & LOCAL REFERENCES ---
+    cpt_local = centerline[new_wp]
+    cx_local = cpt_local[0]
+    cy_local = cpt_local[1]
+    cth_local = cpt_local[2]
+    
+    s_cth_local = wp.sin(cth_local)
+    c_cth_local = wp.cos(cth_local)
+    
+    # Absolute physical distance from the immediate centerline
+    true_lateral_dist = wp.abs(-(x - cx_local) * s_cth_local + (y - cy_local) * c_cth_local)
+
+    # Terminate if it hits a wall OR wanders too far into a dead end (e.g., > 3.0 meters)
+    edt_val = dt_map[px, py] * res
+    is_stable = wp.isfinite(x) and wp.isfinite(y) and wp.isfinite(v) and wp.isfinite(psi)
+    is_off_track = true_lateral_dist > MAX_CENTERLINE_DEV
+    
+    term = (edt_val < CAR_HALF_DIAG) or (not is_stable) or is_off_track
+    trunc = steps >= MAX_STEPS
+    steps += 1
+
+    # Assign state outcome flags
     if term:
         done[i] = DONE_TERMINATED
     elif trunc:
@@ -225,10 +237,7 @@ def step_kernel(
 
     # =========================================================================
     # PHASE 1: PRE-RESET REWARD CALCULATION
-    # Evaluate performance before modifying variables in the reset block
     # =========================================================================
-    cpt_reward = centerline[new_wp]
-    cth_reward = cpt_reward[2]
     
     # 1. Asymmetric Waypoint Progress Penalty
     base_progress = wp.where(
@@ -237,21 +246,26 @@ def step_kernel(
         (wp.float32(d_wp) / wp.float32(n_cl)) * PROGRESS_SCALE
     )
 
-    # 2. Linear Velocity Progress (Cosine Trap Bug Fixed)
-    v_along = v * wp.cos(beta + psi - cth_reward)
+    # 2. Predictive Velocity Progress (LOOKAHEAD TARGET)
+    target_wp = new_wp + look_step
+    if target_wp >= n_cl:
+        target_wp -= n_cl
+        
+    cth_target = centerline[target_wp][2]
+    v_along = v * wp.max(0.0, wp.cos(beta + psi - cth_target))
     vel_progress = v_along * PROGRESS_V_COEF
 
-    # 3. Crash / Termination Penalty
+    # 3. Crash Penalty
     term_pen = wp.where(term, TERM_PENALTY, 0.0)
     
-    # 4. Constant Existence Penalty (Anti-Idleness)
+    # 4. Anti-Idleness
     idle_pen = IDLE_PENALTY
 
-    # 5. Cross-Track / Lateral Error Penalty
-    lat_err_reward = -(x - cpt_reward[0]) * wp.sin(cth_reward) + (y - cpt_reward[1]) * wp.cos(cth_reward)
-    lat_pen = wp.abs(lat_err_reward) * LATERAL_PENALTY
+    # 5. Squared Cross-Track Error (LOCAL TARGET)
+    # Uses the local coordinates calculated just before termination logic
+    lat_err_reward = -(x - cx_local) * s_cth_local + (y - cy_local) * c_cth_local
+    lat_pen = (lat_err_reward * lat_err_reward) * LATERAL_PENALTY
 
-    # Summate total reward configuration
     reward[i] = base_progress + vel_progress + term_pen + idle_pen + lat_pen
 
     # =========================================================================
@@ -316,16 +330,11 @@ def step_kernel(
                 break
         obs[i, 3 + j] = wp.min(dist, lrange_px) * res
 
-    # Compute Frenet Tracking Errors
-    cpt = centerline[new_wp]
-    cx_p = cpt[0]
-    cy_p = cpt[1]
-    cth_p = cpt[2]
-    s_cth = wp.sin(cth_p)
-    c_cth = wp.cos(cth_p)
+    # Compute Frenet Tracking Errors (Strictly Local)
+    # We reuse the local heading/sine/cosine from earlier in the kernel
+    heading_err = wp.atan2(s_cth_local * ch - c_cth_local * sh, c_cth_local * ch + s_cth_local * sh)
+    lateral_err = -(x - cx_local) * s_cth_local + (y - cy_local) * c_cth_local
     
-    heading_err = wp.atan2(s_cth * ch - c_cth * sh, c_cth * ch + s_cth * sh)
-    lateral_err = -(x - cx_p) * s_cth + (y - cy_p) * c_cth
     obs[i, OBS_FRENET_OFF] = heading_err
     obs[i, OBS_FRENET_OFF + 1] = lateral_err
 

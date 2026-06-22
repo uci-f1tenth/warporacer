@@ -105,14 +105,12 @@ class Visuals:
         """Pushes current state calculations down to visual graphics primitives."""
         sim_time = self.env._call * DT 
         self.renderer.begin_frame(sim_time)
-        
-        self._render_user_car()
 
         # Direct routing handles individual agents or multi-agent swarm updates smoothly
-        # if self.env.num_envs > 1:
-        #     self._render_all_agents()
-        # else:
-        #     self._render_user_car()
+        if self.env.num_envs > 1:
+            self._render_all_agents()
+        else:
+            self._render_user_car()
             
         self._render_user_lidar()
         self.renderer.end_frame()
@@ -193,13 +191,18 @@ class Visuals:
 
     def _render_all_agents(self) -> None:
         """Handles structural allocation, color distribution, and updates for massive parallel agent swarms."""
+        # Adjust this divider to control rendering density (e.g., 100 renders 1% of total agents)
+        agent_count_divider = 1000
+        
+        # OPTIMIZATION 1: Single GPU-to-CPU transfer & immediate array slicing.
+        # This grabs only the subset of cars we actually intend to render.
+        car_states = self.env.cars_buf.cpu().numpy()[::agent_count_divider]
+        num_cars_to_render = len(car_states)
+        
         if not self.initialized_all_agents:
-            all_car_states = self.env.cars_buf.cpu().numpy()
-            
-            for i in range(self.env.num_envs):
-                percent = float(i / self.env.num_envs)
-                car_state = all_car_states[i]
-                car_x, car_y, car_psi = car_state[0], car_state[1], car_state[4]
+            for i in range(num_cars_to_render):
+                percent = float(i / num_cars_to_render)
+                car_x, car_y, car_psi = car_states[i, 0], car_states[i, 1], car_states[i, 4]
                 car_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(car_psi))
 
                 car_name = f"car_{i}"
@@ -222,23 +225,20 @@ class Visuals:
             
             self.initialized_all_agents = True
 
-        # Extract current physical coordinate structures out of shared PyTorch engine arrays
-        car_states = self.env.cars_buf.cpu().numpy()
-        num_cars = len(car_states)
-        
+        # Extract current physical coordinate structures for the active rendering subset
         xs = car_states[:, 0]
         ys = car_states[:, 1]
         psis = car_states[:, 4]
 
         # Vectorize spatial orientation transformations to avoid CPU bottleneck constraints
-        angles = np.zeros((num_cars, 3))
+        angles = np.zeros((num_cars_to_render, 3))
         angles[:, 2] = psis 
         
         # Convert raw yaw values into uniform quaternion blocks using lightning-fast Scipy C calls
         quats = R.from_euler('xyz', angles, degrees=False).as_quat()
 
         # Execute instanced property writes over the underlying object transformations
-        for i in range(num_cars):
+        for i in range(num_cars_to_render):
             self.renderer.update_shape_instance(
                 name=f"car_{i}",
                 pos=[xs[i], ys[i], 0.15],
