@@ -50,8 +50,9 @@ class ReturnNormalizer:
         self.rms: RunningMeanStd = RunningMeanStd((), device)
 
     def update(self, reward: torch.Tensor, done: torch.Tensor) -> None:
-        self.returns = self.returns * self.gamma * (1.0 - done) + reward
+        self.returns = self.returns * self.gamma + reward
         self.rms.update(self.returns)
+        self.returns = self.returns * (1.0 - done) # Reset fresh for the next step
 
     def normalize(self, reward: torch.Tensor) -> torch.Tensor:
         return reward * self.rms.inv_std
@@ -68,30 +69,41 @@ class Agent(nn.Module):
     LOGSTD_MAX: float = -0.5
     HALF_LOG_TWO_PI: float = 0.9189385332046727
 
-    def __init__(self, obs_dim: int = OBS_DIM, act_dim: int = ACT_DIM, hidden: int = 256) -> None:
+    def __init__(self, obs_dim: int = OBS_DIM, act_dim: int = ACT_DIM, hidden: int = 512) -> None:
         super().__init__()
         self.actor: nn.Sequential = nn.Sequential(
             layer_init(nn.Linear(obs_dim, hidden)),
+            nn.LayerNorm(hidden),
             nn.Tanh(),
             layer_init(nn.Linear(hidden, hidden)),
+            nn.LayerNorm(hidden),
+            nn.Tanh(),
+            layer_init(nn.Linear(hidden, hidden)),
+            nn.LayerNorm(hidden),
             nn.Tanh(),
             layer_init(nn.Linear(hidden, act_dim), std=0.01),
         )
         self.critic: nn.Sequential = nn.Sequential(
             layer_init(nn.Linear(obs_dim, hidden)),
+            nn.LayerNorm(hidden),
             nn.Tanh(),
             layer_init(nn.Linear(hidden, hidden)),
+            nn.LayerNorm(hidden),
+            nn.Tanh(),
+            layer_init(nn.Linear(hidden, hidden)),
+            nn.LayerNorm(hidden),
             nn.Tanh(),
             layer_init(nn.Linear(hidden, 1), std=1.0),
         )
-        self.log_std: nn.Parameter = nn.Parameter(torch.full((1, act_dim), -0.8))
+        self.log_std = nn.Parameter(torch.zeros(1, act_dim))
 
     def value(self, obs: torch.Tensor) -> torch.Tensor:
         return self.critic(obs).squeeze(-1)
 
-    def act_value(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def act_value(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         mean: torch.Tensor = self.actor(obs)
-        ls: torch.Tensor = self.log_std.clamp(self.LOGSTD_MIN, self.LOGSTD_MAX)
+        # Smoothly scales unconstrained parameter space to your min/max window
+        ls = self.LOGSTD_MIN + (self.LOGSTD_MAX - self.LOGSTD_MIN) * torch.sigmoid(self.log_std)
         std: torch.Tensor = ls.exp()
         
         noise: torch.Tensor = torch.randn_like(mean)
@@ -99,12 +111,14 @@ class Agent(nn.Module):
         action_clamped = torch.clamp(action, -1.0, 1.0)
         
         var: torch.Tensor = std.pow(2)
-        log_prob: torch.Tensor = -((action_clamped - mean) ** 2) / (2 * var) - ls - self.HALF_LOG_TWO_PI
+        # Calculate log_prob using the RAW action to preserve clean continuous gradients
+        log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - self.HALF_LOG_TWO_PI
         log_prob = log_prob.sum(-1)
         
         entropy: torch.Tensor = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1).expand_as(log_prob)
         
-        return action_clamped, log_prob, entropy, self.critic(obs).squeeze(-1)
+        # Return BOTH raw and clamped actions
+        return action, action_clamped, log_prob, entropy, self.critic(obs).squeeze(-1)
 
     def evaluate(self, obs: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mean: torch.Tensor = self.actor(obs)
@@ -230,7 +244,7 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
 def _train_step_compiled(
     agent: Agent,
     b_obs_idx: torch.Tensor,
-    b_act_idx: torch.Tensor,
+    b_act_idx: torch.Tensor, # This will now hold the raw actions
     b_logp_idx: torch.Tensor,
     b_adv_idx: torch.Tensor,
     b_ret_idx: torch.Tensor,
@@ -243,7 +257,8 @@ def _train_step_compiled(
     with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
         new_logp, ent, new_val = agent.evaluate(b_obs_idx, b_act_idx)
         
-        logratio: torch.Tensor = new_logp - b_logp_idx
+        # Cast to float32 to prevent exponentiation overflow/underflow in half-precision
+        logratio: torch.Tensor = new_logp.float() - b_logp_idx.float()
         ratio: torch.Tensor = logratio.exp()
         
         approx_kl: torch.Tensor = ((ratio - 1.0) - logratio).mean()
@@ -254,9 +269,9 @@ def _train_step_compiled(
         s2: torch.Tensor = ratio.clamp(1 - clip, 1 + clip) * adv_mb
         pg: torch.Tensor = -torch.min(s1, s2).mean()
         
-        v_err: torch.Tensor = new_val - b_ret_idx
+        v_err: torch.Tensor = new_val.float() - b_ret_idx.float()
         if vf_clip > 0:
-            v_clipped: torch.Tensor = b_val_idx + (new_val - b_val_idx).clamp(-vf_clip, vf_clip)
+            v_clipped: torch.Tensor = b_val_idx.float() + (new_val.float() - b_val_idx.float()).clamp(-vf_clip, vf_clip)
             v_loss: torch.Tensor = 0.5 * torch.max(v_err.square(), (v_clipped - b_ret_idx).square()).mean()
         else:
             v_loss = 0.5 * v_err.square().mean()
@@ -306,7 +321,7 @@ def train(
     vf_coef: float = 0.5,
     ent_coef: float = 0.01,      
     max_grad_norm: float = 0.5,
-    lr: float = 4e-4,            
+    lr: float = 2.5e-4,            
     target_kl: float = 0.015,    
     log_dir: Path = Path("./logs"),
     record_every_iteration: int = 100,
@@ -344,7 +359,18 @@ def train(
     # -------------------------------------------------------------------------
 
     opt: torch.optim.Optimizer = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5, fused=True)
-    sched: KLAdaptiveLR = KLAdaptiveLR(opt, target_kl=target_kl)
+    
+    # Drop base optimizer LR down slightly for smoother high-batch step mechanics
+    for pg in opt.param_groups:
+        pg["lr"] = lr
+
+    # Cosine annealing that safely floors at 5e-5
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, 
+        T_max=iterations, 
+        eta_min=5e-5
+    )
+    
     sensory_dim = OBS_DIM - 3
     obs_rms: RunningMeanStd = RunningMeanStd((sensory_dim,), device)
     ret_rms: ReturnNormalizer = ReturnNormalizer(N, gamma, device)
@@ -378,12 +404,14 @@ def train(
         agent.eval()
         with torch.no_grad():
             for t in range(rollouts):
+                # Inside your data generation loop:
                 obs_b[t] = obs
-                act, logp, _, val = agent.act_value(obs)
-                act_b[t] = act
+                act_raw, act_clamped, logp, _, val = agent.act_value(obs)
+                act_b[t] = act_raw # Store the raw action for mathematical consistency during training
                 logp_b[t] = logp
                 val_b[t] = val
-                raw, raw_rew, term, trunc, _ = env.step(act)
+
+                raw, raw_rew, term, trunc, _ = env.step(act_clamped) # Step the environment with the clamped action
                 raw_obs_b[t] = raw
 
                 done: torch.Tensor = (term | trunc).float()
@@ -410,6 +438,8 @@ def train(
             next_val: torch.Tensor = agent.value(obs)
 
         obs_rms.update(raw_obs_b[..., 3:])
+        # Re-normalize the trailing state using the fresh statistics before the next iteration
+        obs = process_observations(raw, obs_rms)
 
         adv_b: torch.Tensor = compute_gae(rew_b, val_b, next_val, term_b, done_b, gamma, gae_lambda, rollouts)
         ret_b: torch.Tensor = adv_b + val_b
@@ -417,7 +447,7 @@ def train(
         B: int = rollouts * N
         global_step += B
 
-        TARGET_MINIBATCH_SIZE = 32768  
+        TARGET_MINIBATCH_SIZE = 16384
         calculated_minibatches = max(1, B // TARGET_MINIBATCH_SIZE)
         mb: int = B // calculated_minibatches
 
@@ -430,18 +460,22 @@ def train(
 
         agent.train()
         
-        # Tracking metrics as Python variables to keep graph execution fully unblocked
         tot_pg, tot_v, tot_ent, tot_kl, tot_clip = 0.0, 0.0, 0.0, 0.0, 0.0
         n_upd: int = 0
         current_ent_coef = max(0.001, ent_coef * (1.0 - (it / iterations)))
-        
         permutation_indices = torch.arange(B, device=device)
 
         for epoch in range(current_epochs):  
             perm = permutation_indices[torch.randperm(B, device=device)]
+            epoch_kl = 0.0
+            minibatches_run = 0
             
+            # Drop the remainder batch if it isn't an exact match
             for start in range(0, B, mb):
                 idx = perm[start : start + mb]
+                if idx.shape[0] != mb: 
+                    continue # Skip the odd-sized remainder to protect torch.compile
+
                 opt.zero_grad(set_to_none=True)
                 
                 loss, pg, v_loss, ent_m, approx_kl, clipfrac = _train_step_compiled(
@@ -463,10 +497,18 @@ def train(
                 tot_clip += clipfrac.item()
                 n_upd += 1
                 
+                epoch_kl += approx_kl.item()
+                minibatches_run += 1
+            
+            # Post-epoch check: Stop optimizing if the average drift this epoch is too high
+            if minibatches_run > 0 and (epoch_kl / minibatches_run) > target_kl * 2.0:
+                break
+                
         denom = max(n_upd, 1)
         avg_pg, avg_v, avg_ent, final_kl, avg_clip = tot_pg/denom, tot_v/denom, tot_ent/denom, tot_kl/denom, tot_clip/denom
         
-        sched.step(final_kl)
+        # Scheduler execution step
+        sched.step()
         
         if final_kl > 1.5 * target_kl:
             current_epochs = max(1, current_epochs - 1)
@@ -477,6 +519,9 @@ def train(
         sps: int = int(rollouts * N / max(now - last_t, 1e-9))
         last_t = now
         
+        # Extracted active learning rate securely from the base optimizer parameter group
+        current_lr = float(opt.param_groups[0]["lr"])
+
         log: Dict[str, Any] = {
             "policy_loss": avg_pg,
             "value_loss": avg_v,
@@ -485,7 +530,7 @@ def train(
             "clipfrac": avg_clip,
             "current_epochs": current_epochs,  
             "log_std": agent.log_std.mean().item(),
-            "iter_lr": sched.lr,
+            "iter_lr": current_lr,
             "sps": sps,
             "iteration": it,
         }
@@ -519,7 +564,7 @@ def train(
                 f"[{it:4d}] Real:{real_str} Sim:{sim_str} | {sps:>5d} SPS | "
                 f"R:{er:6.1f} L:{el:5.1f} Ent:{avg_ent:.3f} | "
                 f"V:{avg_v:.3f} P:{avg_pg:.3f} Clp:{avg_clip:.2f} KL:{final_kl:.3f} | "
-                f"LR:{sched.lr:.1e} Ep:{current_epochs} | RAM:{ram:4.0f}M CPU:{cpu:4.1f}%"
+                f"LR:{current_lr:.1e} Ep:{current_epochs} | RAM:{ram:4.0f}M CPU:{cpu:4.1f}%"
             )
             
         if record_every_iteration > 0 and (it + 1) % record_every_iteration == 0:

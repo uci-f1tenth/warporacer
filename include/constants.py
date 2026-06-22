@@ -44,20 +44,20 @@ DT_SUB_SIX = DT_SUB / 6.0            # [s] Cache constant for solver
 # 4. Reward Shaping & Normalization Weights (Generalization Tuned)
 # =========================================================================
 PROGRESS_SCALE = 1.2                 # INCREASING: Prioritize raw downward track progression
-PROGRESS_V_COEF = 0.5                # INCREASING: Reward velocity aligned with the path horizon
+PROGRESS_V_COEF = 1.2                # INCREASING: Reward velocity aligned with the path horizon
 BACKWARDS_PROGRESS_PENALTY_MUL = 20.0 # INCREASING: Explicitly kill wrong-way wiggling immediately
 TERM_PENALTY = -150.0                # INCREASING: Give crashing a sharper, distinct penalty drop
 
 IDLE_PENALTY = -0.4                  # INCREASING: Make loitering or oscillation hurt more
-# REDUCED: Crucial fix. Lowered from -0.15 to -0.03. This allows the agent to scale the 
-# outer walls and cut the inner apexes of tight turns without getting choked out by penalties.
-LATERAL_PENALTY = -0.03              
+# RESTORING: Bring this back to a modest value. This forces the agent to keep 
+# moving cleanly along the track vector rather than parking on the apex.
+LATERAL_PENALTY = -0.05
 
-MAX_CENTERLINE_DEV = 1.5             # [m] Track boundary containment zone
-STALL_VELOCITY = 1.2                 # INCREASING: Move the minimum acceptable velocity floor up
-# REDUCED: Dropped from 3.0s to 1.0s. At 60Hz, 3 seconds allowed endless exploit wiggling. 
-# 1 second forces the agent to make a real forward choice or get re-spawnd.
-STALL_SECONDS_TO_STEPS = 1.0 / DT
+MAX_CENTERLINE_DEV = 2.0             # [m] Track boundary containment zone
+STALL_VELOCITY = 1.5
+# DECREASING: Drop from 1.0s to 0.4s. At 60Hz, 0.4 seconds means if it 
+# sits there wiggling for more than 24 frames, it gets instantly terminated.
+STALL_SECONDS_TO_STEPS = 0.4 / DT
 
 # =========================================================================
 # 5. Sensors & Observation Tensor Offsets
@@ -85,8 +85,10 @@ DONE_TRUNCATED = 2                   # Environment timeout truncation flag state
 # =========================================================================
 # 7. Dynamic Horizon Tuning Constants
 # =========================================================================
-BASE_STRIDE = 6.0          # [points] Minimum waypoint index skip at 0 m/s
-VELOCITY_SCALE = 1.0       # [-] Scaling multiplier tracking forward velocity
+# INCREASED: Gives a larger target window so the relative angle to the target
+# waypoint doesn't flip wildly when entering an apex at speed.
+BASE_STRIDE = 15.0          # [points] Minimum waypoint index skip at 0 m/s
+VELOCITY_SCALE = 1.5        # [-] Scaling multiplier tracking forward velocity
 
 # Things to reward
 # - Following centerline
