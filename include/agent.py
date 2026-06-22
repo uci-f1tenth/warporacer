@@ -321,7 +321,7 @@ def train(
     vf_coef: float = 0.5,
     ent_coef: float = 0.01,      
     max_grad_norm: float = 0.5,
-    lr: float = 2.5e-4,            
+    lr: float = 2.0e-4,            
     target_kl: float = 0.015,    
     log_dir: Path = Path("./logs"),
     record_every_iteration: int = 100,

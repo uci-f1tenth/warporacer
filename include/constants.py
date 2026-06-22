@@ -43,12 +43,12 @@ DT_SUB_SIX = DT_SUB / 6.0            # [s] Cache constant for solver
 # =========================================================================
 # 4. Reward Shaping & Normalization Weights (Generalization Tuned)
 # =========================================================================
-PROGRESS_SCALE = 0.8                 # INCREASING: Prioritize raw downward track progression
-PROGRESS_V_COEF = 0.8                # INCREASING: Reward velocity aligned with the path horizon
-BACKWARDS_PROGRESS_PENALTY_MUL = 24.0 # INCREASING: Explicitly kill wrong-way wiggling immediately
-TERM_PENALTY = -300.0                # INCREASING: Give crashing a sharper, distinct penalty drop
+PROGRESS_SCALE = 1.0                 # INCREASING: Prioritize raw downward track progression
+PROGRESS_V_COEF = 0.5                # INCREASING: Reward velocity aligned with the path horizon
+BACKWARDS_PROGRESS_PENALTY_MUL = 50.0 # INCREASING: Explicitly kill wrong-way wiggling immediately
+TERM_PENALTY = -500.0                # INCREASING: Give crashing a sharper, distinct penalty drop
 
-IDLE_PENALTY = -0.4                  # INCREASING: Make loitering or oscillation hurt more
+IDLE_PENALTY = -0.5                  # INCREASING: Make loitering or oscillation hurt more
 # RESTORING: Bring this back to a modest value. This forces the agent to keep 
 # moving cleanly along the track vector rather than parking on the apex.
 LATERAL_PENALTY = -0.05
