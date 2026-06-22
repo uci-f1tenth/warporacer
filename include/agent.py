@@ -1,22 +1,23 @@
-import math
-import time
 from collections import deque
+import math
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from cv2 import COLOR_GRAY2RGB, cvtColor, fillPoly, polylines
 import imageio.v2 as imageio
 import numpy as np
+import psutil  # Native package overhead profiling
 import torch
 import torch.nn as nn
-import wandb
-import psutil  # Native package overhead profiling
-from cv2 import COLOR_GRAY2RGB, cvtColor, fillPoly, polylines
 from torch.distributions import Normal
+import wandb
 
 from include.constants import *
 from include.environment import Environment
 from include.map import Map
 
+# Fast matrix multiplication layout alignment configurations
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -24,7 +25,7 @@ torch.backends.cudnn.allow_tf32 = True
 class RunningMeanStd:
     def __init__(self, shape: Tuple[int, ...], device: torch.device) -> None:
         self.mean: torch.Tensor = torch.zeros(shape, dtype=torch.float32, device=device)
-        self.var: torch.Tensor = torch.ones(shape, dtype=torch.float32, device=device)
+        self.var: torch.Tensor = torch.zeros(shape, dtype=torch.float32, device=device)
         self.inv_std: torch.Tensor = torch.ones(shape, dtype=torch.float32, device=device)
         self.count: float = 1e-4
 
@@ -68,6 +69,7 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2.0), bias: float = 0.0) -
 class Agent(nn.Module):
     LOGSTD_MIN: float = -2.0
     LOGSTD_MAX: float = -0.5
+    HALF_LOG_TWO_PI: float = 0.9189385332046727
 
     def __init__(self, obs_dim: int = OBS_DIM, act_dim: int = ACT_DIM, hidden: int = 256) -> None:
         super().__init__()
@@ -86,7 +88,6 @@ class Agent(nn.Module):
             layer_init(nn.Linear(hidden, 1), std=1.0),
         )
         self.log_std: nn.Parameter = nn.Parameter(torch.full((1, act_dim), -0.8))
-        self._compiled: bool = False
 
     def value(self, obs: torch.Tensor) -> torch.Tensor:
         return self.critic(obs).squeeze(-1)
@@ -98,13 +99,13 @@ class Agent(nn.Module):
         
         noise: torch.Tensor = torch.randn_like(mean)
         action: torch.Tensor = mean + noise * std
-        action_clamped = torch.clamp(action, -1.0, 1.0)
         
         var: torch.Tensor = std.pow(2)
-        log_prob: torch.Tensor = -((action_clamped - mean) ** 2) / (2 * var) - ls - math.log(math.sqrt(2 * math.pi))
+        log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - self.HALF_LOG_TWO_PI
         log_prob = log_prob.sum(-1)
         
-        entropy: torch.Tensor = (0.5 + 0.5 * math.log(2 * math.pi) + ls).sum(-1).expand_as(log_prob).clone()
+        action_clamped = torch.clamp(action, -1.0, 1.0)
+        entropy: torch.Tensor = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1).expand_as(log_prob).clone()
         
         return action_clamped, log_prob, entropy, self.critic(obs).squeeze(-1)
 
@@ -113,8 +114,8 @@ class Agent(nn.Module):
         ls: torch.Tensor = self.log_std.clamp(self.LOGSTD_MIN, self.LOGSTD_MAX)
         var: torch.Tensor = ls.exp().pow(2)
         
-        log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - math.log(math.sqrt(2 * math.pi))
-        entropy: torch.Tensor = (0.5 + 0.5 * math.log(2 * math.pi) + ls).sum(-1).expand_as(log_prob[:, 0]).clone()
+        log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - self.HALF_LOG_TWO_PI
+        entropy: torch.Tensor = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1).expand_as(log_prob[:, 0]).clone()
         
         return log_prob.sum(-1), entropy, self.critic(obs).squeeze(-1)
 
@@ -229,10 +230,8 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
 
 
 @torch.compile(mode="reduce-overhead")
-def _train_step(
+def _train_step_compiled(
     agent: Agent,
-    opt: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
     b_obs_idx: torch.Tensor,
     b_act_idx: torch.Tensor,
     b_logp_idx: torch.Tensor,
@@ -243,8 +242,7 @@ def _train_step(
     vf_coef: float,
     vf_clip: float,
     ent_coef: float,
-    max_grad_norm: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
         new_logp, ent, new_val = agent.evaluate(b_obs_idx, b_act_idx)
         
@@ -267,15 +265,8 @@ def _train_step(
             v_loss = 0.5 * v_err.square().mean()
             
         loss: torch.Tensor = pg + vf_coef * v_loss - ent_coef * ent.mean()
-
-    opt.zero_grad(set_to_none=True)
-    scaler.scale(loss).backward()
-    scaler.unscale_(opt)
-    torch.nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
-    scaler.step(opt)
-    scaler.update()
-    
-    return pg, v_loss, ent.mean(), approx_kl, clipfrac
+        
+    return loss, pg, v_loss, ent.mean(), approx_kl, clipfrac
 
 
 @torch.compile(mode="reduce-overhead", fullgraph=True)
@@ -337,11 +328,6 @@ def train(
     obs_rms: RunningMeanStd = RunningMeanStd((sensory_dim,), device)
     ret_rms: ReturnNormalizer = ReturnNormalizer(N, gamma, device)
 
-    if not agent._compiled:
-        agent.evaluate = torch.compile(agent.evaluate, mode="reduce-overhead")
-        agent.act_value = torch.compile(agent.act_value, mode="reduce-overhead")
-        agent._compiled = True
-
     scaler: torch.amp.GradScaler = torch.amp.GradScaler("cuda")
 
     obs_b: torch.Tensor = torch.zeros((rollouts, N, OBS_DIM), device=device)
@@ -389,8 +375,10 @@ def train(
                 
                 fin: torch.Tensor = done.bool()
                 if fin.any():
-                    finished_rets.extend(ep_ret[fin].detach().cpu().numpy())
-                    finished_lens.extend(ep_len[fin].detach().cpu().numpy())
+                    res_rets = ep_ret[fin].to("cpu", non_blocking=True).numpy()
+                    res_lens = ep_len[fin].to("cpu", non_blocking=True).numpy()
+                    finished_rets.extend(res_rets)
+                    finished_lens.extend(res_lens)
                     ep_ret[fin] = 0.0
                     ep_len[fin] = 0.0
                 obs = process_observations(raw, obs_rms)
@@ -418,24 +406,32 @@ def train(
 
         agent.train()
         
-        # Unified allocation on GPU to prevent pipeline stalling
         epoch_stats = torch.zeros(5, dtype=torch.float32, device=device)
         n_upd: int = 0
         current_ent_coef = max(0.001, ent_coef * (1.0 - (it / iterations)))
         
-        torch.compiler.cudagraph_mark_step_begin()
+        permutation_indices = torch.arange(B, device=device)
+
         for epoch in range(current_epochs):  
-            perm = torch.randperm(B, device=device)
+            perm = permutation_indices[torch.randperm(B, device=device)]
+            
             for start in range(0, B, mb):
                 idx = perm[start : start + mb]
                 
-                pg, v_loss, ent_m, approx_kl, clipfrac = _train_step(
-                    agent, opt, scaler, b_obs[idx], b_act[idx], b_logp[idx], 
+                opt.zero_grad(set_to_none=True)
+                
+                loss, pg, v_loss, ent_m, approx_kl, clipfrac = _train_step_compiled(
+                    agent, b_obs[idx], b_act[idx], b_logp[idx], 
                     b_adv[idx], b_ret[idx], b_val[idx], clip, vf_coef, vf_clip, 
-                    current_ent_coef, max_grad_norm
+                    current_ent_coef
                 )
+                
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
+                scaler.step(opt)
+                scaler.update()
 
-                # Detaching here prevents a massive gradient history graph from building up
                 epoch_stats[0].add_(pg.detach())
                 epoch_stats[1].add_(v_loss.detach())
                 epoch_stats[2].add_(ent_m.detach())
@@ -444,9 +440,7 @@ def train(
                 n_upd += 1
                 
         epoch_stats.div_(max(n_upd, 1))
-        
-        # This will now execute perfectly without needing an extra .detach() here
-        stats_cpu = epoch_stats.cpu().numpy()
+        stats_cpu = epoch_stats.to("cpu", non_blocking=True).numpy()
         
         final_kl = float(stats_cpu[3])
         sched.step(final_kl)
@@ -488,18 +482,15 @@ def train(
             cpu = process_profile.cpu_percent()
             ram = process_profile.memory_info().rss / 1048576
 
-            # --- Time Metric Calculations (Reading your imported constants natively) ---
             real_elapsed = time.time() - start_wall_clock
             rh, rem = divmod(real_elapsed, 3600)
             rm, rs = divmod(rem, 60)
             real_str = f"{int(rh):02d}:{int(rm):02d}:{int(rs):02d}"
 
-            # Uses DT directly from include.constants
             sim_elapsed_seconds = global_step * DT  
             sh, srem = divmod(sim_elapsed_seconds, 3600)
             sm, ss = divmod(srem, 60)
             sim_str = f"{int(sh):02d}:{int(sm):02d}:{int(ss):02d}"
-            # ----------------------------------------------------------------------------
 
             print(
                 f"[{it:4d}] Real:{real_str} Sim:{sim_str} | {sps:>5d} SPS | "
