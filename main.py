@@ -52,7 +52,9 @@ DR_FRAC = 0.15
 
 PROGRESS_SCALE = 100.0
 PROGRESS_V_COEF = 10.0
-TERM_PENALTY = 25.0  # crash cost; must dominate the pre-crash progress a floored corner can farm
+TERM_PENALTY = (
+    25.0  # crash cost; must dominate the pre-crash progress a floored corner can farm
+)
 
 NUM_LIDAR = 108
 LIDAR_FOV = np.radians(270.0)
@@ -71,10 +73,14 @@ DONE_TRUNCATED = 2
 # --- Sim-to-real / racing-line config (retrain-only; toggle each independently) ---
 LIDAR_MOUNT_X = 0.2733  # m, real base_link->laser offset (sim raytraced from LF before)
 VESC_TAU = 0.15  # s, first-order speed-loop time constant (~3*tau ≈ 0.45 s to settle)
-V_LEAD_MARGIN = 2.0  # m/s, cap how far the speed setpoint leads actual v (matches the node)
+V_LEAD_MARGIN = (
+    2.0  # m/s, cap how far the speed setpoint leads actual v (matches the node)
+)
 MU_DR_LO = 0.70  # grip domain randomization: a_max scale low bound ...
 MU_DR_HI = 1.10  # ... and high bound (real track grip is usually below MU)
-LATENCY_MAX_STEPS = 0  # max randomized actuation/sensing delay, control steps (raise to ~3 to harden)
+LATENCY_MAX_STEPS = (
+    3  # max randomized actuation/sensing delay, control steps (raise to ~3 to harden)
+)
 
 
 @wp.struct
@@ -364,9 +370,7 @@ class Map:
         kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
         skel = skel.copy()
         while True:
-            counts = convolve(
-                skel.astype(np.uint8), kernel, mode="constant", cval=0
-            )
+            counts = convolve(skel.astype(np.uint8), kernel, mode="constant", cval=0)
             endpoints = skel & (counts <= 1)
             if not endpoints.any():
                 break
@@ -633,9 +637,7 @@ class RacingEnv:
         )
 
     def _launch(self, act_torch):
-        seed_step = (
-            self.seed_base * 2654435761 + self._call * 83492791
-        ) & 0x7FFFFFFF
+        seed_step = (self.seed_base * 2654435761 + self._call * 83492791) & 0x7FFFFFFF
         for i, mb in enumerate(self.map_buffers):
             a, b = mb["env_start"], mb["env_end"]
             act_w = wp.from_torch(act_torch[a:b], dtype=wp.vec2)
@@ -644,9 +646,7 @@ class RacingEnv:
         self._call += 1
 
     def _launch_zero(self):
-        seed_step = (
-            self.seed_base * 2654435761 + self._call * 83492791
-        ) & 0x7FFFFFFF
+        seed_step = (self.seed_base * 2654435761 + self._call * 83492791) & 0x7FFFFFFF
         for i, mb in enumerate(self.map_buffers):
             self._launch_one(mb, mb["zero_act_v"], seed_step ^ ((i + 1) * 982451653))
         wp.synchronize_device(self.cars.device)
@@ -913,7 +913,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
 def train(
     env,
     agent,
-    iterations=2000,
+    iterations=4000,
     rollouts=24,
     epochs=5,
     minibatches=4,
@@ -1106,7 +1106,7 @@ def train(
 def main(
     map_yamls: list[Path],
     num_envs: int = 4096,
-    iterations: int = 2000,
+    iterations: int = 4000,
     seed: int = 0,
     log_dir: Path = Path("./logs"),
     device: str = "",
