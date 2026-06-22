@@ -2,16 +2,16 @@ import numpy as np
 
 # TODO : Units!!!
 
-MU = 1.0489
+MU = 1.5489 #1.0489
 LF = 0.15875
 LR = 0.17145
 LWB = LF + LR
-MASS = 4.74 #3.74
+MASS = 6.74 #3.74
 
 STEER_MIN = -0.4189
 STEER_MAX = 0.4189
-STEER_V_MAX = 3.2
-A_MAX = 9.51
+STEER_V_MAX = 6.4 #3.2
+A_MAX = 25.0 #9.51
 V_MIN = -5.0
 V_MAX = 25.0 #20.0
 PSI_PRIME_MAX = 6.0
