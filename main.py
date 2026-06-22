@@ -39,7 +39,7 @@ def main(
     seed: int = 0,
     interactive: bool = False,
     live_viewer: bool = False,
-    iterations: int = 2000,
+    iterations: int = 5000,
     record_every_iteration: int = 100,
     record_duration_steps: int = 2000,
     switch_map_iter: int = 100,  # Training step interval between layout rotations (0 to disable)

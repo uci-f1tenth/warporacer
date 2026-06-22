@@ -311,7 +311,7 @@ def compute_gae(
 def train(
     env: Environment,
     agent: Agent,
-    iterations: int = 10000,
+    iterations: int = 5000,
     rollouts: int = 64,         
     epochs: int = 4,             
     gamma: float = 0.985,        
@@ -321,7 +321,7 @@ def train(
     vf_coef: float = 0.5,
     ent_coef: float = 0.01,      
     max_grad_norm: float = 0.5,
-    lr: float = 2.0e-4,            
+    lr: float = 5.0e-4,
     target_kl: float = 0.015,    
     log_dir: Path = Path("./logs"),
     record_every_iteration: int = 100,
@@ -364,11 +364,11 @@ def train(
     for pg in opt.param_groups:
         pg["lr"] = lr
 
-    # Cosine annealing that safely floors at 5e-5
+    # Cosine annealing that safely floors at 4e-5
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, 
-        T_max=iterations, 
-        eta_min=5e-5
+        opt,
+        T_max=iterations,
+        eta_min=4e-5
     )
     
     sensory_dim = OBS_DIM - 3
@@ -447,7 +447,7 @@ def train(
         B: int = rollouts * N
         global_step += B
 
-        TARGET_MINIBATCH_SIZE = 16384
+        TARGET_MINIBATCH_SIZE = 8192
         calculated_minibatches = max(1, B // TARGET_MINIBATCH_SIZE)
         mb: int = B // calculated_minibatches
 
