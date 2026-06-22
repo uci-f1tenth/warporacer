@@ -12,9 +12,10 @@ from typing import TYPE_CHECKING # Forward declaration
 if TYPE_CHECKING:
     from include.visuals import Visuals
 
+# TODO : Enable randomize CW/CCW map directions
+
 class Environment:
     # Class attribute type annotations for structural linting and memory layout clarity
-    map_path: Path
     num_envs: int
     seed: int
     seed_base: int
@@ -56,19 +57,19 @@ class Environment:
     look_step: int
     _call: int
 
-    def __init__(self, map_target: Path, num_envs: int, seed: int, live_viewer: bool):
+    def __init__(self, maps_dir: Path, num_envs: int, seed: int, target_device: wp.Device, live_viewer: bool):
         self.num_envs = num_envs
         self.seed = seed
         self.seed_base = seed  # Required for the LCG random seed inside _launch
         self._call = 0         # Required to track kernel step dispatch offsets
-        self.device = "cuda"   # Bind strictly to CUDA for Warp/PyTorch interoperability
+        self.device = target_device
         
         # Internally track the map management system
         self.available_maps = []
         self.current_map_idx = 0
         
         # Discover and populate your track library automatically
-        self._initialize_map_library(map_target)
+        self._initialize_map_library(maps_dir)
         
         # Load up your initial baseline map choice (which subsequently initializes the physics buffers)
         self.load_map_by_index(self.current_map_idx)
@@ -79,9 +80,9 @@ class Environment:
             from include.visuals import Visuals
             self.vs = Visuals(self, self.map)
 
-    def _initialize_map_library(self, map_target: Path) -> None:
+    def _initialize_map_library(self, maps_dir: Path) -> None:
         """Determines if the target is a single asset or directory and indexes files."""
-        resolved_target = Path(map_target).resolve()
+        resolved_target = Path(maps_dir).resolve()
         
         if resolved_target.is_file():
             # Single-map configuration pipeline: Lock strictly to the provided file
@@ -102,11 +103,11 @@ class Environment:
             raise IndexError(f"[Env Error] Target index {idx} falls outside map library boundary limits.")
             
         self.current_map_idx = idx
-        self.map_path = self.available_maps[self.current_map_idx]
+        current_map_path = self.available_maps[self.current_map_idx]
         
         # Procedurally instantiate the internal Map data representation
-        print(f"[Environment] Activating track layout [{self.current_map_idx}]: {self.map_path.name}")
-        self.load_map(self.map_path, reset_call_count=True)
+        print(f"[Environment] Activating track layout [{self.current_map_idx}]: {current_map_path.name}")
+        self.load_map(current_map_path, reset_call_count=True)
         
         # Cascading fallback update notice down to the visual layer graphics buffers if mounted
         if hasattr(self, 'vs') and self.vs is not None:
@@ -130,8 +131,7 @@ class Environment:
 
     def load_map(self, map_path: Path, reset_call_count: bool = False) -> None:
         """Dynamically shifts environmental maps and re-allocates structural buffers smoothly."""
-        self.map_path = map_path
-        self.map = Map(self.map_path)
+        self.map = Map(map_path)
         
         if reset_call_count:
             self._call = 0

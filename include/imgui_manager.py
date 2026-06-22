@@ -93,7 +93,7 @@ class ImGuiManager:
         imgui.text(f"Active Vehicles: {self.env.num_envs}")
         imgui.text(f"Simulation Step: {self.env._call}")
         imgui.text(f"Current Track Index: {self.env.current_map_idx}")
-        imgui.text(f"Active Track File: {self.env.map_path.name}")
+        imgui.text(f"Active Track File: {self.env.map.path_name}")
         
         imgui.separator()
         imgui.spacing()

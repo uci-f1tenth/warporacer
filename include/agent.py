@@ -219,7 +219,7 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
         # ---------------------------------------------------------
         trail: deque = deque(maxlen=300)
         
-        with imageio.get_writer(str(out_path), fps=int(1 / DT), macro_block_size=1) as w:
+        with imageio.get_writer(str(out_path), fps=int(1 / DT), macro_block_size=2) as w:
             for i in range(num_steps):
                 if resets_cpu[i]:
                     trail.clear()
@@ -329,7 +329,7 @@ def compute_gae(
 
 #git@profile
 def train(
-    env: "Environment",
+    env: Environment,
     agent: Agent,
     iterations: int = 2000,
     rollouts: int = 24,
@@ -345,8 +345,9 @@ def train(
     lr: float = 3e-4,
     target_kl: float = 0.02,
     log_dir: Path = Path("./logs"),
-    record_every: int = 100,
-    record_steps: int = 1800,
+    record_every_iteration: int = 100,
+    record_duration_steps: int = 2000,
+    switch_map_iter: int = 10,
     use_wandb_train: bool = False
 ) -> Tuple[float, RunningMeanStd, ReturnNormalizer, int]:
     device: torch.device = next(agent.parameters()).device
@@ -417,8 +418,8 @@ def train(
                     ep_len[fin] = 0.0
                 obs = obs_rms.normalize(raw)
 
-                # Render every 3rd frame
-                if env.live_viewer and t % 3 == 0:
+                # Render every 4th frame
+                if env.vs and t % 4 == 0:
                     env.vs.render()
                 
             next_val: torch.Tensor = agent.value(obs)
@@ -522,15 +523,18 @@ def train(
                 f"ret={er:8.2f} kl={final_kl:.4f} lr={sched.lr:.2e} epochs={current_epochs}"
             )
             
-        if record_every > 0 and (it + 1) % record_every == 0:
+        if record_every_iteration > 0 and (it + 1) % record_every_iteration == 0:
             out: Path = log_dir / f"rollout_iter{it + 1:06d}.mp4"
             print(f"record_rollout: out={out}")
-            record_rollout(env, agent, record_steps, out, obs_rms)
+            record_rollout(env, agent, record_duration_steps, out, obs_rms)
 
             if use_wandb_train:
                 try:
                     wandb.log({"rollout": wandb.Video(str(out), format="mp4")}, step=global_step)
                 except Exception as e:
                     print(f"[WandB] Rollout video failed: {e}")
+        
+        if switch_map_iter > 0 and (it + 1) % switch_map_iter == 0:
+            env.cycle_next_map() # TODO: randomize
             
     return time.time() - t0, obs_rms, ret_rms, global_step

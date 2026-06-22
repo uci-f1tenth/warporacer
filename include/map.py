@@ -43,6 +43,7 @@ class Map:
         print(f"Processing and caching new map: {path.name}...")
 
         # 1. Load map metadata and raw image array
+        self.path_name = path.name
         self.meta = safe_load(path.read_text())
         self.img_path = path.parent / self.meta["image"]
 
