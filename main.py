@@ -852,7 +852,8 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
         def w2p(x, y):
             return int((x - m.ox) / m.res), int(m.h - 1 - (y - m.oy) / m.res)
 
-        trail = deque(maxlen=300)
+        trail = []  # full-lap driven path (x, y), cleared on crash/respawn
+        trail_accel = []  # commanded accel at each point (<0 = braking)
         raw, _ = env.reset()
         obs = obs_rms.normalize(raw) if obs_rms else raw
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -862,22 +863,37 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
             with torch.no_grad():
                 for _ in range(num_steps):
                     a = agent.deterministic(obs)
+                    accel = float(a[0, 1])  # policy's throttle/brake command
                     raw, _, term, trunc, _ = env.step(a)
                     obs = obs_rms.normalize(raw) if obs_rms else raw
                     row = env.cars_buf[0].tolist()
                     x, y, psi = row[0], row[1], row[4]
                     if bool(term[0].item()) or bool(trunc[0].item()):
                         trail.clear()
+                        trail_accel.clear()
                     trail.append((x, y))
+                    trail_accel.append(accel)
                     frame = cvtColor(m.raw, COLOR_GRAY2RGB)
+                    # Full raceline coloured by commanded effort: green on the
+                    # throttle (accel >= 0), red braking — in constant-colour runs.
                     if len(trail) > 1:
-                        polylines(
-                            frame,
-                            [np.array([w2p(*p) for p in trail], dtype=np.int32)],
-                            False,
-                            (0, 200, 0),
-                            2,
-                        )
+                        pts = [w2p(*p) for p in trail]
+                        n = len(pts)
+                        s = 0
+                        while s < n - 1:
+                            braking = trail_accel[s + 1] < 0.0
+                            e = s
+                            while e < n - 1 and (trail_accel[e + 1] < 0.0) == braking:
+                                e += 1
+                            color = (235, 40, 40) if braking else (0, 210, 0)
+                            polylines(
+                                frame,
+                                [np.array(pts[s : e + 1], dtype=np.int32)],
+                                False,
+                                color,
+                                2,
+                            )
+                            s = e
                     R = np.array(
                         [[np.cos(psi), -np.sin(psi)], [np.sin(psi), np.cos(psi)]]
                     )
@@ -885,7 +901,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
                     fillPoly(
                         frame,
                         [np.array([w2p(*p) for p in world], dtype=np.int32)],
-                        (255, 50, 50),
+                        (40, 130, 255),
                     )
                     w.append_data(frame)
     finally:
