@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import wandb
+import psutil  # Native package overhead profiling
 from cv2 import COLOR_GRAY2RGB, cvtColor, fillPoly, polylines
 from torch.distributions import Normal
 
@@ -65,8 +66,8 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2.0), bias: float = 0.0) -
 
 
 class Agent(nn.Module):
-    LOGSTD_MIN: float = -1.6
-    LOGSTD_MAX: float = -0.3
+    LOGSTD_MIN: float = -2.0
+    LOGSTD_MAX: float = -0.5
 
     def __init__(self, obs_dim: int = OBS_DIM, act_dim: int = ACT_DIM, hidden: int = 256) -> None:
         super().__init__()
@@ -84,14 +85,8 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(hidden, 1), std=1.0),
         )
-        self.log_std: nn.Parameter = nn.Parameter(torch.full((1, act_dim), -0.5))
+        self.log_std: nn.Parameter = nn.Parameter(torch.full((1, act_dim), -0.8))
         self._compiled: bool = False
-
-    def _dist(self, obs: torch.Tensor, mean: Optional[torch.Tensor] = None) -> Normal:
-        if mean is None:
-            mean = self.actor(obs)
-        ls: torch.Tensor = self.log_std.clamp(self.LOGSTD_MIN, self.LOGSTD_MAX)
-        return Normal(mean, ls.exp())
 
     def value(self, obs: torch.Tensor) -> torch.Tensor:
         return self.critic(obs).squeeze(-1)
@@ -103,14 +98,15 @@ class Agent(nn.Module):
         
         noise: torch.Tensor = torch.randn_like(mean)
         action: torch.Tensor = mean + noise * std
+        action_clamped = torch.clamp(action, -1.0, 1.0)
         
         var: torch.Tensor = std.pow(2)
-        log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - math.log(math.sqrt(2 * math.pi))
+        log_prob: torch.Tensor = -((action_clamped - mean) ** 2) / (2 * var) - ls - math.log(math.sqrt(2 * math.pi))
         log_prob = log_prob.sum(-1)
         
         entropy: torch.Tensor = (0.5 + 0.5 * math.log(2 * math.pi) + ls).sum(-1).expand_as(log_prob).clone()
         
-        return action, log_prob, entropy, self.critic(obs).squeeze(-1)
+        return action_clamped, log_prob, entropy, self.critic(obs).squeeze(-1)
 
     def evaluate(self, obs: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mean: torch.Tensor = self.actor(obs)
@@ -123,11 +119,11 @@ class Agent(nn.Module):
         return log_prob.sum(-1), entropy, self.critic(obs).squeeze(-1)
 
     def deterministic(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.actor(obs)
+        return torch.clamp(self.actor(obs), -1.0, 1.0)
 
 
 class KLAdaptiveLR:
-    def __init__(self, opt: torch.optim.Optimizer, target_kl: float = 0.02, factor: float = 1.5, lr_min: float = 1e-6, lr_max: float = 3e-3) -> None:
+    def __init__(self, opt: torch.optim.Optimizer, target_kl: float = 0.015, factor: float = 1.5, lr_min: float = 1e-5, lr_max: float = 1e-3) -> None:
         self.opt: torch.optim.Optimizer = opt
         self.target: float = target_kl
         self.factor: float = factor
@@ -146,12 +142,12 @@ class KLAdaptiveLR:
     def lr(self) -> float:
         return float(self.opt.param_groups[0]["lr"])
 
+
 def process_observations(raw_tensor: torch.Tensor, rms_module: RunningMeanStd) -> torch.Tensor:
-    # Retain kinematic indices [0, 1, 2] exactly as scaled by the Warp kernel
     kinematics = raw_tensor[..., :3]
-    # Extract and normalize only sensory/LiDAR channels [3:]
     sensory_normalized = rms_module.normalize(raw_tensor[..., 3:])
     return torch.cat([kinematics, sensory_normalized], dim=-1)
+
 
 def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: Path, obs_rms: Optional[RunningMeanStd] = None) -> None:
     snap: Dict[str, torch.Tensor] = env.save_state()
@@ -180,12 +176,7 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
         obs: torch.Tensor = process_observations(raw, obs_rms) if obs_rms else raw
         out_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # ---------------------------------------------------------
-        # PHASE 1: Pure GPU Simulation
-        # ---------------------------------------------------------
         device = env.cars_buf.device
-        
-        # FIX 1: Allocate enough space for the FULL tensor row to avoid Advanced Indexing
         num_features = env.cars_buf.shape[1] 
         traj_states = torch.empty((num_steps, num_features), dtype=torch.float32, device=device)
         resets_gpu = torch.empty(num_steps, dtype=torch.bool, device=device)
@@ -195,34 +186,21 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
                 a: torch.Tensor = agent.deterministic(obs)
                 raw, _, term, trunc, _ = env.step(a)
                 obs = process_observations(raw, obs_rms) if obs_rms else raw
-                
-                # Fast contiguous memory copy instead of indexing kernel
                 traj_states[i] = env.cars_buf[0]
                 resets_gpu[i] = term[0] | trunc[0]
 
-        # Sync to CPU once
         full_states_cpu = traj_states.cpu().numpy()
         resets_cpu = resets_gpu.cpu().numpy()
 
-        # Extract exactly what we need on the CPU side
         x_arr = full_states_cpu[:, 0]
         y_arr = full_states_cpu[:, 1]
         psi_arr = full_states_cpu[:, 4]
 
-        # ---------------------------------------------------------
-        # PHASE 2: Pre-Compute Rendering Math
-        # ---------------------------------------------------------
-        # FIX 2: Vectorize the map transformation for all 10,000 steps instantly
         centers = np.column_stack((x_arr, y_arr))
         px_centers = w2p_vec(centers) 
-        
-        # Pre-compute rotation sin/cos for all steps
         c_arr = np.cos(psi_arr)
         s_arr = np.sin(psi_arr)
 
-        # ---------------------------------------------------------
-        # PHASE 3: Pure CPU Rendering
-        # ---------------------------------------------------------
         trail: deque = deque(maxlen=300)
         
         with imageio.get_writer(str(out_path), fps=int(1 / DT), macro_block_size=2) as w:
@@ -230,25 +208,19 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
                 if resets_cpu[i]:
                     trail.clear()
                     
-                # The trail now stores raw pixel coordinates directly!
                 trail.append(px_centers[i])
-                
                 frame: np.ndarray = base_frame.copy()
                 
                 if len(trail) > 1:
-                    # Convert deque to array (much faster without the w2p_vec math inside)
                     polylines(frame, [np.array(trail)], False, (0, 200, 0), 2)
                     
-                # Build rotation matrix for this specific frame
                 c, s = c_arr[i], s_arr[i]
                 R: np.ndarray = np.array([[c, -s], [s, c]])
                 
-                # Calculate corners
                 world_pts: np.ndarray = corners @ R.T + centers[i]
                 px_world = w2p_vec(world_pts)
                 
                 fillPoly(frame, [px_world], (255, 50, 50))
-                
                 w.append_data(frame)
 
     finally:
@@ -273,7 +245,6 @@ def _train_step(
     ent_coef: float,
     max_grad_norm: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Hardcode "cuda" to prevent graph breaks from checking tensor attributes
     with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
         new_logp, ent, new_val = agent.evaluate(b_obs_idx, b_act_idx)
         
@@ -333,23 +304,23 @@ def compute_gae(
         
     return adv_b
 
-#git@profile
+
 def train(
     env: Environment,
     agent: Agent,
     iterations: int = 2000,
-    rollouts: int = 32,          # [Increased 24 -> 32] Better horizon coverage for fast 4S runs
-    epochs: int = 4,             # [Decreased 5 -> 4] Prevents policy overfitting on high-grip surfaces
-    minibatches: int = 32,       # [Increased 4 -> 32] Keeps individual minibatch tensor footprints small
-    gamma: float = 0.985,        # [Decreased 0.99 -> 0.985] Car moves fast; prioritize immediate path rewards
+    rollouts: int = 32,          
+    epochs: int = 4,             
+    minibatches: int = 32,       
+    gamma: float = 0.985,        
     gae_lambda: float = 0.95,
     clip: float = 0.2,
     vf_clip: float = 0.2,
     vf_coef: float = 0.5,
-    ent_coef: float = 0.01,      # [Increased 0.0 -> 0.01] Essential for exploration on new maps
+    ent_coef: float = 0.01,      
     max_grad_norm: float = 0.5,
-    lr: float = 4e-4,            # [Slightly accelerated for faster map adaptation]
-    target_kl: float = 0.015,    # [Decreased 0.02 -> 0.015] Tighter bounds ensure stable cornering maneuvers
+    lr: float = 4e-4,            
+    target_kl: float = 0.015,    
     log_dir: Path = Path("./logs"),
     record_every_iteration: int = 100,
     record_duration_steps: int = 2000,
@@ -357,9 +328,9 @@ def train(
     use_wandb_train: bool = False
 ) -> Tuple[float, RunningMeanStd, ReturnNormalizer, int]:
     device: torch.device = next(agent.parameters()).device
+    process_profile = psutil.Process()
     N: int = env.num_envs
     
-    # Enable Fused Adam for massive CPU overhead reduction
     opt: torch.optim.Optimizer = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5, fused=True)
     sched: KLAdaptiveLR = KLAdaptiveLR(opt, target_kl=target_kl)
     sensory_dim = OBS_DIM - 3
@@ -383,7 +354,7 @@ def train(
     val_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
 
     raw, _ = env.reset()
-    obs_rms.update(raw[..., 3:]) # Feed only sensory indices to update
+    obs_rms.update(raw[..., 3:]) 
     obs: torch.Tensor = process_observations(raw, obs_rms)
     ep_ret: torch.Tensor = torch.zeros(N, device=device)
     ep_len: torch.Tensor = torch.zeros(N, device=device)
@@ -393,10 +364,9 @@ def train(
     global_step: int = 0
     t0: float = time.time()
     last_t: float = t0
-    
-    # Initialize dynamic epochs
     current_epochs: int = epochs
 
+    start_wall_clock = time.time()
     for it in range(iterations):
         agent.eval()
         with torch.no_grad():
@@ -425,17 +395,13 @@ def train(
                     ep_len[fin] = 0.0
                 obs = process_observations(raw, obs_rms)
 
-                # Render every 4th frame
                 if env.vs and t % 4 == 0:
                     env.vs.render()
                 
             next_val: torch.Tensor = agent.value(obs)
 
-        # Introduce a phase threshold or flag to stop updating normalization arrays
-        if global_step < 1_000_000_000_000:
-            obs_rms.update(raw_obs_b[..., 3:])
+        obs_rms.update(raw_obs_b[..., 3:])
 
-        # GAE Calculation - We MUST use .clone() here to escape CUDAGraph static memory
         adv_b: torch.Tensor = compute_gae(rew_b, val_b, next_val, term_b, done_b, gamma, gae_lambda, rollouts).clone()
         ret_b: torch.Tensor = adv_b + val_b
         
@@ -452,17 +418,9 @@ def train(
 
         agent.train()
         
-        stats: Dict[str, torch.Tensor] = {
-            "pg": torch.tensor(0.0, device=device),
-            "v": torch.tensor(0.0, device=device),
-            "ent": torch.tensor(0.0, device=device),
-            "kl": torch.tensor(0.0, device=device),
-            "clipfrac": torch.tensor(0.0, device=device)
-        }
-        
+        # Unified allocation on GPU to prevent pipeline stalling
+        epoch_stats = torch.zeros(5, dtype=torch.float32, device=device)
         n_upd: int = 0
-
-        # Start with a defensive exploration margin, then slowly decay it
         current_ent_coef = max(0.001, ent_coef * (1.0 - (it / iterations)))
         
         torch.compiler.cudagraph_mark_step_begin()
@@ -477,27 +435,25 @@ def train(
                     current_ent_coef, max_grad_norm
                 )
 
-                # We MUST use .clone() here to escape CUDAGraph static memory
-                stats["pg"] += pg.clone()
-                stats["v"] += v_loss.clone()
-                stats["ent"] += ent_m.clone()
-                stats["kl"] += approx_kl.clone()
-                stats["clipfrac"] += clipfrac.clone()
+                # Detaching here prevents a massive gradient history graph from building up
+                epoch_stats[0].add_(pg.detach())
+                epoch_stats[1].add_(v_loss.detach())
+                epoch_stats[2].add_(ent_m.detach())
+                epoch_stats[3].add_(approx_kl.detach())
+                epoch_stats[4].add_(clipfrac.detach())
                 n_upd += 1
                 
-        divisor = max(n_upd, 1)
-        for k in stats:
-            stats[k] = stats[k] / divisor  # Vectorized division, stays on the GPU
-            
-        final_kl = float(stats["kl"].item())
+        epoch_stats.div_(max(n_upd, 1))
+        
+        # This will now execute perfectly without needing an extra .detach() here
+        stats_cpu = epoch_stats.cpu().numpy()
+        
+        final_kl = float(stats_cpu[3])
         sched.step(final_kl)
         
-        # Dynamic Epoch Logic
         if final_kl > 1.5 * target_kl:
-            # We drifted too far. Do fewer epochs next time.
             current_epochs = max(1, current_epochs - 1)
         elif final_kl < target_kl / 1.5:
-            # Cap the max epochs at your initial default (epochs variable) instead of 10
             current_epochs = min(epochs, current_epochs + 1)
 
         now: float = time.time()
@@ -505,12 +461,12 @@ def train(
         last_t = now
         
         log: Dict[str, Any] = {
-            "policy_loss": stats["pg"].item(),
-            "value_loss": stats["v"].item(),
-            "entropy": stats["ent"].item(),
+            "policy_loss": float(stats_cpu[0]),
+            "value_loss": float(stats_cpu[1]),
+            "entropy": float(stats_cpu[2]),
             "approx_kl": final_kl,
-            "clipfrac": stats["clipfrac"].item(),
-            "current_epochs": current_epochs,  # Replaced kl_stop with current_epochs
+            "clipfrac": float(stats_cpu[4]),
+            "current_epochs": current_epochs,  
             "log_std": agent.log_std.mean().item(),
             "iter_lr": sched.lr,
             "sps": sps,
@@ -520,7 +476,6 @@ def train(
             log["ep_return"] = float(np.mean(finished_rets))
             log["ep_length"] = float(np.mean(finished_lens))
 
-        # Update wandb
         if use_wandb_train:
             try:
                 wandb.log(log, step=global_step)
@@ -528,11 +483,29 @@ def train(
                 print(f"[WandB] Log failed: {e}")
 
         if it % 10 == 0:
-            er: float = log.get("ep_return", float("nan"))
-            # Removed kl_stop conditional from this print statement
+            er = log.get("ep_return", float("nan"))
+            el = log.get("ep_length", float("nan"))
+            cpu = process_profile.cpu_percent()
+            ram = process_profile.memory_info().rss / 1048576
+
+            # --- Time Metric Calculations (Reading your imported constants natively) ---
+            real_elapsed = time.time() - start_wall_clock
+            rh, rem = divmod(real_elapsed, 3600)
+            rm, rs = divmod(rem, 60)
+            real_str = f"{int(rh):02d}:{int(rm):02d}:{int(rs):02d}"
+
+            # Uses DT directly from include.constants
+            sim_elapsed_seconds = global_step * DT  
+            sh, srem = divmod(sim_elapsed_seconds, 3600)
+            sm, ss = divmod(srem, 60)
+            sim_str = f"{int(sh):02d}:{int(sm):02d}:{int(ss):02d}"
+            # ----------------------------------------------------------------------------
+
             print(
-                f"[it {it:4d}] step={global_step:>9d} sps={sps:>6d} "
-                f"ret={er:8.2f} kl={final_kl:.4f} lr={sched.lr:.2e} epochs={current_epochs}"
+                f"[{it:4d}] Real:{real_str} Sim:{sim_str} | {sps:>5d} SPS | "
+                f"R:{er:6.1f} L:{el:5.1f} Ent:{stats_cpu[2]:.3f} | "
+                f"V:{stats_cpu[1]:.3f} P:{stats_cpu[0]:.3f} Clp:{stats_cpu[4]:.2f} KL:{final_kl:.3f} | "
+                f"LR:{sched.lr:.1e} Ep:{current_epochs} | RAM:{ram:4.0f}M CPU:{cpu:4.1f}%"
             )
             
         if record_every_iteration > 0 and (it + 1) % record_every_iteration == 0:
