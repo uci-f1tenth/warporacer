@@ -229,7 +229,7 @@ class Environment:
             inputs=[
                 act, self.obs, self.rew, self.done, self.cars, self.cars_int, self.car_dr,
                 self.map_origin, self.map.res, self.dt_buf, self.lut_buf, self.centerline_buf,
-                self.n_cl, self.look_step, self.lidar_buf, int(seed),
+                self.n_cl, self.lidar_buf, int(seed),
             ],
         )
         self._call += 1

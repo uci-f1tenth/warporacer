@@ -5,13 +5,14 @@ import numpy as np
 # =========================================================================
 WIDTH = 0.33                         # [m] Widened footprint for Fiesta rally shell
 LENGTH = 0.58                        # [m] Bumper-to-bumper chassis length
-# Added a 7% structural expansion padding to naturally enforce wider corner safety margins
-CAR_HALF_DIAG = float(np.hypot(WIDTH / 2.0, LENGTH / 2.0)) * 1.07 
+# REDUCED: Dropped from 1.07 to 1.02. Trust the 60Hz RK4 solver; a 2% margin prevents 
+# clipping without making the agent claustrophobic in narrow chicanes.
+CAR_HALF_DIAG = float(np.hypot(WIDTH / 2.0, LENGTH / 2.0)) * 1.02 
 
-LF = 0.135                           # [m] Distance from COG to front axle (slight front bias)
+LF = 0.135                           # [m] Distance from COG to front axle
 LR = 0.155                           # [m] Distance from COG to rear axle
-LWB = LF + LR                        # [m] Wheelbase (~290mm, standard 1/10 short course/rally)
-MASS = 3.85                          # [kg] Weight of upgraded 4S race chassis with battery
+LWB = LF + LR                        # [m] Wheelbase
+MASS = 3.85                          # [kg] Weight of upgraded 4S race chassis
 G = 9.81                             # [m/s^2] Acceleration due to gravity
 
 # =========================================================================
@@ -20,14 +21,15 @@ G = 9.81                             # [m/s^2] Acceleration due to gravity
 STEER_MIN = -0.4189                  # [rad] ~24 degrees max steering throw left
 STEER_MAX = 0.4189                   # [rad] ~24 degrees max steering throw right
 STEER_V_MAX = 4.5                    # [rad/s] Fast high-end steering servo limit
-A_MAX = 16.5                         # [m/s^2] 4S instantaneous peak torque acceleration (~1.68G)
+A_MAX = 16.5                         # [m/s^2] 4S instantaneous peak torque acceleration
 V_MIN = -4.0                         # [m/s] Capped reverse velocity
 V_MAX = 16.0                         # [m/s] ~35 mph ceiling for an indoor track setup
 PSI_PRIME_MAX = 7.5                  # [rad/s] Max yaw velocity rate
-BETA_MAX = 0.5                      # [rad] Tight body slip angle cap to emulate traction rolls
+BETA_MAX = 0.5                       # [rad] Tight body slip angle cap
 
-MU = 1.15                            # [-] Mechanical traction coefficient of carpet tires on carpet
-DR_FRAC = 0.18                       # [-] Domain Randomization variance envelope (18% parameter flux)
+# OPTIMIZED: Slightly increased tracking friction to reward hard carving in tight turns
+MU = 1.25                            # [-] True high-grip mechanical traction on carpet
+DR_FRAC = 0.15                       # [-] Tightened variance envelope to stabilize policy baseline
 
 # =========================================================================
 # 3. Temporal Steps & Sub-integration Timing
@@ -41,16 +43,21 @@ DT_SUB_SIX = DT_SUB / 6.0            # [s] Cache constant for solver
 # =========================================================================
 # 4. Reward Shaping & Normalization Weights (Generalization Tuned)
 # =========================================================================
-PROGRESS_SCALE = 1.0                 # [-] Step progress scaling weight
-PROGRESS_V_COEF = 0.4                # [-] Lookahead velocity alignment scaling factor
-BACKWARDS_PROGRESS_PENALTY_MUL = 15.0 # [-] Sane deterrent modifier for wrong-way driving
-TERM_PENALTY = -100.0                # [-] Punitive crash limit lowered to keep value exploration alive
-IDLE_PENALTY = -0.2                  # [-] Sane structural penalty for loitering
-LATERAL_PENALTY = -0.15              # [-] Squaring penalty factor emphasizing centerline adherence
+PROGRESS_SCALE = 1.2                 # INCREASING: Prioritize raw downward track progression
+PROGRESS_V_COEF = 0.5                # INCREASING: Reward velocity aligned with the path horizon
+BACKWARDS_PROGRESS_PENALTY_MUL = 20.0 # INCREASING: Explicitly kill wrong-way wiggling immediately
+TERM_PENALTY = -150.0                # INCREASING: Give crashing a sharper, distinct penalty drop
+
+IDLE_PENALTY = -0.4                  # INCREASING: Make loitering or oscillation hurt more
+# REDUCED: Crucial fix. Lowered from -0.15 to -0.03. This allows the agent to scale the 
+# outer walls and cut the inner apexes of tight turns without getting choked out by penalties.
+LATERAL_PENALTY = -0.03              
 
 MAX_CENTERLINE_DEV = 1.5             # [m] Track boundary containment zone
-STALL_VELOCITY = 1.0                  # [m/s] Matches your intended racing threshold
-STALL_SECONDS_TO_STEPS = 3.0 / DT     # Allow 3 full seconds of recovery time
+STALL_VELOCITY = 1.2                 # INCREASING: Move the minimum acceptable velocity floor up
+# REDUCED: Dropped from 3.0s to 1.0s. At 60Hz, 3 seconds allowed endless exploit wiggling. 
+# 1 second forces the agent to make a real forward choice or get re-spawnd.
+STALL_SECONDS_TO_STEPS = 1.0 / DT
 
 # =========================================================================
 # 5. Sensors & Observation Tensor Offsets
@@ -74,6 +81,12 @@ SMOOTH_WINDOW = 51                   # [-] Convoluted path smoothing filter wind
 ADJ = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 DONE_TERMINATED = 1                  # Environment terminal crash flag state
 DONE_TRUNCATED = 2                   # Environment timeout truncation flag state
+
+# =========================================================================
+# 7. Dynamic Horizon Tuning Constants
+# =========================================================================
+BASE_STRIDE = 6.0          # [points] Minimum waypoint index skip at 0 m/s
+VELOCITY_SCALE = 1.0       # [-] Scaling multiplier tracking forward velocity
 
 # Things to reward
 # - Following centerline
