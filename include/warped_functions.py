@@ -51,7 +51,7 @@ def st_deriv(
     out.d_x = v * cp
     out.d_y = v * sp
     out.d_psi = d_psi
-    out.d_v = wp.clamp(accel, -a_long_max, a_long_max)
+    out.d_v = wp.clamp(accel, -A_MAX, a_long_max) # Always allow maximum braking force (-A_MAX)
     out.d_psip = 0.0
     out.d_beta = 0.0
     return out
@@ -143,10 +143,8 @@ def step_kernel(
     lidar_dirs: wp.array[wp.vec2],
     seed_base: int,
 ):
-    # Retrieve the absolute multi-environment execution lane thread index
     i = wp.tid()
     
-    # Read core state features from global memory layout into local registers
     x = cars[i, 0]
     y = cars[i, 1]
     delta = cars[i, 2]
@@ -158,7 +156,6 @@ def step_kernel(
     wp_i = cars_int[i, 1]
     stall_steps = cars_int[i, 2]
     
-    # Read randomized physical parameters assigned to this lane
     mu_s = car_dr[i, 0]
     mass_s = car_dr[i, 1]
     lf_s = car_dr[i, 2]
@@ -168,7 +165,6 @@ def step_kernel(
     mh = dt_map.shape[1]
     mh_f = wp.float32(mh) - 1.0
 
-    # Parse and safely cap raw policy control outputs
     steer_v = wp.clamp(actions[i][0], -1.0, 1.0) * STEER_V_MAX
     if (steer_v < 0.0 and delta <= STEER_MIN) or (steer_v > 0.0 and delta >= STEER_MAX):
         steer_v = 0.0
@@ -177,7 +173,7 @@ def step_kernel(
     if (accel < 0.0 and v <= V_MIN) or (accel > 0.0 and v >= V_MAX):
         accel = 0.0
 
-    # Execute temporal substep tracking loops
+    # Clean multi-pass RK4 Integration
     dd_sub = steer_v * DT_SUB
     for _ in range(SUBSTEPS):
         d = rk4_step(delta, v, psi, psip, beta, steer_v, accel, mu_s, mass_s, lf_s, lr_s)
@@ -189,17 +185,14 @@ def step_kernel(
         psip += d.d_psip
         beta += d.d_beta
 
-    # Bound operational variables post-integration phase
     delta = wp.clamp(delta, STEER_MIN, STEER_MAX)
     v = wp.clamp(v, V_MIN, V_MAX)
     psip = wp.clamp(psip, -PSI_PRIME_MAX, PSI_PRIME_MAX)
     beta = wp.clamp(beta, -BETA_MAX, BETA_MAX)
 
-    # Convert continuous coordinates to discrete spatial map index locations
     px = wp.clamp(wp.int32((x - origin[0]) / res), 0, mw - 1)
     py = wp.clamp(wp.int32(mh_f - (y - origin[1]) / res), 0, mh - 1)
     
-    # Extract target progression waypoints
     new_wp = cl_lut[px, py]
     d_wp = new_wp - wp_i
     if 2 * d_wp > n_cl:
@@ -207,7 +200,6 @@ def step_kernel(
     elif 2 * d_wp < -n_cl:
         d_wp += n_cl
 
-    # --- NEW OFF-TRACK KILL SWITCH & LOCAL REFERENCES ---
     cpt_local = centerline[new_wp]
     cx_local = cpt_local[0]
     cy_local = cpt_local[1]
@@ -216,8 +208,6 @@ def step_kernel(
     s_cth_local = wp.sin(cth_local)
     c_cth_local = wp.cos(cth_local)
     
-    # --- NEW STALL TRACKING ---
-    # If velocity is below STALL_VELOCITY, increment counter. Otherwise, reset it.
     if wp.abs(v) < STALL_VELOCITY:
         stall_steps += 1
     else:
@@ -225,20 +215,16 @@ def step_kernel(
         
     is_stalled = stall_steps > STALL_SECONDS_TO_STEPS
 
-    # --- UPDATED TERMINATION LOGIC ---
-    # Absolute physical distance from the immediate centerline
     true_lateral_dist = wp.abs(-(x - cx_local) * s_cth_local + (y - cy_local) * c_cth_local)
     edt_val = dt_map[px, py] * res
     
     is_stable = wp.isfinite(x) and wp.isfinite(y) and wp.isfinite(v) and wp.isfinite(psi)
-    is_off_track = true_lateral_dist > 3.0  
+    is_off_track = true_lateral_dist > MAX_CENTERLINE_DEV  
     
-    # The car now dies if it hits a wall, falls out of bounds, or stalls out
     term = (edt_val < CAR_HALF_DIAG) or (not is_stable) or is_off_track or is_stalled
     trunc = steps >= MAX_STEPS
     steps += 1
 
-    # Assign state outcome flags
     if term:
         done[i] = DONE_TERMINATED
     elif trunc:
@@ -247,46 +233,37 @@ def step_kernel(
         done[i] = 0
 
     # =========================================================================
-    # PHASE 1: PRE-RESET REWARD CALCULATION
+    # FIXED: ALIGNED REWARD MATRIX CALCULATION
     # =========================================================================
-    
-    # 1. Asymmetric Waypoint Progress Penalty
     base_progress = wp.where(
         d_wp < 0,
         (wp.float32(d_wp) / wp.float32(n_cl)) * PROGRESS_SCALE * BACKWARDS_PROGRESS_PENALTY_MUL,
         (wp.float32(d_wp) / wp.float32(n_cl)) * PROGRESS_SCALE
     )
 
-    # 2. Predictive Velocity Progress (LOOKAHEAD TARGET)
-    target_wp = new_wp + look_step
-    if target_wp >= n_cl:
-        target_wp -= n_cl
+    # Calculate map density invariant metric lookahead steps ahead of reward parsing
+    speed_factor = wp.max(1.0, v / 5.0) 
+    dynamic_look_step = wp.int32(wp.float32(look_step) * speed_factor)
+    target_wp = (new_wp + dynamic_look_step) % n_cl
         
     cth_target = centerline[target_wp][2]
     v_along = v * wp.max(0.0, wp.cos(beta + psi - cth_target))
     vel_progress = v_along * PROGRESS_V_COEF
 
-    # 3. Crash Penalty
     term_pen = wp.where(term, TERM_PENALTY, 0.0)
-    
-    # 4. Anti-Idleness
     idle_pen = IDLE_PENALTY
 
-    # 5. Squared Cross-Track Error (LOCAL TARGET)
-    # Uses the local coordinates calculated just before termination logic
     lat_err_reward = -(x - cx_local) * s_cth_local + (y - cy_local) * c_cth_local
     lat_pen = (lat_err_reward * lat_err_reward) * LATERAL_PENALTY
 
     reward[i] = base_progress + vel_progress + term_pen + idle_pen + lat_pen
 
     # =========================================================================
-    # PHASE 2: AUTO-RESET LOGIC BLOCK
-    # Teleport failed/finished lanes to a clean, safe state
+    # AUTO-RESET LOGIC BLOCK
     # =========================================================================
     if term or trunc:
         rng = wp.rand_init(seed_base + i * 73 + steps * 31 + new_wp * 17)
         
-        # Safe random bounding
         rnd = wp.int32(wp.randf(rng) * wp.float32(n_cl))
         if rnd >= n_cl:
             rnd = n_cl - 1
@@ -300,18 +277,23 @@ def step_kernel(
         psip = 0.0
         beta = 0.0
         steps = 0
-        stall_steps = 0  # Reset stall counter on death
+        stall_steps = 0 
         new_wp = rnd
         
-        # Re-sample domain randomization values for the fresh environment lifecycle
         car_dr[i, 0] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 1] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 2] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 3] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
 
+        cpt_local = centerline[new_wp]
+        cx_local = cpt_local[0]
+        cy_local = cpt_local[1]
+        cth_local = cpt_local[2]
+        s_cth_local = wp.sin(cth_local)
+        c_cth_local = wp.cos(cth_local)
+
     # =========================================================================
-    # PHASE 3: POST-RESET OBSERVATION CALCULATION
-    # Extract sensory metrics matching the state the network faces next step
+    # POST-RESET OBSERVATION CALCULATION
     # =========================================================================
     sh = wp.sin(psi)
     ch = wp.cos(psi)
@@ -322,7 +304,6 @@ def step_kernel(
     lpos = wp.vec2(wp.float32(lpx), wp.float32(lpy))
     lrange_px = LIDAR_RANGE / res
     
-    # Raymarching-based Lidar Scan Pass
     for j in range(lidar_dirs.shape[0]):
         ca = lidar_dirs[j][0]
         sa = lidar_dirs[j][1]
@@ -342,22 +323,16 @@ def step_kernel(
                 break
         obs[i, 3 + j] = wp.min(dist, lrange_px) * res
 
-    # Compute Frenet Tracking Errors (Strictly Local)
-    # We reuse the local heading/sine/cosine from earlier in the kernel
     heading_err = wp.atan2(s_cth_local * ch - c_cth_local * sh, c_cth_local * ch + s_cth_local * sh)
     lateral_err = -(x - cx_local) * s_cth_local + (y - cy_local) * c_cth_local
     
     obs[i, OBS_FRENET_OFF] = heading_err
     obs[i, OBS_FRENET_OFF + 1] = lateral_err
 
-    # Compute Dynamic Forward Track Lookahead Steps
-    speed_factor = wp.max(1.0, v / 5.0) 
-    dynamic_look_step = wp.int32(wp.float32(look_step) * speed_factor)
-
+    # Loop starts at new_wp to correctly match target_wp on step 1
     idx = new_wp
     for k in range(NUM_LOOKAHEAD):
-        idx += dynamic_look_step
-        idx = wp.where(idx >= n_cl, idx - n_cl, idx)
+        idx = (idx + dynamic_look_step) % n_cl
         
         w = centerline[idx]
         dx = w[0] - x
@@ -365,10 +340,10 @@ def step_kernel(
         obs[i, OBS_LOOK_OFF + k * 2] = dx * ch + dy * sh
         obs[i, OBS_LOOK_OFF + k * 2 + 1] = -dx * sh + dy * ch
 
-    # Flush final execution calculations back to global memory blocks
-    obs[i, 0] = delta
-    obs[i, 1] = v
-    obs[i, 2] = psip
+    # Normalize state variables
+    obs[i, 0] = delta / STEER_MAX
+    obs[i, 1] = v / V_MAX
+    obs[i, 2] = psip / PSI_PRIME_MAX
     
     cars[i, 0] = x
     cars[i, 1] = y
@@ -380,4 +355,4 @@ def step_kernel(
     
     cars_int[i, 0] = steps
     cars_int[i, 1] = new_wp
-    cars_int[i, 2] = stall_steps  # Save stall counter
+    cars_int[i, 2] = stall_steps

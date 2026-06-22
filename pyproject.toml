@@ -1,7 +1,7 @@
 [project]
 name = "warporacer"
 version = "0.1.0"
-description = "Add your description here"
+description = "High-performance parallel reinforcement learning"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -10,6 +10,7 @@ dependencies = [
     "imgui-bundle>=1.92.700",
     "line-profiler>=5.0.2",
     "matplotlib>=3.10.9",
+    "ninja>=1.11.1.2",            # Fuses compilation and smooths multi-platform TorchInductor tasks
     "numpy>=2.4.4",
     "opencv-python>=4.13.0.92",
     "pyglet>=2.1.14",

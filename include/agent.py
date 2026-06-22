@@ -146,6 +146,12 @@ class KLAdaptiveLR:
     def lr(self) -> float:
         return float(self.opt.param_groups[0]["lr"])
 
+def process_observations(raw_tensor: torch.Tensor, rms_module: RunningMeanStd) -> torch.Tensor:
+    # Retain kinematic indices [0, 1, 2] exactly as scaled by the Warp kernel
+    kinematics = raw_tensor[..., :3]
+    # Extract and normalize only sensory/LiDAR channels [3:]
+    sensory_normalized = rms_module.normalize(raw_tensor[..., 3:])
+    return torch.cat([kinematics, sensory_normalized], dim=-1)
 
 def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: Path, obs_rms: Optional[RunningMeanStd] = None) -> None:
     snap: Dict[str, torch.Tensor] = env.save_state()
@@ -171,7 +177,7 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
             return np.column_stack((px, py)).astype(np.int32)
 
         raw, _ = env.reset()
-        obs: torch.Tensor = obs_rms.normalize(raw) if obs_rms else raw
+        obs: torch.Tensor = process_observations(raw, obs_rms) if obs_rms else raw
         out_path.parent.mkdir(parents=True, exist_ok=True)
         
         # ---------------------------------------------------------
@@ -188,7 +194,7 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
             for i in range(num_steps):
                 a: torch.Tensor = agent.deterministic(obs)
                 raw, _, term, trunc, _ = env.step(a)
-                obs = obs_rms.normalize(raw) if obs_rms else raw
+                obs = process_observations(raw, obs_rms) if obs_rms else raw
                 
                 # Fast contiguous memory copy instead of indexing kernel
                 traj_states[i] = env.cars_buf[0]
@@ -332,18 +338,18 @@ def train(
     env: Environment,
     agent: Agent,
     iterations: int = 2000,
-    rollouts: int = 24,
-    epochs: int = 5,
-    minibatches: int = 4,
-    gamma: float = 0.99,
+    rollouts: int = 32,          # [Increased 24 -> 32] Better horizon coverage for fast 4S runs
+    epochs: int = 4,             # [Decreased 5 -> 4] Prevents policy overfitting on high-grip surfaces
+    minibatches: int = 32,       # [Increased 4 -> 32] Keeps individual minibatch tensor footprints small
+    gamma: float = 0.985,        # [Decreased 0.99 -> 0.985] Car moves fast; prioritize immediate path rewards
     gae_lambda: float = 0.95,
     clip: float = 0.2,
     vf_clip: float = 0.2,
     vf_coef: float = 0.5,
-    ent_coef: float = 0.0,
+    ent_coef: float = 0.01,      # [Increased 0.0 -> 0.01] Essential for exploration on new maps
     max_grad_norm: float = 0.5,
-    lr: float = 3e-4,
-    target_kl: float = 0.02,
+    lr: float = 4e-4,            # [Slightly accelerated for faster map adaptation]
+    target_kl: float = 0.015,    # [Decreased 0.02 -> 0.015] Tighter bounds ensure stable cornering maneuvers
     log_dir: Path = Path("./logs"),
     record_every_iteration: int = 100,
     record_duration_steps: int = 2000,
@@ -356,7 +362,8 @@ def train(
     # Enable Fused Adam for massive CPU overhead reduction
     opt: torch.optim.Optimizer = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5, fused=True)
     sched: KLAdaptiveLR = KLAdaptiveLR(opt, target_kl=target_kl)
-    obs_rms: RunningMeanStd = RunningMeanStd((OBS_DIM,), device)
+    sensory_dim = OBS_DIM - 3
+    obs_rms: RunningMeanStd = RunningMeanStd((sensory_dim,), device)
     ret_rms: ReturnNormalizer = ReturnNormalizer(N, gamma, device)
 
     if not agent._compiled:
@@ -376,8 +383,8 @@ def train(
     val_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
 
     raw, _ = env.reset()
-    obs_rms.update(raw)
-    obs: torch.Tensor = obs_rms.normalize(raw)
+    obs_rms.update(raw[..., 3:]) # Feed only sensory indices to update
+    obs: torch.Tensor = process_observations(raw, obs_rms)
     ep_ret: torch.Tensor = torch.zeros(N, device=device)
     ep_len: torch.Tensor = torch.zeros(N, device=device)
     finished_rets: deque = deque(maxlen=100)
@@ -416,7 +423,7 @@ def train(
                     finished_lens.extend(ep_len[fin].detach().cpu().numpy())
                     ep_ret[fin] = 0.0
                     ep_len[fin] = 0.0
-                obs = obs_rms.normalize(raw)
+                obs = process_observations(raw, obs_rms)
 
                 # Render every 4th frame
                 if env.vs and t % 4 == 0:
@@ -424,7 +431,9 @@ def train(
                 
             next_val: torch.Tensor = agent.value(obs)
 
-        obs_rms.update(raw_obs_b)
+        # Introduce a phase threshold or flag to stop updating normalization arrays
+        if global_step < 1_000_000_000_000:
+            obs_rms.update(raw_obs_b[..., 3:])
 
         # GAE Calculation - We MUST use .clone() here to escape CUDAGraph static memory
         adv_b: torch.Tensor = compute_gae(rew_b, val_b, next_val, term_b, done_b, gamma, gae_lambda, rollouts).clone()
@@ -452,6 +461,9 @@ def train(
         }
         
         n_upd: int = 0
+
+        # Start with a defensive exploration margin, then slowly decay it
+        current_ent_coef = max(0.001, ent_coef * (1.0 - (it / iterations)))
         
         torch.compiler.cudagraph_mark_step_begin()
         for epoch in range(current_epochs):  
@@ -462,7 +474,7 @@ def train(
                 pg, v_loss, ent_m, approx_kl, clipfrac = _train_step(
                     agent, opt, scaler, b_obs[idx], b_act[idx], b_logp[idx], 
                     b_adv[idx], b_ret[idx], b_val[idx], clip, vf_coef, vf_clip, 
-                    ent_coef, max_grad_norm
+                    current_ent_coef, max_grad_norm
                 )
 
                 # We MUST use .clone() here to escape CUDAGraph static memory
@@ -535,6 +547,6 @@ def train(
                     print(f"[WandB] Rollout video failed: {e}")
         
         if switch_map_iter > 0 and (it + 1) % switch_map_iter == 0:
-            env.cycle_next_map() # TODO: randomize
+            env.cycle_next_map(randomize=True)
             
     return time.time() - t0, obs_rms, ret_rms, global_step
