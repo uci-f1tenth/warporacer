@@ -168,8 +168,8 @@ class Environment:
         cars[:, 1] = self.map.centerline[idxs, 1]
         cars[:, 4] = self.map.angles[idxs]
         
-        # Discrete tracking coordinates: [step_counter, target_centerline_index]
-        cars_int: np.ndarray = np.zeros((self.num_envs, 2), dtype=np.int32)
+        # Discrete tracking coordinates: [step_counter, target_centerline_index, stall_steps]
+        cars_int: np.ndarray = np.zeros((self.num_envs, 3), dtype=np.int32)
         cars_int[:, 1] = idxs
         
         # Domain Randomization (DR) scaling multipliers to handle heterogeneous asset variance

@@ -156,6 +156,7 @@ def step_kernel(
     beta = cars[i, 6]
     steps = cars_int[i, 0]
     wp_i = cars_int[i, 1]
+    stall_steps = cars_int[i, 2]
     
     # Read randomized physical parameters assigned to this lane
     mu_s = car_dr[i, 0]
@@ -215,15 +216,25 @@ def step_kernel(
     s_cth_local = wp.sin(cth_local)
     c_cth_local = wp.cos(cth_local)
     
+    # --- NEW STALL TRACKING ---
+    # If velocity is below STALL_VELOCITY, increment counter. Otherwise, reset it.
+    if wp.abs(v) < STALL_VELOCITY:
+        stall_steps += 1
+    else:
+        stall_steps = 0
+        
+    is_stalled = stall_steps > STALL_SECONDS_TO_STEPS
+
+    # --- UPDATED TERMINATION LOGIC ---
     # Absolute physical distance from the immediate centerline
     true_lateral_dist = wp.abs(-(x - cx_local) * s_cth_local + (y - cy_local) * c_cth_local)
-
-    # Terminate if it hits a wall OR wanders too far into a dead end (e.g., > 3.0 meters)
     edt_val = dt_map[px, py] * res
-    is_stable = wp.isfinite(x) and wp.isfinite(y) and wp.isfinite(v) and wp.isfinite(psi)
-    is_off_track = true_lateral_dist > MAX_CENTERLINE_DEV
     
-    term = (edt_val < CAR_HALF_DIAG) or (not is_stable) or is_off_track
+    is_stable = wp.isfinite(x) and wp.isfinite(y) and wp.isfinite(v) and wp.isfinite(psi)
+    is_off_track = true_lateral_dist > 3.0  
+    
+    # The car now dies if it hits a wall, falls out of bounds, or stalls out
+    term = (edt_val < CAR_HALF_DIAG) or (not is_stable) or is_off_track or is_stalled
     trunc = steps >= MAX_STEPS
     steps += 1
 
@@ -289,6 +300,7 @@ def step_kernel(
         psip = 0.0
         beta = 0.0
         steps = 0
+        stall_steps = 0  # Reset stall counter on death
         new_wp = rnd
         
         # Re-sample domain randomization values for the fresh environment lifecycle
@@ -368,3 +380,4 @@ def step_kernel(
     
     cars_int[i, 0] = steps
     cars_int[i, 1] = new_wp
+    cars_int[i, 2] = stall_steps  # Save stall counter
