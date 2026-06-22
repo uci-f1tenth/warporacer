@@ -1106,7 +1106,7 @@ def train(
 def main(
     map_yamls: list[Path],
     num_envs: int = 4096,
-    iterations: int = 4000,
+    iterations: int = 2000,
     seed: int = 0,
     log_dir: Path = Path("./logs"),
     device: str = "",
