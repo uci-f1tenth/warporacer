@@ -267,15 +267,47 @@ def _log_training_summary(it: int, global_step: int, sps: int, avg_ent: float, a
 
 
 def record_rollout(env: Environment, agent: Agent, num_steps: int, out_path: Path, obs_rms: Optional[RunningMeanStd] = None) -> None:
-    """Saves a rollout validation video to track steering and collision behavior."""
+    """Saves a rollout validation video to track behavior on a random active track without interfering with training."""
     snap: Dict[str, torch.Tensor] = env.save_state()
     was_training: bool = agent.training
     agent.eval()
     
     try:
-        map_idx = int(env.env_map_ids.numpy()[0])
+        # 1. Reset the environment states normally
+        raw, _, _ = env.reset()
+
+        # 2. Randomly select an index from the currently active maps pool
+        import random
+        map_idx = random.randint(0, env.num_maps - 1)
         m = env.maps[map_idx]
+        print(f"Recording validation rollout on sampled map: {m.path_name}")
+
+        # 3. Calculate Global Map Alignment Shifts
+        cl_vec3_array = env.maps_storage.centerline_buf.numpy()
+        global_wp0 = cl_vec3_array[map_idx, 0]
+        shift_x = float(global_wp0[0] - m.centerline[0, 0])
+        shift_y = float(global_wp0[1] - m.centerline[0, 1])
+
+        # 4. Force environment 0 to use this specific map and spawn point safely
+        cl_idx = random.randint(0, len(m.centerline) - 1)
         
+        env.views.cars_buf[0, 0] = m.centerline[cl_idx, 0] + shift_x # Global X
+        env.views.cars_buf[0, 1] = m.centerline[cl_idx, 1] + shift_y # Global Y
+        env.views.cars_buf[0, 4] = m.angles[cl_idx]                  # Yaw
+        
+        env.views.cars_int_buf[0, 0] = 0       # Step counter reset
+        env.views.cars_int_buf[0, 1] = cl_idx  # Closest centerline index
+        
+        map_ids_np = env.agents.env_map_ids.numpy()
+        map_ids_np[0] = map_idx
+        env.agents.env_map_ids.assign(map_ids_np)
+
+        # 5. Step once with zero actions to compute the clean observation vector for the new position
+        # FIXED: Correct unpacking layout matching the environment configuration
+        raw, _, _, _, _, _ = env.step(torch.zeros((env.num_envs, 2), device=env.views.obs_buf.device))
+        obs: torch.Tensor = process_observations(raw, obs_rms) if obs_rms else raw
+
+        # --- SETUP GRAPHICS RENDERING BASE ---
         corners: np.ndarray = np.array(
             [
                 [-LENGTH / 2, -WIDTH / 2],
@@ -284,29 +316,31 @@ def record_rollout(env: Environment, agent: Agent, num_steps: int, out_path: Pat
                 [-LENGTH / 2, WIDTH / 2],
             ]
         )
-
         base_frame: np.ndarray = cvtColor(m.raw, COLOR_GRAY2RGB)
 
         def w2p_vec(pts: np.ndarray) -> np.ndarray:
-            px = (pts[:, 0] - m.ox) / m.res
-            py = m.h - 1 - (pts[:, 1] - m.oy) / m.res
+            local_x = pts[:, 0] - shift_x
+            local_y = pts[:, 1] - shift_y
+            px = (local_x - m.ox) / m.res
+            py = m.h - 1 - (local_y - m.oy) / m.res
             return np.column_stack((px, py)).astype(np.int32)
 
-        raw, _, _ = env.reset()
-        obs: torch.Tensor = process_observations(raw, obs_rms) if obs_rms else raw
         out_path.parent.mkdir(parents=True, exist_ok=True)
         
-        device = env.cars_buf.device
-        num_features = env.cars_buf.shape[1] 
+        device = env.views.cars_buf.device
+        num_features = env.views.cars_buf.shape[1] 
+        
         traj_states = torch.empty((num_steps, num_features), dtype=torch.float32, device=device)
         resets_gpu = torch.empty(num_steps, dtype=torch.bool, device=device)
 
+        # --- COLLECT TRAJECTORY ---
         with torch.no_grad():
             for i in range(num_steps):
                 a: torch.Tensor = agent.deterministic(obs)
-                raw, _, term, trunc, _ = env.step(a)
+                # FIXED: Corrected unpacking from 5 arguments to 6 here to clear the ValueError
+                raw, _, _, term, trunc, _ = env.step(a)
                 obs = process_observations(raw, obs_rms) if obs_rms else raw
-                traj_states[i] = env.cars_buf[0]
+                traj_states[i] = env.views.cars_buf[0]
                 resets_gpu[i] = term[0] | trunc[0]
 
         full_states_cpu = traj_states.cpu().numpy()
@@ -323,6 +357,7 @@ def record_rollout(env: Environment, agent: Agent, num_steps: int, out_path: Pat
 
         trail: deque = deque(maxlen=300)
         
+        # --- RENDER VIDEO ---
         with imageio.get_writer(str(out_path), fps=int(1 / DT), macro_block_size=2) as w:
             for i in range(num_steps):
                 if resets_cpu[i]:
@@ -344,6 +379,7 @@ def record_rollout(env: Environment, agent: Agent, num_steps: int, out_path: Pat
                 w.append_data(frame)
 
     finally:
+        # 5. Restore original tensors perfectly back into memory blocks
         env.restore_state(snap)
         agent.train(was_training)
 
@@ -352,8 +388,8 @@ def train(
     env: Environment,
     agent: Agent,
     iterations: int = 5000,
-    rollouts: int = 256,
-    epochs: int = 5,
+    rollouts: int = 64,
+    epochs: int = 4,
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
     clip: float = 0.2,
@@ -361,7 +397,7 @@ def train(
     vf_coef: float = 0.5,
     ent_coef: float = 0.01,
     max_grad_norm: float = 0.5,
-    lr: float = 3.0e-4,
+    lr: float = 5.0e-4,
     target_kl: float = 0.010,
     log_dir: Path = Path("./logs"),
     record_every_iteration: int = 200,
