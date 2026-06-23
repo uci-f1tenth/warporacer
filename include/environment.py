@@ -61,7 +61,6 @@ class Environment:
     maps_origin: Optional[wp.array]  # Shape: (num_maps,) - wp.vec2
     maps_res: Optional[wp.array]  # Shape: (num_maps,) - float
     maps_n_cl: Optional[wp.array]  # Shape: (num_maps,) - int
-    maps_look_step: Optional[wp.array]  # Shape: (num_maps,) - int
 
     # Environment-to-Track Routing Buffer
     env_map_ids: wp.array  # Shape: (num_envs,) - int
@@ -108,7 +107,6 @@ class Environment:
         self.maps_origin = None
         self.maps_res = None
         self.maps_n_cl = None
-        self.maps_look_step = None
         self.vs = None
 
         self._initialize_map_library(maps_dir)
@@ -218,7 +216,7 @@ class Environment:
         )
         cl_np = np.zeros((self.num_maps, max_n_cl, 3), dtype=np.float32)
 
-        n_cl_list, origins_list, res_list, look_step_list = [], [], [], []
+        n_cl_list, origins_list, res_list = [], [], []
         gap_margin = 1.0
 
         sorted_map_indices = sorted(
@@ -234,7 +232,6 @@ class Environment:
         current_max_y = 0.0
 
         # --- 2D BIN PACKING ROUTINE ---
-        # Places maps sequentially from largest to smallest inside structural nodes.
         for idx in sorted_map_indices:
             m = self.maps[idx]
             w_box = float(m.wall_width) + gap_margin
@@ -320,7 +317,6 @@ class Environment:
                         free_rects.append(r)
 
         # --- COORDINATE CENTERING LOGIC ---
-        # Computes spatial offsets to ensure the entire multi-map layout cluster is centered at (0,0)
         global_center_x = current_max_x / 2.0
         global_center_y = current_max_y / 2.0
 
@@ -346,8 +342,7 @@ class Environment:
 
             n_cl_list.append(n_cl_curr)
             origins_list.append(wp.vec2(m.ox + shift_x, m.oy + shift_y))
-            res_list.append(float(m.res))
-            look_step_list.append(int(m.look_step))
+            res_list.append(float(m.res)) 
 
         self.floor_square_size = float(max(current_max_x, current_max_y))
 
@@ -359,7 +354,6 @@ class Environment:
         self.maps_n_cl = wp.array(n_cl_list, dtype=int, device=d)
         self.maps_origin = wp.array(origins_list, dtype=wp.vec2, device=d)
         self.maps_res = wp.array(res_list, dtype=float, device=d)
-        self.maps_look_step = wp.array(look_step_list, dtype=int, device=d)
 
         return final_shifts_x, final_shifts_y
 
@@ -481,7 +475,6 @@ class Environment:
                 self.maps_origin,
                 self.maps_res,
                 self.maps_n_cl,
-                self.maps_look_step,
                 self.env_map_ids,
                 self.lidar_buf,
                 int(seed),
