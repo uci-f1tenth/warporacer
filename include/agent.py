@@ -303,7 +303,6 @@ def record_rollout(env: Environment, agent: Agent, num_steps: int, out_path: Pat
         env.agents.env_map_ids.assign(map_ids_np)
 
         # 5. Step once with zero actions to compute the clean observation vector for the new position
-        # FIXED: Correct unpacking layout matching the environment configuration
         raw, _, _, _, _, _ = env.step(torch.zeros((env.num_envs, 2), device=env.views.obs_buf.device))
         obs: torch.Tensor = process_observations(raw, obs_rms) if obs_rms else raw
 
@@ -383,7 +382,7 @@ def record_rollout(env: Environment, agent: Agent, num_steps: int, out_path: Pat
         env.restore_state(snap)
         agent.train(was_training)
 
-
+@profile
 def train(
     env: Environment,
     agent: Agent,
@@ -579,9 +578,9 @@ def train(
         
         if switch_map_iter > 0 and (it + 1) % switch_map_iter == 0:
             env.trigger_map_rotation()
-            env._launch(env._zero_act)
+            env._launch(env.agents.zero_act)
             env._sanitize()
-            raw = env.obs_buf
+            raw = env.views.obs_buf
             obs_rms.update(raw[..., 3:])
             obs = process_observations(raw, obs_rms)
             
