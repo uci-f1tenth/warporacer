@@ -359,7 +359,7 @@ class Map:
                 
         best_circuit = simplified_circuit
 
-        # Spatial Coordinate Mapping & Final Filtering
+        # Spatial Coordinate Mapping
         best_path_px = pts[best_circuit]
         origin_px = np.array([self.h - 1 + self.oy / self.res, -self.ox / self.res])
         start_idx = np.argmin(((best_path_px - origin_px) ** 2).sum(axis=1))
@@ -371,8 +371,46 @@ class Map:
         ])
         
         poly_order = 3
-        self.centerline = savgol_filter(world, SMOOTH_WINDOW, poly_order, axis=0, mode="wrap")
+        n_points = len(world)
         
+        # --- PRE-ALLOCATED DIRECT-WRITE INTERPOLATION ---
+        step = max(1, n_points // 1000) 
+        
+        if step > 1 and (n_points // step) > poly_order:
+            downsampled_world = world[::step]
+            n_down = len(downsampled_world)
+            
+            safe_window = min(SMOOTH_WINDOW // step, n_down - 1) | 1
+            if safe_window <= poly_order:
+                safe_window = (poly_order + 1) | 1
+                
+            pad_len = safe_window
+            padded = np.vstack([downsampled_world[-pad_len:], downsampled_world, downsampled_world[:pad_len]])
+            smoothed_padded = savgol_filter(padded, safe_window, poly_order, axis=0, mode="nearest")
+            smoothed_down = smoothed_padded[pad_len:-pad_len]
+            
+            # 1. Pre-allocate the exact 2D memory block once
+            self.centerline = np.empty((n_points, 2), dtype=world.dtype)
+            
+            # 2. Reuse simple 1D coordinate spaces
+            x_orig = np.arange(n_points)
+            x_down = np.arange(0, n_points, step)[:n_down]
+            
+            # 3. Direct-assign the raw C-arrays into the columns (No np.column_stack needed)
+            self.centerline[:, 0] = np.interp(x_orig, x_down, smoothed_down[:, 0])
+            self.centerline[:, 1] = np.interp(x_orig, x_down, smoothed_down[:, 1])
+            
+        else:
+            safe_window = min(SMOOTH_WINDOW, n_points - 1) | 1
+            if safe_window > poly_order:
+                pad_len = safe_window
+                padded = np.vstack([world[-pad_len:], world, world[:pad_len]])
+                smoothed_padded = savgol_filter(padded, safe_window, poly_order, axis=0, mode="nearest")
+                self.centerline = smoothed_padded[pad_len:-pad_len]
+            else:
+                self.centerline = world.copy()
+                
+        # Final fast vector transformations
         diffs = np.diff(self.centerline, axis=0, append=self.centerline[:1])
         self.angles = np.arctan2(diffs[:, 1], diffs[:, 0])
 
