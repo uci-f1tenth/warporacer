@@ -47,6 +47,8 @@ class Visuals:
             device=env.device #  Uses your explicitly requested runtime device
         )
 
+        self.renderer._camera_speed = 1.0
+
         # Mount HUD overlay layer management system using OpenGL callbacks
         self.imgui_manager = ImGuiManager(self.renderer, env)
         self.renderer.render_2d_callbacks.append(self.imgui_manager._render_frame)
@@ -116,63 +118,77 @@ class Visuals:
         self.renderer.end_frame()
 
     def _setup_map(self) -> None:
-        """Bundles procedural operations required to draw a complete track layout."""
-        self._setup_map_ground()
-        self._setup_map_walls()
-        self._setup_map_center_line()
-
-    def _setup_map_ground(self) -> None:
-        """Renders the ground plane exactly centered at the world origin (0, 0, 0)."""
-        # Grab the precise bounding box extent of the track
-        max_extent = self.map.max_extent
+        """Renders a single unified square floor plane bounding all packed track structures cleanly."""
+        # 1. Render the single shared, non-stretching square floor covering all tracks
+        floor_size = self.env.floor_square_size
+        center_coord = floor_size / 2.0
 
         self.renderer.render_plane(
-            name="map_ground",
-            pos=[0.0, 0.0, 0.0],  # Track origin is now mathematically centered here
+            name="unified_square_ground",
+            pos=[center_coord, center_coord, 0.0],
             rot=np.array(wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), np.pi / 2.0)),
-            width=max_extent / 2.0,
-            length=max_extent / 2.0,
-            color=(0.15, 0.15, 0.15)
+            width=center_coord,   # Extends from center to edge (Half-width parameter)
+            length=center_coord,  # Extends from center to edge (Half-length parameter)
+            color=(0.13, 0.13, 0.13)
         )
-    
-    def _setup_map_walls(self) -> None:
-        """Extracts track boundaries using spatial image dilation to plot outer wall point clouds."""
-        dilated_free = binary_dilation(self.map.free)
-        boundary_mask = dilated_free & ~self.map.free 
+
+        # 2. Iterate through and render the standalone visual elements for each map
+        for idx, single_map in enumerate(self.env.maps):
+            self._setup_single_map_walls(idx, single_map)
+            self._setup_single_map_centerline(idx, single_map)
+
+        # Force the starting viewport to hover directly over the center of your packed layout
+        center_coord = self.env.floor_square_size / 2.0
+        
+        self.renderer.camera_pos = [center_coord, 1, center_coord] # X Z instead of XY cuz nvidia weird
+
+    def _setup_single_map_walls(self, idx: int, m: Map) -> None:
+        """Extracts track boundaries to plot wall point clouds using their exact 2D grid coordinates."""
+        dilated_free = binary_dilation(m.free)
+        boundary_mask = dilated_free & ~m.free 
         boundary_pixels = np.argwhere(boundary_mask)
 
         rows = boundary_pixels[:, 0]
         cols = boundary_pixels[:, 1]
 
-        wall_x = self.map.ox + cols * self.map.res
-        wall_y = self.map.oy + (self.map.h - 1 - rows) * self.map.res
+        # Extract the exact unique grid offsets processed by the physics environment
+        env_origin = self.env.maps_origin.numpy()[idx]
+        shifted_ox = env_origin[0]
+        shifted_oy = env_origin[1]
+
+        # Compute physical world positions with full 2D layout alignment
+        wall_x = shifted_ox + cols * m.res
+        wall_y = shifted_oy + (m.h - 1 - rows) * m.res
 
         num_wall_points = len(boundary_pixels)
-        self.wall_vertices = np.zeros((num_wall_points, 3), dtype=np.float32)
-        self.wall_vertices[:, 0] = wall_x
-        self.wall_vertices[:, 1] = wall_y
-        self.wall_vertices[:, 2] = 0.05
+        vertices = np.zeros((num_wall_points, 3), dtype=np.float32)
+        vertices[:, 0] = wall_x
+        vertices[:, 1] = wall_y
+        vertices[:, 2] = 0.05
 
         self.renderer.render_points(
-            name="physics_walls",
-            points=self.wall_vertices,
-            colors=(1.0, 0.0, 0.0),
-            radius=0.05
+            name=f"physics_walls_{idx}",
+            points=vertices,
+            colors=(0.8, 0.2, 0.2),
+            radius=0.06
         )
 
-    def _setup_map_center_line(self) -> None:
-        """Draws spline guide arrays down the physical midpoint coordinates of the track layout."""
-        num_points = len(self.map.centerline)
-        self.track_vertices = np.zeros((num_points, 3), dtype=np.float32)
-        self.track_vertices[:, 0] = self.map.centerline[:, 0]
-        self.track_vertices[:, 1] = self.map.centerline[:, 1]
-        self.track_vertices[:, 2] = 0.05
+    def _setup_single_map_centerline(self, idx: int, m: Map) -> None:
+        """Draws spline guide lines down the physical midpoint coordinates of each layout."""
+        # Grab the shifted centerline positions directly out of the environment's master buffer
+        cl_data = self.env.centerline_buf.numpy()[idx]
+        n_cl = self.env.maps_n_cl.numpy()[idx]
+
+        vertices = np.zeros((n_cl, 3), dtype=np.float32)
+        vertices[:, 0] = cl_data[:n_cl, 0]
+        vertices[:, 1] = cl_data[:n_cl, 1]
+        vertices[:, 2] = 0.04
         
         self.renderer.render_points(
-            name="center_line",
-            points=self.track_vertices,
-            colors=(0.0, 1.0, 0.0),
-            radius=0.05
+            name=f"center_line_{idx}",
+            points=vertices,
+            colors=(0.2, 0.7, 0.2),
+            radius=0.04
         )
 
     def _setup_dynamic_objects(self) -> None:
@@ -192,11 +208,6 @@ class Visuals:
     def _render_all_agents(self) -> None:
         """Handles structural allocation, color distribution, and updates for massive parallel agent swarms."""
         agent_count_divider = 16
-        
-        # Safeguard: If the environment swapped track layouts under the hood, force-refresh the visual layers
-        if self.map.path_name != self.env.maps[0].path_name:
-            # Assumes your Environment exposes an active map layout tracking reference
-            self.switch_track_layout(self.env.maps[0])
             
         car_states = self.env.cars_buf.cpu().numpy()[::agent_count_divider]
         num_cars_to_render = len(car_states)

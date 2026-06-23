@@ -42,6 +42,7 @@ class Environment:
     maps_res: wp.array        # Shape: (num_maps) of float
     maps_n_cl: wp.array       # Shape: (num_maps) of int
     maps_look_step: wp.array   # Shape: (num_maps) of int
+    floor_square_size: float
 
     # Environment-to-Track Routing Buffer
     env_map_ids: wp.array     # Shape: (num_envs) of int
@@ -69,6 +70,7 @@ class Environment:
         self.device = target_device
         self.switch_map_iter = switch_map_iter
         
+        self.floor_square_size = 0.0
         self.available_maps = []
         self._initialize_map_library(maps_dir)
         
@@ -122,12 +124,12 @@ class Environment:
         self.env_map_ids = wp.zeros(self.num_envs, dtype=int, device=d)
 
     def _initialize_all_maps(self) -> None:
-        """Pads and bakes all map structures into static GPU memory footprints once."""
+        """Pads and bakes all map structures into static GPU memory footprints once using a square-growing MaxRects algorithm."""
         d = self.device
         self.maps = [Map(p) for p in self.available_maps]
         self.num_maps = len(self.maps)
         
-        # Identify bounding constraint limits across all tracks to maintain square alignment
+        # Identify bounding constraint limits across all tracks
         max_shape_0 = max(m.dt.T.shape[0] for m in self.maps)
         max_shape_1 = max(m.dt.T.shape[1] for m in self.maps)
         max_n_cl = max(len(m.centerline) for m in self.maps)
@@ -139,21 +141,130 @@ class Environment:
         
         n_cl_list, origins_list, res_list, look_step_list = [], [], [], []
         
+        # --- HIGH-DENSITY SQUARE BOUNDING PACKING MATH (METERS) ---
+        GAP_MARGIN = 1.0  # 1-meter safety buffer between tracks
+        
+        # Sort maps by largest dimension descending to place big constraints first
+        sorted_map_indices = sorted(
+            range(self.num_maps), 
+            key=lambda i: max(self.maps[i].wall_width, self.maps[i].wall_length), 
+            reverse=True
+        )
+        
+        # Open rectangular tracking nodes: [x, y, width, height]
+        free_rects = [[0.0, 0.0, 10000.0, 10000.0]]
+        map_offsets = {}
+        
+        # Tracks the current global bounding box of all placed items
+        current_max_x = 0.0
+        current_max_y = 0.0
+        
+        for idx in sorted_map_indices:
+            m = self.maps[idx]
+            
+            w_box = float(m.wall_width) + GAP_MARGIN
+            l_box = float(m.wall_length) + GAP_MARGIN
+            
+            best_rect_idx = -1
+            best_score = float('inf')  # Penalizes options that stretch out the layout
+            best_x, best_y = 0.0, 0.0
+            
+            for r_idx, rect in enumerate(free_rects):
+                rx, ry, rw, rh = rect
+                if rw >= w_box and rh >= l_box:
+                    # Evaluate what the new global boundaries would look like if placed here
+                    potential_max_x = max(current_max_x, rx + w_box)
+                    potential_max_y = max(current_max_y, ry + l_box)
+                    
+                    # The score is the maximum edge size. This heavily penalizes long rectangular growth.
+                    score = max(potential_max_x, potential_max_y)
+                    
+                    # Choose the slot that keeps the overall layout bounding box smallest and squarest
+                    if score < best_score:
+                        best_score = score
+                        best_x = rx
+                        best_y = ry
+                        best_rect_idx = r_idx
+                    elif score == best_score:
+                        # Tie-breaker: choose the position that minimizes the area footprint
+                        if potential_max_x * potential_max_y < (max(current_max_x, best_x + w_box) * max(current_max_y, best_y + l_box)):
+                            best_x = rx
+                            best_y = ry
+                            best_rect_idx = r_idx
+            
+            if best_rect_idx == -1:
+                raise RuntimeError(f"[Env Error] Failed to pack map {m.path_name} symmetrically.")
+            
+            placed_x = best_x
+            placed_y = best_y
+            
+            # Update the verified global outer boundaries
+            current_max_x = max(current_max_x, placed_x + w_box)
+            current_max_y = max(current_max_y, placed_y + l_box)
+            
+            # Map tracking center conversion logic remains synchronized
+            shift_x = placed_x + (m.wall_width / 2.0)
+            shift_y = placed_y + (m.wall_length / 2.0)
+            map_offsets[idx] = (shift_x, shift_y)
+            
+            # Subdivide chosen space to keep the packing loop completely clean
+            new_free_rects = []
+            rect_to_remove = free_rects[best_rect_idx]
+            
+            for rect in free_rects:
+                if rect == rect_to_remove:
+                    rx, ry, rw, rh = rect
+                    if ry + l_box < ry + rh:
+                        new_free_rects.append([rx, ry + l_box, rw, rh - l_box])
+                    if rx + w_box < rx + rw:
+                        new_free_rects.append([rx + w_box, ry, rw - w_box, l_box])
+                else:
+                    rx, ry, rw, rh = rect
+                    px2, py2 = placed_x + w_box, placed_y + l_box
+                    
+                    if not (rx >= px2 or rx + rw <= placed_x or ry >= py2 or ry + rh <= placed_y):
+                        if placed_x > rx: 
+                            new_free_rects.append([rx, ry, placed_x - rx, rh])
+                        if px2 < rx + rw: 
+                            new_free_rects.append([px2, ry, (rx + rw) - px2, rh])
+                        if placed_y > ry: 
+                            new_free_rects.append([rx, ry, rw, placed_y - ry])
+                        if py2 < ry + rh: 
+                            new_free_rects.append([rx, py2, rw, (ry + rh) - py2])
+                    else:
+                        new_free_rects.append(rect)
+                        
+            free_rects = []
+            for r in new_free_rects:
+                if r[2] > 0.0 and r[3] > 0.0:
+                    if not any(r != other and other[0] <= r[0] and other[1] <= r[1] and 
+                               other[0]+other[2] >= r[0]+r[2] and other[1]+other[3] >= r[1]+r[3] 
+                               for other in new_free_rects):
+                        free_rects.append(r)
+        
+        # --- BAKE SHIFTED DATA INTO METADATA TENSORS ---
         for idx, m in enumerate(self.maps):
-            s0, s1 = m.dt.T.shape
+            s0, s1 = m.dt.T.shape    
+            shift_x, shift_y = map_offsets[idx]
+            
             dt_np[idx, :s0, :s1] = m.dt.T.astype(np.float32)
             lut_np[idx, :s0, :s1] = m.lut.T.astype(np.int32)
             
             n_cl_curr = len(m.centerline)
-            cl_np[idx, :n_cl_curr, 0:2] = m.centerline
+            cl_np[idx, :n_cl_curr, 0] = m.centerline[:, 0] + shift_x
+            cl_np[idx, :n_cl_curr, 1] = m.centerline[:, 1] + shift_y
             cl_np[idx, :n_cl_curr, 2] = m.angles
             
             n_cl_list.append(n_cl_curr)
-            origins_list.append(wp.vec2(m.ox, m.oy))
+            
+            origins_list.append(wp.vec2(m.ox + shift_x, m.oy + shift_y))
             res_list.append(float(m.res))
             look_step_list.append(int(m.look_step))
+
+        # Assign the tightest outer square bounding value encompassing all tracks cleanly
+        self.floor_square_size = float(max(current_max_x, current_max_y))
             
-        # Ship packed tensors permanently over to GPU VRAM
+        # Permanent GPU Memory Commit
         self.dt_buf = wp.array(dt_np, dtype=float, device=d)
         self.lut_buf = wp.array(lut_np, dtype=int, device=d)
         self.centerline_buf = wp.array(cl_np, dtype=wp.vec3, device=d)
@@ -163,7 +274,6 @@ class Environment:
         self.maps_res = wp.array(res_list, dtype=float, device=d)
         self.maps_look_step = wp.array(look_step_list, dtype=int, device=d)
         
-        # Execute initial randomized distribution
         self._shuffle_and_assign_maps()
 
     def _shuffle_and_assign_maps(self) -> None:

@@ -153,7 +153,7 @@ def step_kernel(
     res = maps_res[map_idx]
     n_cl = maps_n_cl[map_idx]
     
-    # Extract current physical state (Keep original variables here)
+    # Extract current physical state
     x = cars[i, 0]
     y = cars[i, 1]
     delta = cars[i, 2]
@@ -171,11 +171,22 @@ def step_kernel(
     lf_s = car_dr[i, 2]
     lr_s = car_dr[i, 3]
 
-    # Shapes now reflect 3D Tensor indexing (skip dimension 0)
+    # Matrix shapes
     mw = dt_map.shape[1]
     mh = dt_map.shape[2]
-    mh_f = wp.float32(mh) - 1.0
     df32 = wp.float32(DR_FRAC)
+
+    # DYNAMIC UNPADDED HEIGHT TRACKING
+    # Scan back from the max padded height boundary to find this map slice's actual valid image row size
+    actual_mh = mh
+    for h_chk in range(mh):
+        reverse_idx = mh - 1 - h_chk
+        if cl_lut[map_idx, 0, reverse_idx] != 0 or cl_lut[map_idx, mw - 1, reverse_idx] != 0 or cl_lut[map_idx, mw // 2, reverse_idx] != 0:
+            actual_mh = reverse_idx + 1
+            break
+    
+    # Base height inversion target calculated cleanly off the specific map's actual dimensions
+    mh_f = wp.float32(actual_mh) - 1.0
 
     # Calculate unified dynamic vision lookahead stride based on velocity
     dynamic_look_step = wp.int32(wp.float32(BASE_STRIDE) + (wp.float32(VELOCITY_SCALE) * wp.max(0.0, v)))
@@ -310,7 +321,6 @@ def step_kernel(
     # =========================================================================
     # POST-RESET OBSERVATION CALCULATION
     # =========================================================================
-    # Evaluated after the Reset block to guarantee clean heading transforms
     sh = wp.sin(psi)
     ch = wp.cos(psi)
     
@@ -354,7 +364,6 @@ def step_kernel(
     idx = new_wp
     for k in range(NUM_LOOKAHEAD):
         idx = (idx + dynamic_look_step) % n_cl
-        # Query waypoint matrix via 2D lookup track reference
         w = centerline[map_idx, idx]
         dx = w[0] - x
         dy = w[1] - y
@@ -376,7 +385,6 @@ def step_kernel(
     cars[i, 6] = beta
 
     # Populate the Critic's Privileged State
-    # (It gets everything the Actor gets, PLUS the ground truth)
     for k in range(OBS_DIM):
         critic_obs[i, k] = obs[i, k]
         
