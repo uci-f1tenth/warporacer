@@ -879,7 +879,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
 def train(
     env,
     agent,
-    iterations=2000,
+    iterations=800,
     rollouts=24,
     epochs=5,
     minibatches=4,
@@ -1072,7 +1072,7 @@ def train(
 def main(
     map_yamls: list[Path],
     num_envs: int = 4096,
-    iterations: int = 2000,
+    iterations: int = 800,
     seed: int = 0,
     log_dir: Path = Path("./logs"),
     device: str = "",
