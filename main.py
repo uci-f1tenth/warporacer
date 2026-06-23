@@ -208,6 +208,8 @@ def step_kernel(
     cl_lut: wp.array2d(dtype=wp.int32),
     centerline: wp.array(dtype=wp.vec3),
     n_cl: int,
+    spawn_lo: int,
+    spawn_len: int,
     lidar_dirs: wp.array(dtype=wp.vec2),
     seed_base: int,
 ):
@@ -275,6 +277,15 @@ def step_kernel(
     steps += 1
 
     new_wp = cl_lut[px, py]
+    # Confine training to a contiguous arc of the centerline (crop region).
+    # rel is the forward distance from the arc start; leaving the arc in
+    # either direction truncates the episode (treated as a no-penalty reset).
+    rel = new_wp - spawn_lo
+    if rel < 0:
+        rel += n_cl
+    if rel >= spawn_len:
+        trunc = True
+
     d_wp = new_wp - wp_i
     if 2 * d_wp > n_cl:
         d_wp -= n_cl
@@ -303,7 +314,7 @@ def step_kernel(
     # Reset
     if term or trunc:
         rng = wp.rand_init(seed_base + i * 73 + steps * 31 + new_wp * 17)
-        rnd = wp.int32(wp.randf(rng) * wp.float32(n_cl)) % n_cl
+        rnd = (spawn_lo + wp.int32(wp.randf(rng) * wp.float32(spawn_len))) % n_cl
         rpt = centerline[rnd]
         x = rpt[0]
         y = rpt[1]
@@ -361,7 +372,7 @@ def step_kernel(
 
 # Map
 class Map:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, crop=None):
         self.meta = safe_load(path.read_text())
         img_path = path.parent / self.meta["image"]
         self.raw = imread(str(img_path), IMREAD_GRAYSCALE)
@@ -374,6 +385,53 @@ class Map:
         self.res = float(self.meta["resolution"])
         self._compute_centerline(free)
         self._build_lut()
+        self._compute_spawn_arc(crop)
+
+    @staticmethod
+    def _longest_circular_run(mask):
+        # Longest contiguous run of True in a circular boolean array.
+        # Returns (start_index, length).
+        n = len(mask)
+        if mask.all():
+            return 0, n
+        anchor = int(np.argmin(mask))  # a False index to break the wrap
+        best_start, best_len = 0, 0
+        cur_start, cur_len = 0, 0
+        for k in range(n):
+            idx = (anchor + k) % n
+            if mask[idx]:
+                if cur_len == 0:
+                    cur_start = idx
+                cur_len += 1
+                if cur_len > best_len:
+                    best_start, best_len = cur_start, cur_len
+            else:
+                cur_len = 0
+        return best_start, best_len
+
+    def _compute_spawn_arc(self, crop):
+        # crop is (fx0, fy0, fx1, fy1) as fractions of the image (origin
+        # top-left, x=cols, y=rows), or None for the whole track. We keep the
+        # full closed-loop centerline (for robust extraction + lidar) but
+        # restrict spawning/confinement to the contiguous arc inside the box.
+        n_cl = len(self.centerline)
+        if crop is None:
+            self.spawn_lo, self.spawn_len = 0, n_cl
+            return
+        fx0, fy0, fx1, fy1 = crop
+        fx0, fx1 = sorted((fx0, fx1))
+        fy0, fy1 = sorted((fy0, fy1))
+        cmin, cmax = fx0 * self.w, fx1 * self.w
+        rmin, rmax = fy0 * self.h, fy1 * self.h
+        cols = (self.centerline[:, 0] - self.ox) / self.res
+        rows = self.h - 1 - (self.centerline[:, 1] - self.oy) / self.res
+        mask = (cols >= cmin) & (cols <= cmax) & (rows >= rmin) & (rows <= rmax)
+        if not mask.any():
+            raise RuntimeError(
+                f"crop {crop} contains no centerline points; widen the box"
+            )
+        lo, length = self._longest_circular_run(mask)
+        self.spawn_lo, self.spawn_len = int(lo), int(length)
 
     @staticmethod
     def _neighbors(skel, r, c, h, w):
@@ -499,6 +557,7 @@ class RacingEnv:
         num_envs: int,
         seed: int = 0,
         device: str | None = None,
+        crop=None,
     ):
         wp.init()
         if isinstance(map_paths, (str, Path)):
@@ -516,9 +575,17 @@ class RacingEnv:
         self.maps = []
         for p in map_paths:
             try:
-                self.maps.append(Map(p))
+                self.maps.append(Map(p, crop=crop))
             except Exception as e:
                 raise RuntimeError(f"failed to load map {p}: {e}") from e
+        if crop is not None:
+            for p, m in zip(map_paths, self.maps):
+                frac = m.spawn_len / max(len(m.centerline), 1)
+                print(
+                    f"[crop] {Path(p).name}: arc idx [{m.spawn_lo}, "
+                    f"{m.spawn_lo + m.spawn_len}) = {m.spawn_len}/"
+                    f"{len(m.centerline)} pts ({frac:.0%} of loop)"
+                )
         n_maps = len(self.maps)
         if num_envs < n_maps:
             raise ValueError(
@@ -541,7 +608,9 @@ class RacingEnv:
         cars_int = np.zeros((num_envs, 2), dtype=np.int32)
         for i, m in enumerate(self.maps):
             a, b = splits[i]
-            idxs = rng.integers(0, len(m.centerline), size=b - a)
+            idxs = (
+                m.spawn_lo + rng.integers(0, m.spawn_len, size=b - a)
+            ) % len(m.centerline)
             cars[a:b, 0] = m.centerline[idxs, 0]
             cars[a:b, 1] = m.centerline[idxs, 1]
             cars[a:b, 4] = m.angles[idxs]
@@ -587,6 +656,8 @@ class RacingEnv:
                     "origin": wp.vec2(m.ox, m.oy),
                     "res": float(m.res),
                     "n_cl": int(len(m.centerline)),
+                    "spawn_lo": int(m.spawn_lo),
+                    "spawn_len": int(m.spawn_len),
                     "dt": wp.array(m.dt.T.astype(np.float32), dtype=float, device=d),
                     "lut": wp.array(m.lut.T.astype(np.int32), dtype=int, device=d),
                     "cl": wp.array(
@@ -632,6 +703,8 @@ class RacingEnv:
                 mb["lut"],
                 mb["cl"],
                 mb["n_cl"],
+                mb["spawn_lo"],
+                mb["spawn_len"],
                 self.lidar_buf,
                 int(seed),
             ],
@@ -898,13 +971,17 @@ def train(
     log_dir=Path("./logs"),
     record_every=100,
     record_steps=1800,
+    obs_rms=None,
+    ret_rms=None,
 ):
     device = next(agent.parameters()).device
     N = env.num_envs
     opt = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5)
     sched = KLAdaptiveLR(opt, target_kl=target_kl)
-    obs_rms = RunningMeanStd((OBS_DIM,), device)
-    ret_rms = ReturnNormalizer(N, gamma, device)
+    if obs_rms is None:
+        obs_rms = RunningMeanStd((OBS_DIM,), device)
+    if ret_rms is None:
+        ret_rms = ReturnNormalizer(N, gamma, device)
 
     obs_b = torch.zeros((rollouts, N, OBS_DIM), device=device)
     act_b = torch.zeros((rollouts, N, ACT_DIM), device=device)
@@ -1082,7 +1159,21 @@ def main(
     record_every: int = 100,
     record_steps: int = 1800,
     use_wandb: bool = True,
+    init_from: str = "",
+    crop: str = "",
+    lr: float = 3e-4,
 ):
+    """Train (or fine-tune) the racer.
+
+    Fine-tune on one quarter of a new map for a short run, e.g.:
+        uv run main.py maps/new.yaml --init-from logs/agent_final.pt \\
+            --crop 0,0,0.5,0.5 --iterations 150 --lr 1e-4 --record-every 50
+
+    --crop is "x0,y0,x1,y1" as fractions of the image (origin top-left,
+    x=cols, y=rows). The full closed-loop centerline is still extracted; only
+    spawning + episode confinement are restricted to the arc inside the box.
+    Top-left quarter = "0,0,0.5,0.5"; bottom-right = "0.5,0.5,1,1".
+    """
     log_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -1091,19 +1182,43 @@ def main(
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    env = RacingEnv(map_yamls, num_envs=num_envs, seed=seed, device=device or None)
+    crop_box = None
+    if crop:
+        parts = [float(x) for x in crop.split(",")]
+        if len(parts) != 4:
+            raise ValueError("crop must be 'x0,y0,x1,y1' fractions in [0, 1]")
+        crop_box = tuple(parts)
+
+    env = RacingEnv(
+        map_yamls, num_envs=num_envs, seed=seed, device=device or None, crop=crop_box
+    )
     agent = Agent(obs_dim=OBS_DIM).to(env.device)
+
+    obs_rms = None
+    if init_from:
+        ckpt = torch.load(init_from, map_location=env.device, weights_only=False)
+        agent.load_state_dict(ckpt["agent"])
+        obs_rms = RunningMeanStd((OBS_DIM,), env.device)
+        obs_rms.mean = ckpt["obs_mean"].to(env.device)
+        obs_rms.var = ckpt["obs_var"].to(env.device)
+        obs_rms.count = float(ckpt["obs_count"])
+        obs_rms.inv_std = torch.rsqrt(obs_rms.var + 1e-8)
+        print(f"[finetune] loaded weights + obs stats from {init_from}")
 
     if use_wandb:
         try:
             wandb.init(
                 project="warporacer",
-                name=f"seed{seed}_n{num_envs}_m{len(map_yamls)}",
+                name=f"seed{seed}_n{num_envs}_m{len(map_yamls)}"
+                + ("_ft" if init_from else ""),
                 config={
                     "num_envs": num_envs,
                     "iterations": iterations,
                     "seed": seed,
                     "maps": [str(p) for p in map_yamls],
+                    "init_from": init_from,
+                    "crop": crop,
+                    "lr": lr,
                 },
             )
         except Exception as e:
@@ -1113,9 +1228,11 @@ def main(
         env,
         agent,
         iterations=iterations,
+        lr=lr,
         log_dir=log_dir,
         record_every=record_every,
         record_steps=record_steps,
+        obs_rms=obs_rms,
     )
     print(f"[done] {elapsed:.1f}s")
 

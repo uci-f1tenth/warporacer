@@ -66,7 +66,7 @@ def trace_loop(skel, start):
     return np.array(path), src, nbrs
 
 
-def main(map_yaml: Path, save: Path = None):
+def main(map_yaml: Path, save: Path = None, crop: str = ""):
     meta = safe_load(map_yaml.read_text())
     img_path = map_yaml.parent / meta["image"]
     raw = imread(str(img_path), IMREAD_GRAYSCALE)
@@ -125,6 +125,23 @@ def main(map_yaml: Path, save: Path = None):
                 label="raw BFS path", alpha=0.6)
         ax.plot(sm_px_col, sm_px_row, "-", lw=2.0, c="#ff3a6b",
                 label="smoothed centerline")
+
+        # Crop preview: draw the box and highlight the arc inside it. These
+        # are the same image-fraction coords main.py's --crop consumes.
+        if crop:
+            fx0, fy0, fx1, fy1 = (float(v) for v in crop.split(","))
+            fx0, fx1 = sorted((fx0, fx1))
+            fy0, fy1 = sorted((fy0, fy1))
+            cmin, cmax, rmin, rmax = fx0 * w, fx1 * w, fy0 * h, fy1 * h
+            in_box = ((sm_px_col >= cmin) & (sm_px_col <= cmax)
+                      & (sm_px_row >= rmin) & (sm_px_row <= rmax))
+            ax.add_patch(plt.Rectangle((cmin, rmin), cmax - cmin, rmax - rmin,
+                         fill=False, edgecolor="white", lw=2.0, ls="--",
+                         label=f"crop {crop}"))
+            ax.scatter(sm_px_col[in_box], sm_px_row[in_box], s=10, c="lime",
+                       label=f"arc in crop ({int(in_box.sum())} pts)")
+            print(f"crop {crop}: {int(in_box.sum())}/{len(in_box)} "
+                  f"centerline pts inside ({in_box.mean():.0%} of loop)")
 
         # Direction arrow near the start, pointing along travel.
         step = max(1, len(smoothed) // 50)
