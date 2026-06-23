@@ -130,8 +130,11 @@ class Agent(nn.Module):
         raw_action = mean + noise * std
         action_squashed = torch.tanh(raw_action)
         
-        log_prob = -((raw_action - mean) ** 2) / (2 * std.pow(2)) - ls - self.HALF_LOG_TWO_PI
-        log_prob = log_prob.sum(-1) - torch.log(1.0 - action_squashed.pow(2) + 1e-6).sum(-1)
+        # 1. Algebraic cancellation (Massive mathematical shortcut)
+        log_prob = -0.5 * noise.pow(2) - ls - self.HALF_LOG_TWO_PI
+        
+        # 2. Combined the sum(-1) into a single reduction to save a kernel launch
+        log_prob = (log_prob - torch.log(1.0 - action_squashed.pow(2) + 1e-6)).sum(-1)
         entropy = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1)
         
         return raw_action, action_squashed, log_prob, entropy, self.critic(critic_obs).squeeze(-1)
@@ -489,7 +492,9 @@ def train(
             for t in range(rollouts):
                 buffers.obs_b[t] = obs
                 buffers.critic_obs_b[t] = raw_critic
+                #torch.cuda.synchronize()
                 act_raw, act_clamped, logp, _, val = agent.act_value_compiled(obs, raw_critic)
+                #torch.cuda.synchronize()
                 buffers.act_b[t] = act_raw 
                 buffers.logp_b[t] = logp
                 buffers.val_b[t] = val
@@ -518,7 +523,7 @@ def train(
                 
                 obs = process_observations(raw, obs_rms)
 
-                if env.vs and t % 4 == 0:
+                if env.vs and t % 10 == 0:
                     env.vs.render()
                 
             next_val: torch.Tensor = agent.value(raw_critic)
@@ -532,7 +537,9 @@ def train(
         obs = process_observations(raw, obs_rms)
 
         # Compute GAE while the PCIe bus copies your metrics trackers over
+        #torch.cuda.synchronize()
         adv_b: torch.Tensor = compute_gae(buffers.rew_b, buffers.val_b, next_val, buffers.term_b, buffers.done_b, gamma, gae_lambda, rollouts)
+        #torch.cuda.synchronize()
         ret_b: torch.Tensor = adv_b + buffers.val_b
         global_step += B
 
@@ -577,6 +584,7 @@ def train(
                 
                 # Advanced indexing (e.g., b_obs[mb_indices]) automatically allocates 
                 # a tiny, contiguous tensor just for this minibatch.
+                #torch.cuda.synchronize()
                 pg, v_loss, ent_m, approx_kl, clipfrac, avg_std = _full_train_step_compiled(
                     agent, opt, scaler, max_grad_norm,
                     b_obs[mb_indices].view(mb, OBS_DIM), 
@@ -588,6 +596,7 @@ def train(
                     b_val[mb_indices].view(mb), 
                     clip, vf_coef, vf_clip, current_ent_coef
                 )
+                #torch.cuda.synchronize()
 
                 running_stats[0].add_(pg)
                 running_stats[1].add_(v_loss)
