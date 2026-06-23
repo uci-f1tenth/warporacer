@@ -28,7 +28,6 @@ class Map:
         abs_path = path.resolve()
         
         if abs_path not in cls._cache:
-            # Allocate memory for a new instance if not cached
             instance = super().__new__(cls)
             instance._initialized = False
             cls._cache[abs_path] = instance
@@ -37,7 +36,6 @@ class Map:
 
     def __init__(self, path: Path):
         """Initializes the map logic. Bypasses heavy lifting if pulled from cache."""
-        # Skip processing if this instance was successfully fetched from the cache
         if getattr(self, "_initialized", False):
             return
 
@@ -53,7 +51,6 @@ class Map:
             raise FileNotFoundError(f"Could not load image at {self.img_path}")
         
         # 2. Programmatically seal the image border with black pixels (0)
-        # Prevents "leaks" in distance transforms and visually closes tightly cropped tracks
         self.raw[0, :] = 0    
         self.raw[-1, :] = 0   
         self.raw[:, 0] = 0    
@@ -74,14 +71,12 @@ class Map:
         self._compute_centerline()
         self._build_lut()
 
-        # Mark as initialized to enable instant cache-returns on future calls
         self._initialized = True
 
     def _calculate_wall_bounds(self):
         """Calculates physical dimensions of the track and mathematical centers the world origin."""
         track_pts = np.argwhere(self.free)
         
-        # Fallback to full image bounds if no free space is found (prevent crashes)
         if len(track_pts) == 0:
             min_r, min_c, max_r, max_c = 0, 0, self.h - 1, self.w - 1
         else:
@@ -107,69 +102,58 @@ class Map:
         self.max_extent = float(max(self.wall_width, self.wall_length)) + 2.0
 
     def _extract_wall_segments(self):
-        """Extracts drivable boundaries as 2D vector line segments."""
-        # 1. Convert boolean free space to uint8 for OpenCV compatibility
+        """Extracts drivable boundaries as 2D vector line segments via fully vectorized mapping."""
         free_img = self.free.astype(np.uint8) * 255
-
-        # 2. Find contours (the boundaries between free space and walls)
-        # RETR_LIST gets outer walls and inner obstacles.
         contours, _ = cv2.findContours(free_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
         segments = []
-        
         for contour in contours:
-            # 3. Simplify the jagged pixel edges into smooth vector lines
-            # epsilon is the maximum distance from contour to approximated contour.
-            # 1.0 pixel is usually a perfect balance of accuracy vs segment reduction.
             approx = cv2.approxPolyDP(contour, epsilon=1.0, closed=True)
-            
-            # Reshape OpenCV's output to a standard (N, 2) array of [col, row]
             pts = approx.reshape(-1, 2) 
             
             if len(pts) < 3:
-                continue # Ignore microscopic noise artifacts
+                continue  
                 
-            # 4. Convert pixel coordinates (col, row) to world coordinates (X, Y)
-            world_x = self.ox + pts[:, 0] * self.res
-            world_y = self.oy + (self.h - 1 - pts[:, 1]) * self.res
+            # Vectorized coordinate mapping transformations
+            world_pts = np.empty(pts.shape, dtype=np.float32)
+            world_pts[:, 0] = self.ox + pts[:, 0] * self.res
+            world_pts[:, 1] = self.oy + (self.h - 1 - pts[:, 1]) * self.res
             
-            world_pts = np.column_stack([world_x, world_y])
+            # Vectorized continuous loop connection
+            next_pts = np.roll(world_pts, -1, axis=0)
+            segments.append(np.hstack([world_pts, next_pts]))
+                
+        if segments:
+            self.wall_segments = np.vstack(segments).astype(np.float32)
+        else:
+            self.wall_segments = np.empty((0, 4), dtype=np.float32)
             
-            # 5. Create point-to-point line segments closing the loop
-            for i in range(len(world_pts)):
-                p1 = world_pts[i]
-                p2 = world_pts[(i + 1) % len(world_pts)]
-                
-                # Append as [x1, y1, x2, y2]
-                segments.append([p1[0], p1[1], p2[0], p2[1]])
-                
-        # Store as a flat, highly-optimized float32 array for the GPU
-        self.wall_segments = np.array(segments, dtype=np.float32)
         print(f" -> Extracted {len(self.wall_segments)} wall segments for {self.path_name}")
 
     def _compute_centerline(self):
-        """Extracts the optimal racing circuit centerline using skeletonization and Dijkstra's algorithm."""
-        
-        # 1. Collapse drivable space into a 1-pixel wide skeleton
+        """Extracts optimal circuit centerline using graph adjacency and dynamic cost lookups."""
         skel = skeletonize(self.free)
         pts = np.argwhere(skel)
         
         if len(pts) == 0:
             raise RuntimeError(f"[Map Error] Skeleton is empty on {self.img_path.name}.")
 
-        # Fast lookup tables for pixel coordinates to node IDs and vice-versa
         node_to_px = {i: tuple(pt) for i, pt in enumerate(pts)}
         px_to_node = {tuple(pt): i for i, pt in enumerate(pts)}
+        
+        # High-performance cache map for wall clearances per node
+        node_clearance = {i: float(self.dt[node_to_px[i]]) for i in node_to_px}
 
-        # 2. Build graph adjacency list checking 8-way connectivity
-        adj = {i: set() for i in node_to_px}
+        # Build graph adjacencies using structural dictionaries to pre-store edge weights
+        adj = {i: {} for i in node_to_px}
         for i, (r, c) in node_to_px.items():
             for dr, dc in ADJ:
                 nr, nc = r + dr, c + dc
                 if (nr, nc) in px_to_node:
-                    adj[i].add(px_to_node[(nr, nc)])
+                    # Diagonal edges are sqrt(2), straight edges are 1.0
+                    adj[i][px_to_node[(nr, nc)]] = 1.41421356 if dr != 0 and dc != 0 else 1.0
 
-        # 3. Heal disjointed skeleton segments (jumps < 12 pixels are reconnected)
+        # Heal disjointed skeleton segments
         kdtree = KDTree(pts)
         max_gap_pixels = 12.0  
         endpoints = [i for i, neighbors in adj.items() if len(neighbors) <= 1]
@@ -181,21 +165,23 @@ class Map:
                 if v == u or v in adj[u]: 
                     continue
                 v_px = node_to_px[v]
-                if np.hypot(u_px[0] - v_px[0], u_px[1] - v_px[1]) > 1.5:
-                    adj[u].add(v)
-                    adj[v].add(u)
+                dist = float(np.hypot(u_px[0] - v_px[0], u_px[1] - v_px[1]))
+                if dist > 1.5:
+                    adj[u][v] = dist
+                    adj[v][u] = dist
 
-        # 4. Iteratively prune useless dead-end branches
+        # Prune dead-end branches
         degrees = {i: len(neighbors) for i, neighbors in adj.items()}
         q = deque([i for i, d in degrees.items() if d == 1])
 
         while q:
             u = q.popleft()
-            for v in adj[u]:
+            for v in list(adj[u].keys()):
                 if u in adj[v]:
-                    adj[v].remove(u)
+                    del adj[v][u]
                     degrees[v] -= 1
-                    if degrees[v] == 1: q.append(v)
+                    if degrees[v] == 1: 
+                        q.append(v)
             adj[u].clear()
             degrees[u] = 0
 
@@ -203,7 +189,7 @@ class Map:
         if not valid_nodes:
             raise RuntimeError(f"[Map Error] No closed loops found on {self.img_path.name}.")
 
-        # 5. Extract the largest connected component (main track)
+        # Extract largest connected component
         visited = set()
         components = []
         for node in valid_nodes:
@@ -221,14 +207,11 @@ class Map:
                 components.append(comp)
 
         main_component = set(max(components, key=len))
-
-        # Start search at the widest point on the track
-        start_node = max(main_component, key=lambda n: self.dt[node_to_px[n]])
+        start_node = max(main_component, key=lambda n: node_clearance[n])
         min_clearance_px = max(2.0, 0.15 / self.res)
 
         def dijkstra_soft(src, target=None, penalty_nodes=None):
-            """Internal pathfinder prioritizing wider spaces over strictly shorter distances."""
-            # FIX: Mutable default argument eliminated to prevent memory leaking between calls
+            """Internal pathfinder leveraging precalculated primitive edge distances."""
             if penalty_nodes is None:
                 penalty_nodes = set()
                 
@@ -238,26 +221,20 @@ class Map:
             
             while pq:
                 curr_cost, u = heapq.heappop(pq)
-                if target is not None and u == target: break
-                
-                # Prune outdated higher-cost paths
+                if target is not None and u == target: 
+                    break
                 if curr_cost > costs.get(u, float('inf')): 
                     continue
                 
-                for v in adj[u]:
+                for v, edge_dist in adj[u].items():
                     if v not in main_component: 
                         continue
                     
-                    u_px, v_px = node_to_px[u], node_to_px[v]
-                    clearance = self.dt[v_px]
-                    
+                    clearance = node_clearance[v]
                     if clearance < min_clearance_px: 
                         continue
                     
-                    edge_dist = np.hypot(u_px[0] - v_px[0], u_px[1] - v_px[1])
-                    # Weight function aggressively penalizes getting close to walls
                     weight = edge_dist + (8.0 / (clearance + 1e-3))
-                    
                     if v in penalty_nodes: 
                         weight += 5000.0
                     
@@ -285,7 +262,7 @@ class Map:
             curr = p1_tree[curr]
         path1.reverse()
 
-        # Extract Inbound Path (Penalize outbound nodes so it takes the other side of the track)
+        # Extract Inbound Path
         internal_nodes = set(path1[1:-1])
         _, p2_tree = dijkstra_soft(target_node, start_node, penalty_nodes=internal_nodes)
         
@@ -297,24 +274,19 @@ class Map:
         
         best_circuit = path1 + path2[1:-1]
 
-        # ---------------------------------------------------------
-        # OPTIMIZED PRUNER: Removes dead-end excursions in O(N) time
-        # ---------------------------------------------------------
+        # Fast O(N) dead-end pruner
         simplified_circuit = []
-        node_indices = {}  # Tracks the list index of nodes to avoid O(N) lookups
+        node_indices = {}  
         max_detour_len = len(best_circuit) * 0.25 
 
         for node in best_circuit:
             if node in node_indices:
                 idx = node_indices[node]
-                # If the loop/detour is short, slice it out
                 if len(simplified_circuit) - idx < max_detour_len:
-                    # Clean up the dictionary for nodes we are about to delete
                     for popped_node in simplified_circuit[idx + 1:]:
                         del node_indices[popped_node]
                     simplified_circuit = simplified_circuit[:idx + 1]
                 else:
-                    # Massive loop (main circuit overlap). Keep it.
                     simplified_circuit.append(node)
                     node_indices[node] = len(simplified_circuit) - 1
             else:
@@ -322,11 +294,9 @@ class Map:
                 node_indices[node] = len(simplified_circuit) - 1
 
         best_circuit = simplified_circuit
-        # ---------------------------------------------------------
 
         # Convert back to physical world coordinates and orient sequence
         best_path_px = np.array([node_to_px[n] for n in best_circuit])
-
         origin_px = np.array([self.h - 1 + self.oy / self.res, -self.ox / self.res])
         start_idx = np.argmin(((best_path_px - origin_px) ** 2).sum(axis=1))
         best_path_rolled = np.roll(best_path_px, -start_idx, axis=0)
@@ -351,7 +321,6 @@ class Map:
 
     def _build_lut(self):
         """Generates a spatial lookup table to query nearest centerline index instantly."""
-        # Map physical centerline coordinates back to image pixel space
         cl_px = np.column_stack(
             [
                 self.h - 1 - (self.centerline[:, 1] - self.oy) / self.res,
@@ -359,10 +328,9 @@ class Map:
             ]
         )
         
-        # Use KDTree to generate an image-sized grid mapping every map pixel to a track index
         tree = KDTree(cl_px)
-        rows, cols = np.mgrid[: self.h, : self.w]
         
-        self.lut = tree.query(
-            np.column_stack([rows.ravel(), cols.ravel()]), workers=-1
-        )[1].reshape(rows.shape)
+        # Memory optimized coordinate stacking without full grid array duplication
+        query_points = np.indices((self.h, self.w)).reshape(2, -1).T
+        
+        self.lut = tree.query(query_points, workers=-1)[1].reshape(self.h, self.w)
