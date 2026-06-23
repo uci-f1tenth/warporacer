@@ -53,7 +53,10 @@ DR_FRAC = 0.15
 PROGRESS_SCALE = 100.0
 PROGRESS_V_COEF = 10.0
 TERM_PENALTY = (
-    25.0  # crash cost; must dominate the pre-crash progress a floored corner can farm
+    100.0  # crash cost; must DOMINATE the pre-crash progress a floored corner farms.
+    # Raised 25->100 to make crashing categorically worse than any cautious line:
+    # a floored corner only farms ~6-12 progress before impact, so 100 is an
+    # ~8-16x margin and a crash can never net out cheaper than slowing down.
 )
 
 # Dense wall-proximity shaping. The crash penalty above is SPARSE — the policy
@@ -63,8 +66,8 @@ TERM_PENALTY = (
 # speed-scaled (mirrors progress) so hugging a wall *fast* costs the most, which
 # teaches the car to slow as clearance drops. Strictly a penalty (never paid as
 # reward) so it can't be farmed the way decoupling v_along to plain v was.
-WALL_MARGIN = 0.25  # m of clearance beyond the car half-diagonal where the penalty starts
-WALL_PROX_COEF = 0.5  # penalty at zero clearance; quadratic ramp from 0 at WALL_MARGIN
+WALL_MARGIN = 0.35  # m of clearance beyond the car half-diagonal where the penalty starts
+WALL_PROX_COEF = 1.0  # penalty at zero clearance; quadratic ramp from 0 at WALL_MARGIN
 
 NUM_LIDAR = 108
 LIDAR_FOV = np.radians(270.0)
