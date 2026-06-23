@@ -54,6 +54,30 @@ class VDeriv:
     d_v: wp.float32
 
 
+@wp.struct
+class GridPos:
+    """Grid coordinate indices tracking positions inside map structures."""
+    x: wp.int32
+    y: wp.int32
+
+
+@wp.func
+def world_to_grid_px(
+    pos_x: wp.float32,
+    pos_y: wp.float32,
+    origin: wp.vec2,
+    res: wp.float32,
+    mh_f: wp.float32,
+    mw: wp.int32,
+    mh: wp.int32,
+) -> GridPos:
+    """Transforms continuous world coordinate spaces cleanly into clamped grid pixel spaces."""
+    out = GridPos()
+    out.x = wp.clamp(wp.int32((pos_x - origin[0]) / res), 0, mw - 1)
+    out.y = wp.clamp(wp.int32(mh_f - (pos_y - origin[1]) / res), 0, mh - 1)
+    return out
+
+
 @wp.func
 def st_deriv(
     delta: wp.float32,
@@ -68,51 +92,29 @@ def st_deriv(
     lf_s: wp.float32,
     lr_s: wp.float32,
 ) -> VDeriv:
-    """Calculates single-step state derivatives using a bounded kinematic-dynamic model.
-
-    Args:
-        delta: Current steering angle (radians).
-        v: Forward velocity (m/s).
-        psi: Heading angle (radians).
-        psip: Yaw rate (rad/s).
-        beta: Slip angle (radians).
-        steer_v: Steering velocity input (rad/s).
-        accel: Longitude acceleration input (m/s^2).
-        mu_s: Friction scaling factor.
-        mass_s: Mass scaling factor.
-        lf_s: Front wheelbase length scaling factor.
-        lr_s: Rear wheelbase length scaling factor.
-
-    Returns:
-        VDeriv: The evaluated state derivatives.
-    """
-    # Scale static physical dimensions by the randomized environment coefficients
+    """Calculates single-step state derivatives using a bounded kinematic-dynamic model."""
     lf = LF * lf_s
     lr = LR * lr_s
     lwb = lf + lr
     mu = MU * mu_s
     a_max = mu * G
 
-    # Calculate kinematic angular velocity bounds
-    # Velocity threshold avoids division-by-zero singularities when the vehicle is stationary
+    # Avoid division-by-zero singularities when stationary
     velocity_epsilon = 0.5
     tand = wp.tan(delta)
     d_psi_kin = v * tand / lwb
     d_psi_cap = a_max / wp.max(wp.abs(v), velocity_epsilon)
     d_psi = wp.clamp(d_psi_kin, -d_psi_cap, d_psi_cap)
 
-    # Project tire traction constraints into friction ellipse boundaries to clamp max acceleration
+    # Friction ellipse boundary constraints
     a_lat = v * d_psi
     a_long_max = wp.sqrt(wp.max(a_max * a_max - a_lat * a_lat, 0.0))
 
-    cp = wp.cos(psi)
-    sp = wp.sin(psi)
-
     out = VDeriv()
-    out.d_x = v * cp
-    out.d_y = v * sp
+    out.d_x = v * wp.cos(psi)
+    out.d_y = v * wp.sin(psi)
     out.d_psi = d_psi
-    out.d_v = wp.clamp(accel, -A_MAX, a_long_max)  # Always allow maximum emergency braking force
+    out.d_v = wp.clamp(accel, -A_MAX, a_long_max)
     out.d_psip = 0.0
     out.d_beta = 0.0
     return out
@@ -132,24 +134,7 @@ def rk4_step(
     lf_s: wp.float32,
     lr_s: wp.float32,
 ) -> VDeriv:
-    """Performs explicit 4th-order Runge-Kutta integration over a sub-step interval.
-
-    Args:
-        delta: Current steering angle (radians).
-        v: Forward velocity (m/s).
-        psi: Heading angle (radians).
-        psip: Yaw rate (rad/s).
-        beta: Slip angle (radians).
-        steer_v: Steering velocity input (rad/s).
-        accel: Longitude acceleration input (m/s^2).
-        mu_s: Friction scaling factor.
-        mass_s: Mass scaling factor.
-        lf_s: Front wheelbase length scaling factor.
-        lr_s: Rear wheelbase length scaling factor.
-
-    Returns:
-        VDeriv: Blended integration step vector updates.
-    """
+    """Performs explicit 4th-order Runge-Kutta integration over a sub-step interval."""
     dd = steer_v * DT_SUB_HALF
     dd_full = steer_v * DT_SUB
 
@@ -194,7 +179,6 @@ def rk4_step(
         lr_s,
     )
 
-    # Perform weighted average blending for the definitive integration update
     out = VDeriv()
     out.d_x = (k1.d_x + 2.0 * k2.d_x + 2.0 * k3.d_x + k4.d_x) * DT_SUB_SIX
     out.d_y = (k1.d_y + 2.0 * k2.d_y + 2.0 * k3.d_y + k4.d_y) * DT_SUB_SIX
@@ -221,15 +205,12 @@ def step_kernel(
     maps_origin: wp.array[wp.vec2],
     maps_res: wp.array[wp.float32],
     maps_n_cl: wp.array[wp.int32],
+    maps_mh_f: wp.array[wp.float32],
     env_map_ids: wp.array[wp.int32],
     lidar_dirs: wp.array[wp.vec2],
     seed_base: int,
 ):
-    """Executes parallel environment step updates including physics, resets, and raymarching.
-
-    Device Context:
-        Runs on the GPU parallelized across environment instances (`dim=num_envs`).
-    """
+    """Executes parallel environment step updates including physics, resets, and raymarching."""
     i = wp.tid()
 
     # Extract dynamic track profile context for this thread
@@ -237,6 +218,7 @@ def step_kernel(
     origin = maps_origin[map_idx]
     res = maps_res[map_idx]
     n_cl = maps_n_cl[map_idx]
+    mh_f = maps_mh_f[map_idx]
 
     # Extract current physical state
     x = cars[i, 0]
@@ -259,22 +241,7 @@ def step_kernel(
     mw = dt_map.shape[1]
     mh = dt_map.shape[2]
     df32 = wp.float32(DR_FRAC)
-
-    # DYNAMIC UNPADDED HEIGHT TRACKING
-    # Scan back from the max padded height boundary to find this map slice's actual valid image row size
-    actual_mh = mh
-    for h_chk in range(mh):
-        reverse_idx = mh - 1 - h_chk
-        if (
-            cl_lut[map_idx, 0, reverse_idx] != 0
-            or cl_lut[map_idx, mw - 1, reverse_idx] != 0
-            or cl_lut[map_idx, mw // 2, reverse_idx] != 0
-        ):
-            actual_mh = reverse_idx + 1
-            break
-
-    # Base height inversion target calculated cleanly off the specific map's actual dimensions
-    mh_f = wp.float32(actual_mh) - 1.0
+    max_ray_steps = 250
 
     # Calculate unified dynamic vision lookahead stride based on velocity
     dynamic_look_step = wp.int32(
@@ -293,9 +260,7 @@ def step_kernel(
     # Clean multi-pass RK4 integration over the sub-stepping interval
     dd_sub = steer_v * DT_SUB
     for _ in range(SUBSTEPS):
-        d = rk4_step(
-            delta, v, psi, psip, beta, steer_v, accel, mu_s, mass_s, lf_s, lr_s
-        )
+        d = rk4_step(delta, v, psi, psip, beta, steer_v, accel, mu_s, mass_s, lf_s, lr_s)
         x += d.d_x
         y += d.d_y
         delta += dd_sub
@@ -309,12 +274,11 @@ def step_kernel(
     psip = wp.clamp(psip, -PSI_PRIME_MAX, PSI_PRIME_MAX)
     beta = wp.clamp(beta, -BETA_MAX, BETA_MAX)
 
-    # Coordinate mapping to grid space indices
-    px = wp.clamp(wp.int32((x - origin[0]) / res), 0, mw - 1)
-    py = wp.clamp(wp.int32(mh_f - (y - origin[1]) / res), 0, mh - 1)
+    # Unified Coordinate Mapping Utility
+    g_pos = world_to_grid_px(x, y, origin, res, mh_f, mw, mh)
 
-    # Lookups now use 3D map index and 2D centerline row
-    new_wp = cl_lut[map_idx, px, py]
+    # Lookups use 3D map index and 2D centerline row indices
+    new_wp = cl_lut[map_idx, g_pos.x, g_pos.y]
     d_wp = new_wp - wp_i
     if 2 * d_wp > n_cl:
         d_wp -= n_cl
@@ -337,13 +301,10 @@ def step_kernel(
     is_stalled = stall_steps > wp.int32(STALL_SECONDS_TO_STEPS)
 
     # Compute termination limits and cross-track deviations
-    # Derived from orthagonal vector project relative to local waypoint heading orientation
     lateral_error = -(x - cx_local) * s_cth_local + (y - cy_local) * c_cth_local
     true_lateral_dist = wp.abs(lateral_error)
-    edt_val = dt_map[map_idx, px, py] * res
-    is_stable = (
-        wp.isfinite(x) and wp.isfinite(y) and wp.isfinite(v) and wp.isfinite(psi)
-    )
+    edt_val = dt_map[map_idx, g_pos.x, g_pos.y] * res
+    is_stable = wp.isfinite(x) and wp.isfinite(y) and wp.isfinite(v) and wp.isfinite(psi)
     is_off_track = true_lateral_dist > MAX_CENTERLINE_DEV
 
     term = (edt_val < CAR_HALF_DIAG) or (not is_stable) or is_off_track or is_stalled
@@ -378,7 +339,6 @@ def step_kernel(
     # COMPACT AUTO-RESET ENGINE
     # =========================================================================
     if term or trunc:
-        # Hashing seed using distinct large prime factors to safely distribute pseudo-random states
         hash_prime_1 = 73
         hash_prime_2 = 31
         hash_prime_3 = 17
@@ -389,7 +349,6 @@ def step_kernel(
         if rnd >= n_cl:
             rnd = n_cl - 1
 
-        # Query thread-specific map slice to re-locate vehicle positions
         rpt = centerline[map_idx, rnd]
         x = rpt[0]
         y = rpt[1]
@@ -403,13 +362,13 @@ def step_kernel(
         stall_steps = 0
         new_wp = rnd
 
-        # Apply domain randomization parameter fluxes across standard distribution scales
+        # Apply domain randomization parameter distributions
         car_dr[i, 0] = wp.float32(1.0) - df32 + wp.float32(2.0) * df32 * wp.randf(rng)
         car_dr[i, 1] = wp.float32(1.0) - df32 + wp.float32(2.0) * df32 * wp.randf(rng)
         car_dr[i, 2] = wp.float32(1.0) - df32 + wp.float32(2.0) * df32 * wp.randf(rng)
         car_dr[i, 3] = wp.float32(1.0) - df32 + wp.float32(2.0) * df32 * wp.randf(rng)
 
-        # Refresh local map tracking metrics using the new reset coordinate frames
+        # Refresh local map tracking metrics using the new reset spatial frames
         cpt_local = centerline[map_idx, new_wp]
         cx_local = cpt_local[0]
         cy_local = cpt_local[1]
@@ -428,13 +387,11 @@ def step_kernel(
     lx = x + LF * ch
     ly = y + LF * sh
 
-    lpx = wp.clamp(wp.int32((lx - origin[0]) / res), 0, mw - 1)
-    lpy = wp.clamp(wp.int32(mh_f - (ly - origin[1]) / res), 0, mh - 1)
-    lpos = wp.vec2(wp.float32(lpx), wp.float32(lpy))
+    g_lidar = world_to_grid_px(lx, ly, origin, res, mh_f, mw, mh)
+    lpos = wp.vec2(wp.float32(g_lidar.x), wp.float32(g_lidar.y))
     lrange_px = LIDAR_RANGE / res
 
     # Bounded LiDAR raymarching loop
-    max_ray_steps = 250
     for j in range(lidar_dirs.shape[0]):
         ca = lidar_dirs[j][0]
         sa = lidar_dirs[j][1]
@@ -450,7 +407,6 @@ def step_kernel(
             if rx < 0 or rx >= mw or ry < 0 or ry >= mh:
                 break
             
-            # Query signed distance layer fields out from the 3D grid voxel matrix
             step_px = dt_map[map_idx, rx, ry]
             ray = ray + dpx * step_px
             dist += step_px
@@ -474,7 +430,7 @@ def step_kernel(
         obs[i, OBS_LOOK_OFF + k * 2] = dx * ch + dy * sh
         obs[i, OBS_LOOK_OFF + k * 2 + 1] = -dx * sh + dy * ch
 
-    # Normalize state profiles directly into the reinforcement observation buffers
+    # Normalize state profiles directly into observation buffers
     obs[i, 0] = delta / STEER_MAX
     obs[i, 1] = v / V_MAX
     obs[i, 2] = psip / PSI_PRIME_MAX

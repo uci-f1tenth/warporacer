@@ -61,6 +61,7 @@ class Environment:
     maps_origin: Optional[wp.array]  # Shape: (num_maps,) - wp.vec2
     maps_res: Optional[wp.array]  # Shape: (num_maps,) - float
     maps_n_cl: Optional[wp.array]  # Shape: (num_maps,) - int
+    maps_mh_f: Optional[wp.array]  # Shape: (num_maps,) - float
 
     # Environment-to-Track Routing Buffer
     env_map_ids: wp.array  # Shape: (num_envs,) - int
@@ -107,6 +108,7 @@ class Environment:
         self.maps_origin = None
         self.maps_res = None
         self.maps_n_cl = None
+        self.maps_mh_f = None
         self.vs = None
 
         self._initialize_map_library(maps_dir)
@@ -119,11 +121,7 @@ class Environment:
             self.vs = Visuals(self)
 
     def trigger_map_rotation(self) -> None:
-        """Swaps the active computational track pool dynamically.
-
-        Invoked by internal schedule or training cycle routines to update
-        the structural data layouts without losing memory alignment.
-        """
+        """Swaps the active computational track pool dynamically."""
         self._call += 1
         rng = np.random.default_rng(self.seed + self._call)
 
@@ -206,7 +204,10 @@ class Environment:
 
         max_shape_0 = max(m.dt.T.shape[0] for m in self.maps)
         max_shape_1 = max(m.dt.T.shape[1] for m in self.maps)
-        max_n_cl = max(len(m.centerline) for m in self.maps)
+        max_n_cl = max(max_shape_0, max_shape_1)  # safe sizing bound
+
+        for m in self.maps:
+            max_n_cl = max(max_n_cl, len(m.centerline))
 
         dt_np = np.zeros(
             (self.num_maps, max_shape_0, max_shape_1), dtype=np.float32
@@ -216,7 +217,7 @@ class Environment:
         )
         cl_np = np.zeros((self.num_maps, max_n_cl, 3), dtype=np.float32)
 
-        n_cl_list, origins_list, res_list = [], [], []
+        n_cl_list, origins_list, res_list, mh_f_list = [], [], [], []
         gap_margin = 1.0
 
         sorted_map_indices = sorted(
@@ -316,7 +317,7 @@ class Environment:
                     ):
                         free_rects.append(r)
 
-        # --- COORDINATE CENTERING LOGIC ---
+        # --- COORDINATE CENTERING & HEIGHT EXTRACTION ---
         global_center_x = current_max_x / 2.0
         global_center_y = current_max_y / 2.0
 
@@ -334,6 +335,20 @@ class Environment:
 
             dt_np[idx, :s0, :s1] = m.dt.T.astype(np.float32)
             lut_np[idx, :s0, :s1] = m.lut.T.astype(np.int32)
+
+            # Pre-compute target unpadded active height configurations on Host
+            actual_mh = s1
+            for h_chk in range(s1):
+                reverse_idx = s1 - 1 - h_chk
+                if (
+                    lut_np[idx, 0, reverse_idx] != 0
+                    or lut_np[idx, s0 - 1, reverse_idx] != 0
+                    or lut_np[idx, s0 // 2, reverse_idx] != 0
+                ):
+                    actual_mh = reverse_idx + 1
+                    break
+
+            mh_f_list.append(float(actual_mh) - 1.0)
 
             n_cl_curr = len(m.centerline)
             cl_np[idx, :n_cl_curr, 0] = m.centerline[:, 0] + shift_x
@@ -354,6 +369,7 @@ class Environment:
         self.maps_n_cl = wp.array(n_cl_list, dtype=int, device=d)
         self.maps_origin = wp.array(origins_list, dtype=wp.vec2, device=d)
         self.maps_res = wp.array(res_list, dtype=float, device=d)
+        self.maps_mh_f = wp.array(mh_f_list, dtype=float, device=d)
 
         return final_shifts_x, final_shifts_y
 
@@ -475,6 +491,7 @@ class Environment:
                 self.maps_origin,
                 self.maps_res,
                 self.maps_n_cl,
+                self.maps_mh_f,
                 self.env_map_ids,
                 self.lidar_buf,
                 int(seed),
