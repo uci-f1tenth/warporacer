@@ -562,30 +562,27 @@ def train(
         for epoch in range(current_epochs):  
             perm = torch.randperm(B, device=device)
             
-            shuffled_obs = b_obs[perm]
-            shuffled_critic_obs = b_critic_obs[perm]
-            shuffled_act = b_act[perm]
-            shuffled_logp = b_logp[perm]
-            shuffled_adv = b_adv[perm]
-            shuffled_ret = b_ret[perm]
-            shuffled_val = b_val[perm]
-            
             for start in range(0, B, mb):
                 end = start + mb
                 if end > B:
                     continue
-
+                    
+                # Grab just the indices for this specific minibatch (Virtually zero VRAM)
+                mb_indices = perm[start:end]
+                
                 torch.compiler.cudagraph_mark_step_begin()
-
+                
+                # Advanced indexing (e.g., b_obs[mb_indices]) automatically allocates 
+                # a tiny, contiguous tensor just for this minibatch.
                 pg, v_loss, ent_m, approx_kl, clipfrac, avg_std = _full_train_step_compiled(
                     agent, opt, scaler, max_grad_norm,
-                    shuffled_obs[start:end].view(mb, OBS_DIM), 
-                    shuffled_critic_obs[start:end].view(mb, b_critic_obs.shape[-1]), 
-                    shuffled_act[start:end].view(mb, ACT_DIM), 
-                    shuffled_logp[start:end].view(mb), 
-                    shuffled_adv[start:end].view(mb), 
-                    shuffled_ret[start:end].view(mb), 
-                    shuffled_val[start:end].view(mb), 
+                    b_obs[mb_indices].view(mb, OBS_DIM), 
+                    b_critic_obs[mb_indices].view(mb, b_critic_obs.shape[-1]), 
+                    b_act[mb_indices].view(mb, ACT_DIM), 
+                    b_logp[mb_indices].view(mb), 
+                    b_adv[mb_indices].view(mb), 
+                    b_ret[mb_indices].view(mb), 
+                    b_val[mb_indices].view(mb), 
                     clip, vf_coef, vf_clip, current_ent_coef
                 )
 
