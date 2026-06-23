@@ -44,7 +44,7 @@ PSI_PRIME_MAX = 6.0
 BETA_MAX = 1.2
 
 # Car
-WIDTH = 0.39
+WIDTH = 0.42
 LENGTH = 0.58
 CAR_HALF_DIAG = float(np.hypot(WIDTH / 2.0, LENGTH / 2.0))
 G = 9.81
@@ -60,7 +60,11 @@ PROGRESS_SCALE = 100.0
 PROGRESS_V_COEF = 10.0
 TERM_PENALTY = 25.0
 WALL_MARGIN = 0.20
-WALL_PROX_COEF = 0.5
+WALL_PROX_COEF = 0.2
+# Symmetric centerline-offset penalty: acts across the whole track width to
+# oppose inside-cutting / single-wall hugging (the wall band only reaches the
+# last 0.2 m). abs(offset) -> cannot bias left vs right.
+CENTER_COEF = 1.0
 
 NUM_LIDAR = 108
 LIDAR_FOV = np.radians(270.0)
@@ -304,7 +308,15 @@ def step_kernel(
     prox_pen = (
         WALL_PROX_COEF * prox_f * prox_f * (1.0 + wp.max(v, 0.0) / PROGRESS_V_COEF)
     )
-    reward[i] = wp.where(term, -TERM_PENALTY, progress - prox_pen)
+
+    # Symmetric centerline-offset penalty: perpendicular distance from the
+    # nearest centerline point, pulling the car toward the middle of the track
+    # everywhere (not just near walls). Quadratic, abs -> no left/right bias.
+    cpt = centerline[new_wp]
+    offset = wp.abs(-(x - cpt[0]) * wp.sin(cth) + (y - cpt[1]) * wp.cos(cth))
+    center_pen = CENTER_COEF * offset * offset
+
+    reward[i] = wp.where(term, -TERM_PENALTY, progress - prox_pen - center_pen)
 
     if term:
         done[i] = DONE_TERMINATED
