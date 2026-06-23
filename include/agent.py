@@ -395,48 +395,6 @@ def record_rollout(env: Environment, agent: Agent, num_steps: int, out_path: Pat
         env.restore_state(snap)
         agent.train(was_training)
 
-@torch.compile(mode="reduce-overhead")
-def _compute_loss_compiled(
-    agent: Agent,
-    obs: torch.Tensor,
-    critic_obs: torch.Tensor,
-    act: torch.Tensor,
-    logp: torch.Tensor,
-    adv: torch.Tensor,
-    ret: torch.Tensor,
-    val: torch.Tensor,
-    clip: float,
-    vf_coef: float,
-    vf_clip: float,
-    ent_coef: float,
-):
-    """Pure mathematical graph. Zero graph breaks, zero dynamic shape confusion."""
-    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-        new_logp, ent, new_val = agent.evaluate(obs, critic_obs, act)
-        
-        logratio = new_logp.float() - logp.float()
-        ratio = logratio.exp()
-        
-        approx_kl = ((ratio - 1.0) - logratio).mean()
-        clipfrac = ((ratio - 1.0).abs() > clip).float().mean()
-        
-        adv_mb = (adv - adv.mean()) / (adv.std() + 1e-8)
-        s1 = ratio * adv_mb
-        s2 = ratio.clamp(1 - clip, 1 + clip) * adv_mb
-        pg = -torch.min(s1, s2).mean()
-        
-        v_err = new_val.float() - ret.float()
-        if vf_clip > 0:
-            v_clipped = val.float() + (new_val.float() - val.float()).clamp(-vf_clip, vf_clip)
-            v_loss = 0.5 * torch.max(v_err.square(), (v_clipped - ret).square()).mean()
-        else:
-            v_loss = 0.5 * v_err.square().mean()
-            
-        loss = pg + vf_coef * v_loss - ent_coef * ent.mean()
-        
-    # Return everything cleanly
-    return loss, pg.detach(), v_loss.detach(), ent.mean().detach(), approx_kl.detach(), clipfrac.detach()
-
 @profile
 def train(
     env: Environment,
