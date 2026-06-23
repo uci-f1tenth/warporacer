@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib>=3.10.9",
     "ninja>=1.11.1.2",            # Fuses compilation and smooths multi-platform TorchInductor tasks
     "numpy>=2.4.4",
+    "opencv-contrib-python>=4.13.0.92",
     "opencv-python>=4.13.0.92",
     "pyglet>=2.1.14",
     "pyopengl>=3.1.10",

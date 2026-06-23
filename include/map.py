@@ -159,22 +159,35 @@ class Map:
         node_grid[pts[:, 0], pts[:, 1]] = np.arange(num_nodes)
         clearances = self.dt[pts[:, 0], pts[:, 1]]
 
-        # 3. Build Initial Adjacency List (List of Dicts is faster than Dict of Dicts)
+        # 3. Vectorized Adjacency List Building
         adj = [{} for _ in range(num_nodes)]
         degrees = np.zeros(num_nodes, dtype=np.int32)
-        diagonal_weight = 1.41421356
-
-        for i in range(num_nodes):
-            r, c = pts[i]
-            for dr, dc in ADJ:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < self.h and 0 <= nc < self.w:
-                    nbr = node_grid[nr, nc]
-                    if nbr != -1:
-                        is_diag = (dr != 0 and dc != 0)
-                        dist = diagonal_weight if is_diag else 1.0
-                        adj[i][nbr] = dist
-                        degrees[i] += 1
+        
+        # Shift the entire point array in all 8 directions at once
+        for dr, dc in ADJ:
+            sr = pts[:, 0] + dr
+            sc = pts[:, 1] + dc
+            
+            # Fast vectorized bounds checking
+            valid = (sr >= 0) & (sr < self.h) & (sc >= 0) & (sc < self.w)
+            valid_idx = np.where(valid)[0]
+            
+            # Fetch grid neighbors for all valid shifted coordinates in one go
+            v_nodes = node_grid[sr[valid_idx], sc[valid_idx]]
+            
+            # Filter down to coordinates that actually hit a skeleton node
+            hit_mask = v_nodes != -1
+            u_nodes = valid_idx[hit_mask]
+            v_nodes = v_nodes[hit_mask]
+            
+            dist = 1.41421356 if (dr != 0 and dc != 0) else 1.0
+            
+            # Zip loop is unavoidable for dict populating, but the massive 
+            # 650,000+ bounds check overhead is totally eliminated.
+            for u, v in zip(u_nodes, v_nodes):
+                adj[u][v] = dist
+                
+            degrees[u_nodes] += 1
 
         # 4. Heal disjointed structural skeleton components
         endpoints = np.where(degrees <= 1)[0]
