@@ -29,13 +29,17 @@ MU = 1.0489
 LF = 0.15875
 LR = 0.17145
 LWB = LF + LR
+MASS = 3.74
+LIDAR_MOUNT_X = 0.2733  # m, real base_link->laser offset (sim raytraces lidar from here)
 
 STEER_MIN = -0.4189
 STEER_MAX = 0.4189
 STEER_V_MAX = 3.2
 A_MAX = 9.51
-V_MIN = 1.0
+V_MIN = -5.0
 V_MAX = 20.0
+PSI_PRIME_MAX = 6.0
+BETA_MAX = 1.2
 
 # Car
 WIDTH = 0.31
@@ -52,29 +56,7 @@ DR_FRAC = 0.15
 
 PROGRESS_SCALE = 100.0
 PROGRESS_V_COEF = 10.0
-TERM_PENALTY = (
-    100.0  # crash cost; must DOMINATE the pre-crash progress a floored corner farms.
-    # Raised 25->100 to make crashing categorically worse than any cautious line:
-    # a floored corner only farms ~6-12 progress before impact, so 100 is an
-    # ~8-16x margin and a crash can never net out cheaper than slowing down.
-)
-
-# Dense wall-proximity shaping. The crash penalty above is SPARSE — the policy
-# only learns about a wall at the instant it hits one, which is too late to
-# teach margin. This penalty grows as the car's clearance to the nearest wall
-# shrinks inside WALL_MARGIN, so the policy keeps a buffer instead. It's
-# speed-scaled (mirrors progress) so hugging a wall *fast* costs the most, which
-# teaches the car to slow as clearance drops. Strictly a penalty (never paid as
-# reward) so it can't be farmed the way decoupling v_along to plain v was.
-# Kept deliberately low/narrow so this stays a gentle nudge. At COEF=1.0/MARGIN
-# =0.35 the at-wall penalty was ~10-40x the per-step progress, so in a tight turn
-# (where low clearance is unavoidable) the policy froze/hesitated to dodge a cost
-# it couldn't escape. Now the band is narrow (only bites very close to contact)
-# and the peak is a few x progress — a real nudge, not a wall the car stalls at.
-# The hard crash deterrent stays TERM_PENALTY; this just discourages needlessly
-# grazing a wall.
-WALL_MARGIN = 0.20  # m of clearance beyond the car half-diagonal where the penalty starts
-WALL_PROX_COEF = 0.2  # penalty at zero clearance; quadratic ramp from 0 at WALL_MARGIN
+TERM_PENALTY = 10.0
 
 NUM_LIDAR = 108
 LIDAR_FOV = np.radians(270.0)
@@ -90,24 +72,14 @@ ADJ = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 DONE_TERMINATED = 1
 DONE_TRUNCATED = 2
 
-# --- Sim-to-real / racing-line config (retrain-only; toggle each independently) ---
-LIDAR_MOUNT_X = 0.2733  # m, real base_link->laser offset (sim raytraced from LF before)
-VESC_TAU = 0.15  # s, first-order speed-loop time constant (~3*tau ≈ 0.45 s to settle)
-V_LEAD_MARGIN = (
-    2.0  # m/s, cap how far the speed setpoint leads actual v (matches the node)
-)
-MU_DR_LO = 0.70  # grip domain randomization: a_max scale low bound ...
-MU_DR_HI = 1.10  # ... and high bound (real track grip is usually below MU)
-LATENCY_MAX_STEPS = (
-    0  # max randomized actuation/sensing delay, control steps (raise to ~3 to harden)
-)
-
 
 @wp.struct
 class VDeriv:
     d_x: float
     d_y: float
     d_psi: float
+    d_psip: float
+    d_beta: float
     d_v: float
 
 
@@ -116,8 +88,12 @@ def st_deriv(
     delta: float,
     v: float,
     psi: float,
-    v_cmd: float,
+    psip: float,
+    beta: float,
+    steer_v: float,
+    accel: float,
     mu_s: float,
+    mass_s: float,
     lf_s: float,
     lr_s: float,
 ) -> VDeriv:
@@ -141,9 +117,9 @@ def st_deriv(
     out.d_x = v * cp
     out.d_y = v * sp
     out.d_psi = d_psi
-    # Speed-loop tracking: close on the commanded setpoint with lag VESC_TAU,
-    # bounded by the longitudinal friction budget (mirrors the real VESC).
-    out.d_v = wp.clamp((v_cmd - v) / VESC_TAU, -a_long_max, a_long_max)
+    out.d_v = wp.clamp(accel, -a_long_max, a_long_max)
+    out.d_psip = 0.0
+    out.d_beta = 0.0
     return out
 
 
@@ -152,22 +128,29 @@ def rk4_step(
     delta: float,
     v: float,
     psi: float,
+    psip: float,
+    beta: float,
     steer_v: float,
-    v_cmd: float,
+    accel: float,
     mu_s: float,
+    mass_s: float,
     lf_s: float,
     lr_s: float,
 ) -> VDeriv:
     dd = steer_v * DT_SUB_HALF
     dd_full = steer_v * DT_SUB
 
-    k1 = st_deriv(delta, v, psi, v_cmd, mu_s, lf_s, lr_s)
+    k1 = st_deriv(delta, v, psi, psip, beta, steer_v, accel, mu_s, mass_s, lf_s, lr_s)
     k2 = st_deriv(
         delta + dd,
         v + k1.d_v * DT_SUB_HALF,
         psi + k1.d_psi * DT_SUB_HALF,
-        v_cmd,
+        psip + k1.d_psip * DT_SUB_HALF,
+        beta + k1.d_beta * DT_SUB_HALF,
+        steer_v,
+        accel,
         mu_s,
+        mass_s,
         lf_s,
         lr_s,
     )
@@ -175,8 +158,12 @@ def rk4_step(
         delta + dd,
         v + k2.d_v * DT_SUB_HALF,
         psi + k2.d_psi * DT_SUB_HALF,
-        v_cmd,
+        psip + k2.d_psip * DT_SUB_HALF,
+        beta + k2.d_beta * DT_SUB_HALF,
+        steer_v,
+        accel,
         mu_s,
+        mass_s,
         lf_s,
         lr_s,
     )
@@ -184,8 +171,12 @@ def rk4_step(
         delta + dd_full,
         v + k3.d_v * DT_SUB,
         psi + k3.d_psi * DT_SUB,
-        v_cmd,
+        psip + k3.d_psip * DT_SUB,
+        beta + k3.d_beta * DT_SUB,
+        steer_v,
+        accel,
         mu_s,
+        mass_s,
         lf_s,
         lr_s,
     )
@@ -194,6 +185,12 @@ def rk4_step(
     out.d_y = (k1.d_y + 2.0 * k2.d_y + 2.0 * k3.d_y + k4.d_y) * DT_SUB_SIX
     out.d_psi = (k1.d_psi + 2.0 * k2.d_psi + 2.0 * k3.d_psi + k4.d_psi) * DT_SUB_SIX
     out.d_v = (k1.d_v + 2.0 * k2.d_v + 2.0 * k3.d_v + k4.d_v) * DT_SUB_SIX
+    out.d_psip = (
+        k1.d_psip + 2.0 * k2.d_psip + 2.0 * k3.d_psip + k4.d_psip
+    ) * DT_SUB_SIX
+    out.d_beta = (
+        k1.d_beta + 2.0 * k2.d_beta + 2.0 * k3.d_beta + k4.d_beta
+    ) * DT_SUB_SIX
     return out
 
 
@@ -221,10 +218,12 @@ def step_kernel(
     delta = cars[i, 2]
     v = cars[i, 3]
     psi = cars[i, 4]
-    v_cmd = cars[i, 5]
+    psip = cars[i, 5]
+    beta = cars[i, 6]
     steps = cars_int[i, 0]
     wp_i = cars_int[i, 1]
     mu_s = car_dr[i, 0]
+    mass_s = car_dr[i, 1]
     lf_s = car_dr[i, 2]
     lr_s = car_dr[i, 3]
 
@@ -237,21 +236,21 @@ def step_kernel(
     if (steer_v < 0.0 and delta <= STEER_MIN) or (steer_v > 0.0 and delta >= STEER_MAX):
         steer_v = 0.0
     accel = wp.clamp(actions[i][1], -1.0, 1.0) * A_MAX
+    if (accel < 0.0 and v <= V_MIN) or (accel > 0.0 and v >= V_MAX):
+        accel = 0.0
 
     dd_sub = steer_v * DT_SUB
     for _ in range(SUBSTEPS):
-        # VESC speed-loop: the action drives a speed SETPOINT (v_cmd); the car's
-        # actual speed tracks it with first-order lag inside st_deriv.
-        v_cmd = wp.clamp(
-            v_cmd + accel * DT_SUB, V_MIN, wp.min(V_MAX, v + V_LEAD_MARGIN)
-        )
         d = rk4_step(
             delta,
             v,
             psi,
+            psip,
+            beta,
             steer_v,
-            v_cmd,
+            accel,
             mu_s,
+            mass_s,
             lf_s,
             lr_s,
         )
@@ -260,9 +259,13 @@ def step_kernel(
         delta += dd_sub
         v += d.d_v
         psi += d.d_psi
+        psip += d.d_psip
+        beta += d.d_beta
 
     delta = wp.clamp(delta, STEER_MIN, STEER_MAX)
     v = wp.clamp(v, V_MIN, V_MAX)
+    psip = wp.clamp(psip, -PSI_PRIME_MAX, PSI_PRIME_MAX)
+    beta = wp.clamp(beta, -BETA_MAX, BETA_MAX)
 
     # Reward + done
     px = wp.clamp(wp.int32((x - origin[0]) / res), 0, mw - 1)
@@ -279,13 +282,8 @@ def step_kernel(
     elif 2 * d_wp < -n_cl:
         d_wp += n_cl
 
-    # Speed projected on the track DIRECTION (centerline tangent). This is the
-    # safety lever: going fast straight at a wall (psi far from the upcoming
-    # track heading) earns almost nothing, so the policy slows and turns for
-    # corners. Decoupling it to plain `v` made the car floor it into walls and
-    # treat the -10 crash as a cheap respawn — do NOT remove the cos term.
     cth = centerline[new_wp][2]
-    v_along = v * wp.cos(psi - cth)
+    v_along = v * wp.cos(beta + psi - cth)
     progress = (
         wp.float32(d_wp)
         / wp.float32(n_cl)
@@ -293,20 +291,8 @@ def step_kernel(
         * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
     )
 
-    # Dense wall-proximity penalty: active only inside the WALL_MARGIN clearance
-    # band, ramping quadratically (gentle at the edge, steep near the wall) and
-    # scaled by speed so going fast near a wall costs the most. clearance is >= 0
-    # on every non-crash step (clearance < 0 is exactly the `term` condition).
-    clearance = edt_val - CAR_HALF_DIAG
-    prox_f = wp.max((WALL_MARGIN - clearance) / WALL_MARGIN, 0.0)
-    prox_pen = (
-        WALL_PROX_COEF * prox_f * prox_f * (1.0 + wp.max(v, 0.0) / PROGRESS_V_COEF)
-    )
-
-    # On a crash, pay ONLY the terminal penalty — no speed-progress refund — so
-    # flooring a corner into the wall can never net out cheaper than slowing. On
-    # every other step, progress minus the wall-proximity penalty.
-    reward[i] = wp.where(term, -TERM_PENALTY, progress - prox_pen)
+    term_pen = wp.where(term, -TERM_PENALTY, 0.0)
+    reward[i] = progress + term_pen
 
     if term:
         done[i] = DONE_TERMINATED
@@ -325,10 +311,11 @@ def step_kernel(
         psi = rpt[2]
         delta = 0.0
         v = 0.0
-        v_cmd = 0.0
+        psip = 0.0
+        beta = 0.0
         steps = 0
         new_wp = rnd
-        car_dr[i, 0] = MU_DR_LO + (MU_DR_HI - MU_DR_LO) * wp.randf(rng)
+        car_dr[i, 0] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 1] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 2] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 3] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
@@ -367,7 +354,8 @@ def step_kernel(
     cars[i, 2] = delta
     cars[i, 3] = v
     cars[i, 4] = psi
-    cars[i, 5] = v_cmd
+    cars[i, 5] = psip
+    cars[i, 6] = beta
     cars_int[i, 0] = steps
     cars_int[i, 1] = new_wp
 
@@ -401,7 +389,9 @@ class Map:
         kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
         skel = skel.copy()
         while True:
-            counts = convolve(skel.astype(np.uint8), kernel, mode="constant", cval=0)
+            counts = convolve(
+                skel.astype(np.uint8), kernel, mode="constant", cval=0
+            )
             endpoints = skel & (counts <= 1)
             if not endpoints.any():
                 break
@@ -560,10 +550,6 @@ class RacingEnv:
         dr_init = (
             1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((num_envs, 4), dtype=np.float32)
         )
-        # Grip (column 0 -> mu_s) gets its own realistic, wider range.
-        dr_init[:, 0] = MU_DR_LO + (MU_DR_HI - MU_DR_LO) * rng.random(
-            num_envs, dtype=np.float32
-        )
 
         self.cars = wp.array(cars, dtype=float, device=d)
         self.cars_int = wp.array(cars_int, dtype=int, device=d)
@@ -588,20 +574,6 @@ class RacingEnv:
         )
         self._zero_act = wp.zeros(num_envs, dtype=wp.vec2, device=d)
         self._zero_act_torch = wp.to_torch(self._zero_act)
-
-        # Actuation/sensing latency: apply a per-env, episode-randomized delay of
-        # 0..LATENCY_MAX_STEPS control steps to the action the policy commands.
-        self._lat = int(LATENCY_MAX_STEPS)
-        if self._lat > 0:
-            self._act_hist = torch.zeros(
-                (self._lat + 1, num_envs, ACT_DIM),
-                dtype=self.obs_buf.dtype,
-                device=self.obs_buf.device,
-            )
-            self._act_delay = torch.randint(
-                0, self._lat + 1, (num_envs,), device=self.obs_buf.device
-            )
-            self._env_ix = torch.arange(num_envs, device=self.obs_buf.device)
 
         # Per-map warp buffers + cached sliced views into the per-env tensors.
         self.map_buffers = []
@@ -668,7 +640,9 @@ class RacingEnv:
         )
 
     def _launch(self, act_torch):
-        seed_step = (self.seed_base * 2654435761 + self._call * 83492791) & 0x7FFFFFFF
+        seed_step = (
+            self.seed_base * 2654435761 + self._call * 83492791
+        ) & 0x7FFFFFFF
         for i, mb in enumerate(self.map_buffers):
             a, b = mb["env_start"], mb["env_end"]
             act_w = wp.from_torch(act_torch[a:b], dtype=wp.vec2)
@@ -677,7 +651,9 @@ class RacingEnv:
         self._call += 1
 
     def _launch_zero(self):
-        seed_step = (self.seed_base * 2654435761 + self._call * 83492791) & 0x7FFFFFFF
+        seed_step = (
+            self.seed_base * 2654435761 + self._call * 83492791
+        ) & 0x7FFFFFFF
         for i, mb in enumerate(self.map_buffers):
             self._launch_one(mb, mb["zero_act_v"], seed_step ^ ((i + 1) * 982451653))
         wp.synchronize_device(self.cars.device)
@@ -702,30 +678,12 @@ class RacingEnv:
         self._step_counter.zero_()
         self.rew_buf.zero_()
         self.done_buf.zero_()
-        if self._lat > 0:
-            self._act_hist.zero_()
-            self._act_delay = torch.randint(
-                0, self._lat + 1, (self.num_envs,), device=self.obs_buf.device
-            )
         return self.obs_buf, {}
 
     def step(self, action):
         act = action.detach().to(self.obs_buf.device, non_blocking=True).contiguous()
-        if self._lat > 0:
-            self._act_hist = torch.roll(self._act_hist, 1, dims=0)
-            self._act_hist[0] = act
-            act = self._act_hist[self._act_delay, self._env_ix].contiguous()
         self._launch(act)
         self._sanitize()
-        if self._lat > 0:
-            # Re-randomize the delay for envs that just reset and clear their
-            # stale history so a prior episode's commands don't leak across.
-            fresh = self.done_buf != 0
-            if bool(fresh.any()):
-                self._act_delay[fresh] = torch.randint(
-                    0, self._lat + 1, (int(fresh.sum()),), device=self.obs_buf.device
-                )
-                self._act_hist[:, fresh] = 0.0
         return (
             self.obs_buf,
             self.rew_buf,
@@ -754,9 +712,6 @@ class RacingEnv:
         self.obs_buf.copy_(s["obs_buf"])
         self.rew_buf.copy_(s["rew_buf"])
         self.done_buf.copy_(s["done_buf"])
-        if self._lat > 0:
-            # Don't carry an eval rollout's action history back into training.
-            self._act_hist.zero_()
 
 
 # PPO components
@@ -883,8 +838,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
         def w2p(x, y):
             return int((x - m.ox) / m.res), int(m.h - 1 - (y - m.oy) / m.res)
 
-        trail = []  # full-lap driven path (x, y), cleared on crash/respawn
-        trail_accel = []  # commanded accel at each point (<0 = braking)
+        trail = deque(maxlen=300)
         raw, _ = env.reset()
         obs = obs_rms.normalize(raw) if obs_rms else raw
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -894,37 +848,22 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
             with torch.no_grad():
                 for _ in range(num_steps):
                     a = agent.deterministic(obs)
-                    accel = float(a[0, 1])  # policy's throttle/brake command
                     raw, _, term, trunc, _ = env.step(a)
                     obs = obs_rms.normalize(raw) if obs_rms else raw
                     row = env.cars_buf[0].tolist()
                     x, y, psi = row[0], row[1], row[4]
                     if bool(term[0].item()) or bool(trunc[0].item()):
                         trail.clear()
-                        trail_accel.clear()
                     trail.append((x, y))
-                    trail_accel.append(accel)
                     frame = cvtColor(m.raw, COLOR_GRAY2RGB)
-                    # Full raceline coloured by commanded effort: green on the
-                    # throttle (accel >= 0), red braking — in constant-colour runs.
                     if len(trail) > 1:
-                        pts = [w2p(*p) for p in trail]
-                        n = len(pts)
-                        s = 0
-                        while s < n - 1:
-                            braking = trail_accel[s + 1] < 0.0
-                            e = s
-                            while e < n - 1 and (trail_accel[e + 1] < 0.0) == braking:
-                                e += 1
-                            color = (235, 40, 40) if braking else (0, 210, 0)
-                            polylines(
-                                frame,
-                                [np.array(pts[s : e + 1], dtype=np.int32)],
-                                False,
-                                color,
-                                2,
-                            )
-                            s = e
+                        polylines(
+                            frame,
+                            [np.array([w2p(*p) for p in trail], dtype=np.int32)],
+                            False,
+                            (0, 200, 0),
+                            2,
+                        )
                     R = np.array(
                         [[np.cos(psi), -np.sin(psi)], [np.sin(psi), np.cos(psi)]]
                     )
@@ -932,7 +871,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
                     fillPoly(
                         frame,
                         [np.array([w2p(*p) for p in world], dtype=np.int32)],
-                        (40, 130, 255),
+                        (255, 50, 50),
                     )
                     w.append_data(frame)
     finally:
