@@ -69,7 +69,7 @@ class Agent(nn.Module):
     LOGSTD_MAX: float = -0.5
     HALF_LOG_TWO_PI: float = 0.9189385332046727
 
-    def __init__(self, obs_dim: int = OBS_DIM, act_dim: int = ACT_DIM, hidden: int = 512) -> None:
+    def __init__(self, obs_dim: int = OBS_DIM, act_dim: int = ACT_DIM, hidden: int = 256) -> None:
         super().__init__()
         self.actor: nn.Sequential = nn.Sequential(
             layer_init(nn.Linear(obs_dim, hidden)),
@@ -102,33 +102,38 @@ class Agent(nn.Module):
 
     def act_value(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         mean: torch.Tensor = self.actor(obs)
-        # Smooth Sigmoid scaling mapping unconstrained space to [LOGSTD_MIN, LOGSTD_MAX]
         ls = self.LOGSTD_MIN + (self.LOGSTD_MAX - self.LOGSTD_MIN) * torch.sigmoid(self.log_std)
         std: torch.Tensor = ls.exp()
         
-        noise: torch.Tensor = torch.randn_like(mean)
-        action = mean + noise * std
-        action_clamped = torch.clamp(action, -1.0, 1.0)
+        # Sample from standard normal distribution
+        noise = torch.randn_like(mean)
+        raw_action = mean + noise * std
         
-        var: torch.Tensor = std.pow(2)
-        log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - self.HALF_LOG_TWO_PI
-        log_prob = log_prob.sum(-1)
+        # Squash cleanly to [-1, 1] for physics engine safety
+        action_squashed = torch.tanh(raw_action)
         
-        entropy: torch.Tensor = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1).expand_as(log_prob)
+        # Analytical Jacobian Correction for Tanh Squashing
+        log_prob = -((raw_action - mean) ** 2) / (2 * std.pow(2)) - ls - self.HALF_LOG_TWO_PI
+        log_prob = log_prob.sum(-1) - torch.log(1.0 - action_squashed.pow(2) + 1e-6).sum(-1)
         
-        return action, action_clamped, log_prob, entropy, self.critic(obs).squeeze(-1)
+        # Use standard normal entropy as a proxy for exploration tracking
+        entropy = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1)
+        
+        return raw_action, action_squashed, log_prob, entropy, self.critic(obs).squeeze(-1)
 
-    def evaluate(self, obs: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def evaluate(self, obs: torch.Tensor, raw_action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mean: torch.Tensor = self.actor(obs)
-        
-        # FIX: Must use identical Sigmoid scaling here as well!
         ls = self.LOGSTD_MIN + (self.LOGSTD_MAX - self.LOGSTD_MIN) * torch.sigmoid(self.log_std)
-        var: torch.Tensor = ls.exp().pow(2)
+        std: torch.Tensor = ls.exp()
         
-        log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - self.HALF_LOG_TWO_PI
-        entropy: torch.Tensor = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1).expand_as(log_prob[:, 0])
+        action_squashed = torch.tanh(raw_action)
         
-        return log_prob.sum(-1), entropy, self.critic(obs).squeeze(-1)
+        log_prob = -((raw_action - mean) ** 2) / (2 * std.pow(2)) - ls - self.HALF_LOG_TWO_PI
+        log_prob = log_prob.sum(-1) - torch.log(1.0 - action_squashed.pow(2) + 1e-6).sum(-1)
+        
+        entropy = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1)
+        
+        return log_prob, entropy, self.critic(obs).squeeze(-1)
 
     def deterministic(self, obs: torch.Tensor) -> torch.Tensor:
         return torch.clamp(self.actor(obs), -1.0, 1.0)
@@ -244,7 +249,7 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
 def _train_step_compiled(
     agent: Agent,
     b_obs_idx: torch.Tensor,
-    b_act_idx: torch.Tensor, # This will now hold the raw actions
+    b_act_idx: torch.Tensor,
     b_logp_idx: torch.Tensor,
     b_adv_idx: torch.Tensor,
     b_ret_idx: torch.Tensor,
@@ -287,7 +292,7 @@ def compute_gae(
     val_b: torch.Tensor,
     next_val: torch.Tensor,
     term_b: torch.Tensor,
-    done_b: torch.Tensor,
+    done_b: torch.Tensor,  # done_b = (term | trunc)
     gamma: float,
     gae_lambda: float,
     rollouts: int,
@@ -296,12 +301,14 @@ def compute_gae(
     last: torch.Tensor = torch.zeros_like(next_val)
     
     for t in range(rollouts - 1, -1, -1):
-        nonterm: torch.Tensor = 1.0 - term_b[t]
+        # CRITICAL: Treat both crashes AND timeouts as trajectory cutoffs 
+        # to prevent bootstrapping from contaminated in-place reset observations.
         nondone: torch.Tensor = 1.0 - done_b[t]
         
         next_v: torch.Tensor = next_val if t == rollouts - 1 else val_b[t + 1]
         
-        delta: torch.Tensor = rew_b[t] + gamma * next_v * nonterm - val_b[t]
+        # Using nondone here drops the bootstrap cleanly at any reset event
+        delta: torch.Tensor = rew_b[t] + gamma * next_v * nondone - val_b[t]
         last = delta + gamma * gae_lambda * nondone * last
         adv_b[t] = last
         
@@ -312,21 +319,21 @@ def train(
     env: Environment,
     agent: Agent,
     iterations: int = 5000,
-    rollouts: int = 64,         
-    epochs: int = 4,             
-    gamma: float = 0.985,        
+    rollouts: int = 256,
+    epochs: int = 5,
+    gamma: float = 0.99,
     gae_lambda: float = 0.95,
     clip: float = 0.2,
     vf_clip: float = 0.2,
     vf_coef: float = 0.5,
-    ent_coef: float = 0.01,      
+    ent_coef: float = 0.01,
     max_grad_norm: float = 0.5,
-    lr: float = 4.0e-4,
-    target_kl: float = 0.015,    
+    lr: float = 3.0e-4,
+    target_kl: float = 0.010,
     log_dir: Path = Path("./logs"),
-    record_every_iteration: int = 100,
+    record_every_iteration: int = 200,
     record_duration_steps: int = 2000,
-    switch_map_iter: int = 10,
+    switch_map_iter: int = 20,
     use_wandb_train: bool = False
 ) -> Tuple[float, RunningMeanStd, ReturnNormalizer, int]:
     device: torch.device = next(agent.parameters()).device
@@ -447,7 +454,7 @@ def train(
         B: int = rollouts * N
         global_step += B
 
-        TARGET_MINIBATCH_SIZE = 8192
+        TARGET_MINIBATCH_SIZE = 16384 * 4
         calculated_minibatches = max(1, B // TARGET_MINIBATCH_SIZE)
         mb: int = B // calculated_minibatches
 
@@ -462,8 +469,7 @@ def train(
         
         tot_pg, tot_v, tot_ent, tot_kl, tot_clip = 0.0, 0.0, 0.0, 0.0, 0.0
         n_upd: int = 0
-        # Change the minimum from 0.001 to a slightly more protective baseline
-        current_ent_coef = max(0.0025, ent_coef * (1.0 - (it / iterations)))
+        current_ent_coef = max(0.001, ent_coef * (1.0 - (it / iterations)))
         permutation_indices = torch.arange(B, device=device)
 
         for epoch in range(current_epochs):  
@@ -581,5 +587,10 @@ def train(
         
         if switch_map_iter > 0 and (it + 1) % switch_map_iter == 0:
             env.cycle_next_map(randomize=True)
+            
+            #Re-synchronize state representation with the new layout allocation
+            raw = env.obs_buf
+            obs_rms.update(raw[..., 3:])
+            obs = process_observations(raw, obs_rms)
             
     return time.time() - t0, obs_rms, ret_rms, global_step

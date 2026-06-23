@@ -5,9 +5,7 @@ import numpy as np
 # =========================================================================
 WIDTH = 0.33                         # [m] Widened footprint for Fiesta rally shell
 LENGTH = 0.58                        # [m] Bumper-to-bumper chassis length
-# REDUCED: Dropped from 1.07 to 1.02. Trust the 60Hz RK4 solver; a 2% margin prevents 
-# clipping without making the agent claustrophobic in narrow chicanes.
-CAR_HALF_DIAG = float(np.hypot(WIDTH / 2.0, LENGTH / 2.0)) * 1.02 
+CAR_HALF_DIAG = float(np.hypot(WIDTH / 2.0, LENGTH / 2.0)) * 1.10 # Expand chasis by 10%
 
 LF = 0.135                           # [m] Distance from COG to front axle
 LR = 0.155                           # [m] Distance from COG to rear axle
@@ -43,15 +41,15 @@ DT_SUB_SIX = DT_SUB / 6.0            # [s] Cache constant for solver
 # =========================================================================
 # 4. Reward Shaping & Normalization Weights (Generalization Tuned)
 # =========================================================================
-PROGRESS_SCALE = 1.0                 # INCREASING: Prioritize raw downward track progression
-PROGRESS_V_COEF = 0.25                # INCREASING: Reward velocity aligned with the path horizon
-BACKWARDS_PROGRESS_PENALTY_MUL = 100.0 # INCREASING: Explicitly kill wrong-way wiggling immediately
-TERM_PENALTY = -1000.0                # INCREASING: Give crashing a sharper, distinct penalty drop
+PROGRESS_SCALE = 0.8                 # INCREASING: Prioritize raw downward track progression
+PROGRESS_V_COEF = 0.2                # INCREASING: Reward velocity aligned with the path horizon
+BACKWARDS_PROGRESS_PENALTY_MUL = 50.0 # INCREASING: Explicitly kill wrong-way wiggling immediately
+TERM_PENALTY = -50.0                # INCREASING: Give crashing a sharper, distinct penalty drop
 
 IDLE_PENALTY = -0.5                  # INCREASING: Make loitering or oscillation hurt more
 # RESTORING: Bring this back to a modest value. This forces the agent to keep 
 # moving cleanly along the track vector rather than parking on the apex.
-LATERAL_PENALTY = -0.05
+LATERAL_PENALTY = -0.01
 
 MAX_CENTERLINE_DEV = 2.5             # [m] Track boundary containment zone
 STALL_VELOCITY = 0.5

@@ -192,7 +192,7 @@ class Visuals:
     def _render_all_agents(self) -> None:
         """Handles structural allocation, color distribution, and updates for massive parallel agent swarms."""
         # Adjust this divider to control rendering density (e.g., 100 renders 1% of total agents)
-        agent_count_divider = 256
+        agent_count_divider = 16
         
         # OPTIMIZATION 1: Single GPU-to-CPU transfer & immediate array slicing.
         # This grabs only the subset of cars we actually intend to render.

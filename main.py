@@ -35,14 +35,14 @@ from include.environment import Environment
 
 def main(
     maps_dir_str: str = typer.Option("maps/", help="Path to maps file or directory"),
-    num_envs: int = 1024,
+    num_envs: int = 16384,
     seed: int = 0,
     interactive: bool = False,
     live_viewer: bool = False,
     iterations: int = 5000,
     record_every_iteration: int = 100,
     record_duration_steps: int = 2000,
-    switch_map_iter: int = 100,  # Training step interval between layout rotations (0 to disable)
+    switch_map_iter: int = 20,  # Training step interval between layout rotations (0 to disable)
     device: Optional[str] = None,
     use_wandb: bool = False,
     log_dir_str: str = typer.Option("./logs", help="Target output logging directory"),
