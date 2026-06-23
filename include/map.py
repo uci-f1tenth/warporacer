@@ -2,8 +2,9 @@ import heapq
 from collections import deque
 from pathlib import Path
 
-import numpy as np
 import cv2
+import numpy as np
+import warp as wp
 from cv2 import IMREAD_GRAYSCALE, imread
 from scipy.ndimage import distance_transform_edt
 from scipy.signal import savgol_filter
@@ -17,7 +18,7 @@ from include.constants import *
 class Map:
     """
     Multiton Map class handling map loading, binarization, boundary detection, 
-    centerline extraction, and lookup table generation.
+    centerline extraction, lookup table generation, and hardware-accelerated mesh building.
     """
     
     # Class-level cache dictionary to prevent redundant processing of identical maps
@@ -67,7 +68,8 @@ class Map:
 
         # 5. Execute processing pipeline
         self._calculate_wall_bounds()
-        self._extract_wall_segments()
+        # self._extract_wall_segments() # Vector map data in warp is slower than grid data (O(N) vs O(1) lookup)
+        # self._build_wall_mesh() # Vector map data in warp is slower than grid data (O(N) vs O(1) lookup)
         self._compute_centerline()
         self._build_lut()
 
@@ -129,6 +131,40 @@ class Map:
             self.wall_segments = np.empty((0, 4), dtype=np.float32)
             
         print(f" -> Extracted {len(self.wall_segments)} wall segments for {self.path_name}")
+
+    def _build_wall_mesh(self):
+        """Converts 2D wall segments into a 3D Warp Mesh for BVH acceleration and saves to instance."""
+        vertices = []
+        indices = []
+        
+        # Height of the walls
+        z_bottom = -1.0
+        z_top = 1.0
+        
+        for i, seg in enumerate(self.wall_segments):
+            x1, y1, x2, y2 = seg
+            
+            # 4 vertices of the quad (fence)
+            v_idx = len(vertices)
+            vertices.extend([
+                [x1, y1, z_bottom],
+                [x2, y2, z_bottom],
+                [x2, y2, z_top],
+                [x1, y1, z_top]
+            ])
+            
+            # 2 triangles per segment
+            indices.extend([
+                v_idx, v_idx + 1, v_idx + 2,  # Triangle 1
+                v_idx, v_idx + 2, v_idx + 3   # Triangle 2
+            ])
+            
+        # Send to GPU, build the BVH, and bind to the map instance
+        self.track_mesh = wp.Mesh(
+            points=wp.array(vertices, dtype=wp.vec3),
+            indices=wp.array(indices, dtype=wp.int32)
+        )
+        print(f" -> Built BVH track mesh with {len(indices)//3} triangles.")
 
     def _compute_centerline(self):
         """Extracts optimal circuit centerline using graph adjacency and dynamic cost lookups."""
