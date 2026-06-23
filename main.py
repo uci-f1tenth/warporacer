@@ -1,18 +1,17 @@
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 # --- Cross-OS Isolated Compilation Cache Config ---
 os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
 os.environ["TORCH_COMPILE_DEBUG"] = "0"
 
-# Dynamically route the cache path so Windows and Linux allocations never collide
 base_cache_dir = Path("./.torch_compile_cache").resolve()
 os_suffix = "windows" if sys.platform == "win32" else "linux"
 isolated_cache_path = base_cache_dir / os_suffix
-
 isolated_cache_path.mkdir(parents=True, exist_ok=True)
+
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(isolated_cache_path)
 # --------------------------------------------------
 
@@ -23,65 +22,25 @@ import wandb
 import warp as wp
 
 from include.agent import Agent, record_rollout, train
-from include.constants import *
+from include.constants import ACT_DIM, OBS_DIM
 from include.environment import Environment
 
-# ---------------------------------------------------------------------------------
-# Hardware Troubleshooting Note:
-# If you encounter the following error across dual-GPU environments (iGPU & eGPU setups):
-#   "Warp UserWarning: Could not register GL buffer since CUDA/OpenGL interoperability is not available.
-#    Falling back to copy operations between the Warp array and the OpenGL buffer."
-# ---------------------------------------------------------------------------------
 
-def main(
-    maps_dir_str: str = typer.Option("maps/", help="Path to maps file or directory"),
-    num_envs: int = 16384,
-    seed: int = 0,
-    interactive: bool = False,
-    live_viewer: bool = False,
-    iterations: int = 5000,
-    record_every_iteration: int = 100,
-    record_duration_steps: int = 2000,
-    switch_map_iter: int = 20,  # Training step interval between layout rotations (0 to disable)
-    device: Optional[str] = None,
-    use_wandb: bool = False,
-    log_dir_str: str = typer.Option("./logs", help="Target output logging directory"),
-):
-    """
-    Main entry point for handling parallelized reinforcement learning or interactive car runs.
-    Manages global random seed distribution, CUDA/TensorFloat32 compilation pathways, 
-    and bootstraps physical map setups before handing control off to execution streams.
-    """
-    maps_dir = Path(maps_dir_str).resolve()
-    log_dir = Path(log_dir_str).resolve()
-    
-    # Force localized parameter overrides whenever direct manual driving is requested
-    if interactive:
-        num_envs = 1
-        live_viewer = True
-
-    # Fall back to native NVIDIA Warp global runtime selection configurations if unspecified
-    if not device:
-        target_device = wp.get_device()
-    else:
-        target_device = wp.get_device(device)
-
-    # Safely assert log target presence ahead of downstream validation check blocks
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    # Distribute tracking values across separate execution frameworks to ensure run reproducibility
+def _configure_hardware_performance(seed: int, target_device: wp.Device) -> str:
+    """Configures multi-framework seeds, device paths, and Ampere+ tensor optimizations."""
     np.random.seed(seed)
     torch.manual_seed(seed)
     
-    # Fast compilation and execution optimizations for modern Ampere+ GPU architectures
     torch.backends.cudnn.benchmark = True
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    # Map Mode Selection & Validation Pipelines
-    # -----------------------------------------------------------------------------
-    # The 3D tensor environment always requires a directory path to aggregate layout buffers
+    return f"cuda:{target_device.ordinal}" if target_device.is_cuda else "cpu"
+
+
+def _validate_and_load_maps(maps_dir: Path, switch_map_iter: int) -> List[Path]:
+    """Validates the directory structural integrity and verifies available map configurations."""
     if not maps_dir.is_dir():
         raise NotADirectoryError(
             f"[Error] maps_dir must be a valid directory containing layout assets: {maps_dir}"
@@ -92,86 +51,117 @@ def main(
         raise FileNotFoundError(f"[Error] No .yaml map files found in directory: {maps_dir}")
 
     if switch_map_iter == 0:
-        # Single-map mode simply locks all parallel environments to the first loaded map index
-        print(f"[Mode] Single Map Mode. Running exclusively on baseline layout: {available_maps[0].name}")
+        print(f"[Mode] Single Map Mode. Locking baseline layout: {available_maps[0].name}")
     else:
-        print(f"[Mode] Multi-Map Mode. Batched {len(available_maps)} layouts concurrently from: {maps_dir.name}")
+        print(f"[Mode] Multi-Map Mode. Batched {len(available_maps)} layouts concurrently.")
+        
+    return available_maps
 
-    # Bind the contextual physical compute resource block
+
+def _initialize_wandb(use_wandb: bool, seed: int, num_envs: int, iterations: int, switch_map_iter: int, maps_dir: Path) -> bool:
+    """Safely triggers a Weights & Biases telemetry tracking session."""
+    if not use_wandb:
+        return False
+    try:
+        wandb.init(
+            project="warporacer",
+            name=f"seed{seed}_n{num_envs}",
+            config={
+                "num_envs": num_envs,
+                "iterations": iterations,
+                "seed": seed,
+                "maps_directory": str(maps_dir),
+                "switch_map_iter": switch_map_iter,
+            },
+        )
+        return True
+    except Exception as e:
+        print(f"[WandB] Initialization failed, falling back to local logs: {e}")
+        return False
+
+
+def _save_agent_checkpoint(agent: torch.nn.Module, obs_rms: any, log_dir: Path) -> None:
+    """Persists policy network weights and running normalization statistics safely to disk."""
+    clean_state_dict = getattr(agent, "_orig_mod", agent).state_dict()
+    checkpoint_data = {
+        "agent": clean_state_dict,
+        "obs_mean": obs_rms.mean.cpu(),
+        "obs_var": obs_rms.var.cpu(),
+        "obs_count": obs_rms.count,
+    }
+    torch.save(checkpoint_data, log_dir / "agent_final.pt")
+    print("[Saved!] State file weights dumped successfully.")
+
+
+def main(
+    maps_dir_str: str = typer.Option("maps/", help="Path to maps file or directory"),
+    num_envs: int = 16384,
+    seed: int = 0,
+    interactive: bool = False,
+    live_viewer: bool = False,
+    iterations: int = 5000,
+    record_every_iteration: int = 100,
+    record_duration_steps: int = 2000,
+    switch_map_iter: int = 20,
+    device: Optional[str] = None,
+    use_wandb: bool = False,
+    log_dir_str: str = typer.Option("./logs", help="Target output logging directory"),
+) -> None:
+    """Main orchestrator handling parallel reinforcement learning or interactive car runs."""
+    maps_dir = Path(maps_dir_str).resolve()
+    log_dir = Path(log_dir_str).resolve()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    if interactive:
+        num_envs = 1
+        live_viewer = True
+
+    target_device = wp.get_device(device) if device else wp.get_device()
+    torch_device_str = _configure_hardware_performance(seed, target_device)
+    _validate_and_load_maps(maps_dir, switch_map_iter)
+
     with wp.ScopedDevice(target_device):
         env = Environment(maps_dir, num_envs, seed, target_device, live_viewer)
 
+        # Execution Stream A: Manual driving viewport loop
         if interactive:
             if env.vs is not None:
                 env.vs.interactive_render_loop()
             else:
                 print("[Error] Live viewer initialization failed. Interactive loop unavailable.")
-        else:
-            # Instantiate Weights & Biases (WandB) logger sessions
-            if use_wandb:
-                try:
-                    wandb.init(
-                        project="warporacer",
-                        name=f"seed{seed}_n{num_envs}",
-                        config={
-                            "num_envs": num_envs,
-                            "iterations": iterations,
-                            "seed": seed,
-                            "maps_directory": str(maps_dir),
-                            "switch_map_iter": switch_map_iter,
-                        },
-                    )
-                except Exception as e:
-                    print(f"[WandB] Init failed: {e}")
-                    use_wandb = False  
-                    
-            # Safe cross-OS device mapping using Warp's native naming properties
-            torch_device_str = f"cuda:{target_device.ordinal}" if target_device.is_cuda else "cpu"
-            raw_agent = Agent(obs_dim=OBS_DIM, critic_obs_dim=(OBS_DIM+5), act_dim=ACT_DIM).to(torch_device_str)
-            
-            # 2. OPTIMIZATION: Wrap with reduce-overhead to align optimization speeds with your RTX 2070
-            agent = torch.compile(raw_agent, mode="reduce-overhead")
-            
-            # Explicitly pass multi-map tracking arguments down to the trainer pipeline
-            elapsed, obs_rms, ret_rms, step = train(
-                env,
-                agent,
-                iterations=iterations,
-                log_dir=log_dir,
-                record_every_iteration=record_every_iteration,
-                record_duration_steps=record_duration_steps,
-                switch_map_iter=switch_map_iter,
-                use_wandb_train=use_wandb
-            )
+            return
 
-            print(f"[Done!] Optimization path complete in {elapsed:.1f}s")
+        # Execution Stream B: Highly parallelized RL training
+        use_wandb = _initialize_wandb(use_wandb, seed, num_envs, iterations, switch_map_iter, maps_dir)
+        
+        raw_agent = Agent(obs_dim=OBS_DIM, critic_obs_dim=(OBS_DIM + 5), act_dim=ACT_DIM).to(torch_device_str)
+        agent = torch.compile(raw_agent, mode="reduce-overhead")
+        
+        elapsed, obs_rms, _, step = train(
+            env,
+            agent,
+            iterations=iterations,
+            log_dir=log_dir,
+            record_every_iteration=record_every_iteration,
+            record_duration_steps=record_duration_steps,
+            switch_map_iter=switch_map_iter,
+            use_wandb_train=use_wandb
+        )
+        print(f"[Done!] Optimization path complete in {elapsed:.1f}s")
 
-            # Extract clean state_dict without compiler prefix noise (_orig_mod.)
-            clean_state_dict = getattr(agent, "_orig_mod", agent).state_dict()
+        _save_agent_checkpoint(agent, obs_rms, log_dir)
 
-            # Persist policy network configurations and running observation statistics
-            torch.save(
-                {
-                    "agent": clean_state_dict,
-                    "obs_mean": obs_rms.mean.cpu(),
-                    "obs_var": obs_rms.var.cpu(),
-                    "obs_count": obs_rms.count,
-                },
-                log_dir / "agent_final.pt",
-            )
-            print(f"[Saved!] State file weights dumped successfully.")
+        # Final tracking validation rollout run video processing
+        out_video_path = log_dir / "rollout_final.mp4"
+        record_rollout(env, agent, record_duration_steps, out_video_path, obs_rms=obs_rms)
 
-            # Record a standalone baseline test tracking validation run video
-            out = log_dir / "rollout_final.mp4"
-            record_rollout(env, agent, record_duration_steps, out, obs_rms=obs_rms)
+        if use_wandb:
+            try:
+                wandb.log({"rollout_final": wandb.Video(str(out_video_path), format="mp4")}, step=step)
+                wandb.finish()
+            except Exception as e:
+                print(f"[WandB] Video payload upload or session finalization failed: {e}")
 
-            # Export validation video telemetry channels back up to active logging dashboards
-            if use_wandb:
-                try:
-                    wandb.log({"rollout_final": wandb.Video(str(out), format="mp4")}, step=step)
-                    wandb.finish() 
-                except Exception as e:
-                    print(f"[WandB] Final log cleanup or video upload failed: {e}")
 
 if __name__ == "__main__":
     typer.run(main)
