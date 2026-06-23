@@ -1,42 +1,65 @@
-import heapq
-from collections import deque
-from pathlib import Path
+"""Track map library class managing image parsing, skeletons, and coordinate lookups."""
 
-import cv2
-import numpy as np
-import warp as wp
+from collections import deque
+import heapq
+from pathlib import Path
+from typing import Any, ClassVar, Dict, Tuple
+
 from cv2 import IMREAD_GRAYSCALE, imread
+import numpy as np
 from scipy.ndimage import distance_transform_edt
 from scipy.signal import savgol_filter
 from scipy.spatial import KDTree
 from skimage.morphology import skeletonize
 from yaml import safe_load
 
-from include.constants import *
+from include.constants import ADJ, OCC_THRESH, SMOOTH_WINDOW
 
 
 class Map:
-    """
-    Multiton Map class handling map loading, binarization, boundary detection, 
-    centerline extraction, lookup table generation, and hardware-accelerated mesh building.
-    """
-    
-    # Class-level cache dictionary to prevent redundant processing of identical maps
-    _cache = {}
+    """Multiton Map class handling map loading, binarization, and skeleton geometry."""
 
-    def __new__(cls, path: Path):
-        """Intercepts instance creation to implement the Multiton/Flyweight caching pattern."""
+    _cache: ClassVar[Dict[Path, "Map"]] = {}
+    _initialized: bool
+
+    path_name: str
+    meta: Dict[str, Any]
+    img_path: Path
+    raw: np.ndarray
+    free: np.ndarray
+    dt: np.ndarray
+    lut: np.ndarray
+
+    ox: float
+    oy: float
+    h: int
+    w: int
+    res: float
+    shape: Tuple[int, int]
+
+    wall_width: float
+    wall_length: float
+    center_x: float
+    center_y: float
+    max_extent: float
+
+    centerline: np.ndarray
+    angles: np.ndarray
+    look_step: int
+
+    def __new__(cls, path: Path) -> "Map":
+        """Intercepts instance creation to implement Flyweight/Multiton mapping cache."""
         abs_path = path.resolve()
-        
+
         if abs_path not in cls._cache:
             instance = super().__new__(cls)
             instance._initialized = False
             cls._cache[abs_path] = instance
-            
+
         return cls._cache[abs_path]
 
-    def __init__(self, path: Path):
-        """Initializes the map logic. Bypasses heavy lifting if pulled from cache."""
+    def __init__(self, path: Path) -> None:
+        """Initializes structural map matrices from cached configuration lines."""
         if getattr(self, "_initialized", False):
             return
 
@@ -47,17 +70,18 @@ class Map:
         self.meta = safe_load(path.read_text())
         self.img_path = path.parent / self.meta["image"]
 
-        self.raw = imread(str(self.img_path), IMREAD_GRAYSCALE)
-        if self.raw is None:
+        raw_img = imread(str(self.img_path), IMREAD_GRAYSCALE)
+        if raw_img is None:
             raise FileNotFoundError(f"Could not load image at {self.img_path}")
-        
-        # 2. Programmatically seal the image border with black pixels (0)
-        self.raw[0, :] = 0    
-        self.raw[-1, :] = 0   
-        self.raw[:, 0] = 0    
-        self.raw[:, -1] = 0   
-        
-        # 3. Create boolean map of drivable space and calculate distances to nearest walls
+        self.raw = raw_img
+
+        # 2. Programmatically seal image boundaries to enforce safety borders
+        self.raw[0, :] = 0
+        self.raw[-1, :] = 0
+        self.raw[:, 0] = 0
+        self.raw[:, -1] = 0
+
+        # 3. Create boolean map of drivable space and calculate wall clearances
         self.free = self.raw >= OCC_THRESH
         self.dt = distance_transform_edt(self.free)
 
@@ -65,23 +89,19 @@ class Map:
         self.ox, self.oy, _ = self.meta["origin"]
         self.h, self.w = self.raw.shape
         self.res = float(self.meta["resolution"])
-        
-        # Expose shape footprint explicitly for Environment validation checks
         self.shape = (self.h, self.w)
 
         # 5. Execute processing pipeline
         self._calculate_wall_bounds()
-        # self._extract_wall_segments() # Vector map data in warp is slower than grid data (O(N) vs O(1) lookup)
-        # self._build_wall_mesh() # Vector map data in warp is slower than grid data (O(N) vs O(1) lookup)
         self._compute_centerline()
         self._build_lut()
 
         self._initialized = True
 
-    def _calculate_wall_bounds(self):
-        """Calculates physical dimensions of the track and mathematical centers the world origin."""
+    def _calculate_wall_bounds(self) -> None:
+        """Calculates physical dimensions of the track and balances world spaces."""
         track_pts = np.argwhere(self.free)
-        
+
         if len(track_pts) == 0:
             min_r, min_c, max_r, max_c = 0, 0, self.h - 1, self.w - 1
         else:
@@ -98,110 +118,53 @@ class Map:
         orig_center_x = self.ox + center_c * self.res
         orig_center_y = self.oy + (self.h - 1 - center_r) * self.res
 
-        # Shift the raw origin so the track's mathematical center perfectly hits (0, 0)
+        # Shift raw origins so that track center lands perfectly on (0, 0)
         self.ox -= orig_center_x
         self.oy -= orig_center_y
 
         self.center_x = 0.0
         self.center_y = 0.0
-        self.max_extent = float(max(self.wall_width, self.wall_length)) + 2.0
 
-    def _extract_wall_segments(self):
-        """Extracts drivable boundaries as 2D vector line segments via fully vectorized mapping."""
-        free_img = self.free.astype(np.uint8) * 255
-        contours, _ = cv2.findContours(free_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-
-        segments = []
-        for contour in contours:
-            approx = cv2.approxPolyDP(contour, epsilon=1.0, closed=True)
-            pts = approx.reshape(-1, 2) 
-            
-            if len(pts) < 3:
-                continue  
-                
-            # Vectorized coordinate mapping transformations
-            world_pts = np.empty(pts.shape, dtype=np.float32)
-            world_pts[:, 0] = self.ox + pts[:, 0] * self.res
-            world_pts[:, 1] = self.oy + (self.h - 1 - pts[:, 1]) * self.res
-            
-            # Vectorized continuous loop connection
-            next_pts = np.roll(world_pts, -1, axis=0)
-            segments.append(np.hstack([world_pts, next_pts]))
-                
-        if segments:
-            self.wall_segments = np.vstack(segments).astype(np.float32)
-        else:
-            self.wall_segments = np.empty((0, 4), dtype=np.float32)
-            
-        print(f" -> Extracted {len(self.wall_segments)} wall segments for {self.path_name}")
-
-    def _build_wall_mesh(self):
-        """Converts 2D wall segments into a 3D Warp Mesh for BVH acceleration and saves to instance."""
-        vertices = []
-        indices = []
-        
-        # Height of the walls
-        z_bottom = -1.0
-        z_top = 1.0
-        
-        for i, seg in enumerate(self.wall_segments):
-            x1, y1, x2, y2 = seg
-            
-            # 4 vertices of the quad (fence)
-            v_idx = len(vertices)
-            vertices.extend([
-                [x1, y1, z_bottom],
-                [x2, y2, z_bottom],
-                [x2, y2, z_top],
-                [x1, y1, z_top]
-            ])
-            
-            # 2 triangles per segment
-            indices.extend([
-                v_idx, v_idx + 1, v_idx + 2,  # Triangle 1
-                v_idx, v_idx + 2, v_idx + 3   # Triangle 2
-            ])
-            
-        # Send to GPU, build the BVH, and bind to the map instance
-        self.track_mesh = wp.Mesh(
-            points=wp.array(vertices, dtype=wp.vec3),
-            indices=wp.array(indices, dtype=wp.int32)
+        extent_padding = 2.0
+        self.max_extent = (
+            float(max(self.wall_width, self.wall_length)) + extent_padding
         )
-        print(f" -> Built BVH track mesh with {len(indices)//3} triangles.")
 
-    def _compute_centerline(self):
-        """Extracts optimal circuit centerline using graph adjacency and dynamic cost lookups."""
+    def _compute_centerline(self) -> None:
+        """Extracts continuous optimal circuit centerlines using graph heuristics."""
         skel = skeletonize(self.free)
         pts = np.argwhere(skel)
-        
+
         if len(pts) == 0:
-            raise RuntimeError(f"[Map Error] Skeleton is empty on {self.img_path.name}.")
+            raise RuntimeError(f"Skeleton empty on {self.img_path.name}.")
 
         node_to_px = {i: tuple(pt) for i, pt in enumerate(pts)}
         px_to_node = {tuple(pt): i for i, pt in enumerate(pts)}
-        
-        # High-performance cache map for wall clearances per node
         node_clearance = {i: float(self.dt[node_to_px[i]]) for i in node_to_px}
 
-        # Build graph adjacencies using structural dictionaries to pre-store edge weights
-        adj = {i: {} for i in node_to_px}
+        # Build graph adjacencies using structural dictionary maps
+        adj: Dict[int, Dict[int, float]] = {i: {} for i in node_to_px}
+        diagonal_weight = 1.41421356
+
         for i, (r, c) in node_to_px.items():
             for dr, dc in ADJ:
                 nr, nc = r + dr, c + dc
                 if (nr, nc) in px_to_node:
-                    # Diagonal edges are sqrt(2), straight edges are 1.0
-                    adj[i][px_to_node[(nr, nc)]] = 1.41421356 if dr != 0 and dc != 0 else 1.0
+                    is_diag = dr != 0 and dc != 0
+                    adj[i][px_to_node[(nr, nc)]] = (
+                        diagonal_weight if is_diag else 1.0
+                    )
 
-        # Heal disjointed skeleton segments
+        # Heal disjointed structural skeleton components
         kdtree = KDTree(pts)
-        max_gap_pixels = 12.0  
+        max_gap_pixels = 12.0
         endpoints = [i for i, neighbors in adj.items() if len(neighbors) <= 1]
-        
+
         for u in endpoints:
             u_px = node_to_px[u]
             indices = kdtree.query_ball_point(u_px, r=max_gap_pixels)
             for v in indices:
-                if v == u or v in adj[u]: 
+                if v == u or v in adj[u]:
                     continue
                 v_px = node_to_px[v]
                 dist = float(np.hypot(u_px[0] - v_px[0], u_px[1] - v_px[1]))
@@ -209,7 +172,7 @@ class Map:
                     adj[u][v] = dist
                     adj[v][u] = dist
 
-        # Prune dead-end branches
+        # Prune dead-end leaf branch arrays
         degrees = {i: len(neighbors) for i, neighbors in adj.items()}
         q = deque([i for i, d in degrees.items() if d == 1])
 
@@ -219,22 +182,22 @@ class Map:
                 if u in adj[v]:
                     del adj[v][u]
                     degrees[v] -= 1
-                    if degrees[v] == 1: 
+                    if degrees[v] == 1:
                         q.append(v)
             adj[u].clear()
             degrees[u] = 0
 
         valid_nodes = set(i for i, d in degrees.items() if d >= 2)
         if not valid_nodes:
-            raise RuntimeError(f"[Map Error] No closed loops found on {self.img_path.name}.")
+            raise RuntimeError(f"No closed loops found on {self.img_path.name}.")
 
-        # Extract largest connected component
+        # Extract largest connected topological circuit cluster
         visited = set()
         components = []
         for node in valid_nodes:
             if node not in visited:
                 comp = []
-                cq = deque([node])
+                cq: deque[int] = deque([node])
                 visited.add(node)
                 while cq:
                     curr = cq.popleft()
@@ -247,53 +210,66 @@ class Map:
 
         main_component = set(max(components, key=len))
         start_node = max(main_component, key=lambda n: node_clearance[n])
-        min_clearance_px = max(2.0, 0.15 / self.res)
 
-        def dijkstra_soft(src, target=None, penalty_nodes=None):
-            """Internal pathfinder leveraging precalculated primitive edge distances."""
+        physical_clearance_limit = 0.15
+        min_clearance_px = max(2.0, physical_clearance_limit / self.res)
+
+        def dijkstra_soft(
+            src: int,
+            target: int = None,
+            penalty_nodes: set = None,
+        ) -> Tuple[Dict[int, float], Dict[int, Any]]:
+            """Finds minimal clearance paths using soft wall penalties."""
             if penalty_nodes is None:
                 penalty_nodes = set()
-                
+
             pq = [(0.0, src)]
             costs = {src: 0.0}
             parent = {src: None}
-            
+
+            penalty_scale = 8.0
+            collision_penalty = 5000.0
+
             while pq:
                 curr_cost, u = heapq.heappop(pq)
-                if target is not None and u == target: 
+                if target is not None and u == target:
                     break
-                if curr_cost > costs.get(u, float('inf')): 
+                if curr_cost > costs.get(u, float("inf")):
                     continue
-                
+
                 for v, edge_dist in adj[u].items():
-                    if v not in main_component: 
+                    if v not in main_component:
                         continue
-                    
+
                     clearance = node_clearance[v]
-                    if clearance < min_clearance_px: 
+                    if clearance < min_clearance_px:
                         continue
-                    
-                    weight = edge_dist + (8.0 / (clearance + 1e-3))
-                    if v in penalty_nodes: 
-                        weight += 5000.0
-                    
+
+                    weight = edge_dist + (penalty_scale / (clearance + 1e-3))
+                    if v in penalty_nodes:
+                        weight += collision_penalty
+
                     new_cost = curr_cost + weight
-                    if new_cost < costs.get(v, float('inf')):
+                    if new_cost < costs.get(v, float("inf")):
                         costs[v] = new_cost
                         parent[v] = u
                         heapq.heappush(pq, (new_cost, v))
+
             return costs, parent
 
-        # Route to furthest point on map
+        # Route to the furthest available spatial component point
         forward_costs, _ = dijkstra_soft(start_node)
-        far_nodes = sorted([n for n in forward_costs if n in main_component], 
-                           key=lambda n: forward_costs[n], reverse=True)
-        
-        if not far_nodes: 
-            raise RuntimeError("[Map Error] Routing disconnected.")
+        far_nodes = sorted(
+            [n for n in forward_costs if n in main_component],
+            key=lambda n: forward_costs[n],
+            reverse=True,
+        )
+
+        if not far_nodes:
+            raise RuntimeError("Routing disconnected during exploration.")
         target_node = far_nodes[0]
 
-        # Extract Outbound Path
+        # Extract forward path trace
         _, p1_tree = dijkstra_soft(start_node, target_node)
         path1, curr = [], target_node
         while curr is not None:
@@ -301,30 +277,33 @@ class Map:
             curr = p1_tree[curr]
         path1.reverse()
 
-        # Extract Inbound Path
+        # Extract inbound path trace around obstacles
         internal_nodes = set(path1[1:-1])
-        _, p2_tree = dijkstra_soft(target_node, start_node, penalty_nodes=internal_nodes)
-        
+        _, p2_tree = dijkstra_soft(
+            target_node, start_node, penalty_nodes=internal_nodes
+        )
+
         path2, curr = [], start_node
         while curr is not None:
             path2.append(curr)
             curr = p2_tree[curr]
         path2.reverse()
-        
+
         best_circuit = path1 + path2[1:-1]
 
-        # Fast O(N) dead-end pruner
+        # Fast O(N) detour loop removal check
         simplified_circuit = []
-        node_indices = {}  
-        max_detour_len = len(best_circuit) * 0.25 
+        node_indices = {}
+        max_detour_ratio = 0.25
+        max_detour_len = len(best_circuit) * max_detour_ratio
 
         for node in best_circuit:
             if node in node_indices:
                 idx = node_indices[node]
                 if len(simplified_circuit) - idx < max_detour_len:
-                    for popped_node in simplified_circuit[idx + 1:]:
+                    for popped_node in simplified_circuit[idx + 1 :]:
                         del node_indices[popped_node]
-                    simplified_circuit = simplified_circuit[:idx + 1]
+                    simplified_circuit = simplified_circuit[: idx + 1]
                 else:
                     simplified_circuit.append(node)
                     node_indices[node] = len(simplified_circuit) - 1
@@ -334,9 +313,11 @@ class Map:
 
         best_circuit = simplified_circuit
 
-        # Convert back to physical world coordinates and orient sequence
+        # Map pixel coordinates directly back into world coordinate vectors
         best_path_px = np.array([node_to_px[n] for n in best_circuit])
-        origin_px = np.array([self.h - 1 + self.oy / self.res, -self.ox / self.res])
+        origin_px = np.array(
+            [self.h - 1 + self.oy / self.res, -self.ox / self.res]
+        )
         start_idx = np.argmin(((best_path_px - origin_px) ** 2).sum(axis=1))
         best_path_rolled = np.roll(best_path_px, -start_idx, axis=0)
 
@@ -347,29 +328,31 @@ class Map:
             ]
         )
 
-        # Smooth raw geometry
-        self.centerline = savgol_filter(world, SMOOTH_WINDOW, 3, axis=0, mode="wrap")
-        
-        # Precompute yaw angles
+        # Apply digital filter to smooth centerline path geometry variations
+        poly_order = 3
+        self.centerline = savgol_filter(
+            world, SMOOTH_WINDOW, poly_order, axis=0, mode="wrap"
+        )
+
+        # Precompute sequential track heading tracking yaw lines
         diffs = np.diff(self.centerline, axis=0, append=self.centerline[:1])
         self.angles = np.arctan2(diffs[:, 1], diffs[:, 0])
-        
-        # Calculate dynamic index lookahead based on average pixel spacing
-        avg_sp = float(np.linalg.norm(diffs, axis=1).mean())
-        self.look_step = max(1, int(round(1.0 / avg_sp)))
 
-    def _build_lut(self):
-        """Generates a spatial lookup table to query nearest centerline index instantly."""
+        # Adapt index increments utilizing pixel density metrics
+        avg_spacing = float(np.linalg.norm(diffs, axis=1).mean())
+        self.look_step = max(1, int(round(1.0 / avg_spacing)))
+
+    def _build_lut(self) -> None:
+        """Generates coordinate grids to sample closest index parameters."""
         cl_px = np.column_stack(
             [
                 self.h - 1 - (self.centerline[:, 1] - self.oy) / self.res,
                 (self.centerline[:, 0] - self.ox) / self.res,
             ]
         )
-        
+
         tree = KDTree(cl_px)
-        
-        # Memory optimized coordinate stacking without full grid array duplication
         query_points = np.indices((self.h, self.w)).reshape(2, -1).T
-        
-        self.lut = tree.query(query_points, workers=-1)[1].reshape(self.h, self.w)
+
+        nearest_indices = tree.query(query_points, workers=-1)[1]
+        self.lut = nearest_indices.reshape(self.h, self.w)

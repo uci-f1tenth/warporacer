@@ -1,7 +1,7 @@
 from collections import deque
 from pathlib import Path
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from cv2 import COLOR_GRAY2RGB, cvtColor, fillPoly, polylines
 import imageio.v2 as imageio
