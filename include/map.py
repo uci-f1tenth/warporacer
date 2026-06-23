@@ -45,7 +45,6 @@ class Map:
 
     centerline: np.ndarray
     angles: np.ndarray
-    look_step: int
 
     def __new__(cls, path: Path) -> "Map":
         """Intercepts instance creation to implement Flyweight/Multiton mapping cache."""
@@ -81,7 +80,7 @@ class Map:
         self.raw[:, 0] = 0
         self.raw[:, -1] = 0
 
-        # 3. Create boolean map of drivable space and calculate wall clearances
+        # 3. Create boolean map of drivable space using metadata thresholds
         self.free = self.raw >= OCC_THRESH
         self.dt = distance_transform_edt(self.free)
 
@@ -337,10 +336,6 @@ class Map:
         # Precompute sequential track heading tracking yaw lines
         diffs = np.diff(self.centerline, axis=0, append=self.centerline[:1])
         self.angles = np.arctan2(diffs[:, 1], diffs[:, 0])
-
-        # Adapt index increments utilizing pixel density metrics
-        avg_spacing = float(np.linalg.norm(diffs, axis=1).mean())
-        self.look_step = max(1, int(round(1.0 / avg_spacing)))
 
     def _build_lut(self) -> None:
         """Generates coordinate grids to sample closest index parameters."""
