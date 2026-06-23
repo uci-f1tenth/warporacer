@@ -110,11 +110,14 @@ class Agent(nn.Module):
         )
         self.log_std: nn.Parameter = nn.Parameter(torch.zeros(1, act_dim))
 
+        # Compile the actor and the math for massive rollout speedups
+        self.act_value_compiled = torch.compile(self._act_value, mode="reduce-overhead")
+
     def value(self, critic_obs: torch.Tensor) -> torch.Tensor:
         """Evaluates state values from privileged observation feeds."""
         return self.critic(critic_obs).squeeze(-1)
 
-    def act_value(self, obs: torch.Tensor, critic_obs: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _act_value(self, obs: torch.Tensor, critic_obs: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Samples exploratory actions and gathers companion state values."""
         if critic_obs is None:
             critic_obs = obs
@@ -482,11 +485,11 @@ def train(
 
     for it in range(iterations):
         agent.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             for t in range(rollouts):
                 buffers.obs_b[t] = obs
                 buffers.critic_obs_b[t] = raw_critic
-                act_raw, act_clamped, logp, _, val = agent.act_value(obs, raw_critic)
+                act_raw, act_clamped, logp, _, val = agent.act_value_compiled(obs, raw_critic)
                 buffers.act_b[t] = act_raw 
                 buffers.logp_b[t] = logp
                 buffers.val_b[t] = val
