@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 import numpy as np
 import torch
 import warp as wp
+import concurrent.futures
 
 from include.constants import (
     DONE_TERMINATED,
@@ -141,12 +142,11 @@ class Environment:
             self.available_maps, size=sample_size, replace=False
         )
 
-        self.maps = [Map(p) for p in chosen_paths]
-        # import concurrent.futures
-        # self.maps = []
-        # if sample_size > 0:
-        #     with concurrent.futures.ThreadPoolExecutor() as executor:
-        #         self.maps = list(executor.map(Map, chosen_paths))
+        # self.maps = [Map(p) for p in chosen_paths]
+        self.maps = []
+        if sample_size > 0:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                self.maps = list(executor.map(Map, chosen_paths))
         self.num_maps = len(self.maps)
 
         global_shifts = self._initialize_active_maps()

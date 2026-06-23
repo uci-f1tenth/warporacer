@@ -55,7 +55,6 @@ class Map:
             cls._cache[abs_path] = instance
         return cls._cache[abs_path]
 
-    @profile
     def __init__(self, path: Path) -> None:
         """Initializes structural map matrices from cached configuration lines."""
         if getattr(self, "_initialized", False):
@@ -100,7 +99,6 @@ class Map:
 
         self._initialized = True
 
-    @profile
     def _calculate_wall_bounds(self) -> None:
         """Calculates physical dimensions of the track and balances world spaces."""
         track_pts = np.argwhere(self.free)
@@ -124,7 +122,6 @@ class Map:
         self.center_y = 0.0
         self.max_extent = float(max(self.wall_width, self.wall_length)) + 2.0
 
-    @profile
     def _compute_centerline(self) -> None:
         """Extracts continuous optimal circuit centerlines using high-performance graph heuristics."""
         pts, num_nodes, clearances, all_u, all_v, all_dists = self._extract_initial_skeleton_graph()
@@ -173,7 +170,6 @@ class Map:
             
         return pts, num_nodes, clearances, all_u, all_v, all_dists
 
-    @profile
     def _heal_skeleton_gaps(self, pts, num_nodes, all_u, all_v, all_dists):
         """Phase 2: Performs vectorized bridge building across micro-gaps for disjointed endpoints."""
         degrees = np.bincount(all_u, minlength=num_nodes)
@@ -217,7 +213,6 @@ class Map:
                     
         return all_u, all_v, all_dists
 
-    @profile
     def _prune_and_segment_main_loop(self, num_nodes, clearances, all_u, all_v, all_dists):
         """Phase 3: Strips spurious dead-ends vectorially and isolates the dominant loop component."""
         active_edges_mask = np.ones(len(all_u), dtype=bool)
@@ -247,7 +242,6 @@ class Map:
         
         return start_node, in_main_component
 
-    @profile
     def _route_and_smooth_circuit(self, pts, num_nodes, clearances, start_node, in_main_component, all_u, all_v, all_dists):
         """Phase 4: Computes bidirectional penalization routing, clears loops, and processes smooth coordinates."""
         min_clearance_px = max(2.0, 0.15 / self.res)
@@ -356,7 +350,6 @@ class Map:
         path.reverse()
         return path
 
-    @profile
     def _build_lut(self) -> None:
         """Generates coordinate grids to sample closest index parameters."""
         cl_px = np.column_stack([
