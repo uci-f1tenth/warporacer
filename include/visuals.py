@@ -97,7 +97,7 @@ class Visuals:
     def interactive_render_loop(self) -> None:
         """While loop for rendering, must be last! Handles input collection and simulation steps."""
         user_actions = torch.zeros(
-            (self.env.num_envs, ACT_DIM), device=self.env.obs_buf.device
+            (self.env.num_envs, ACT_DIM), device=self.env.views.obs_buf.device
         )
 
         self.last_render_time = time.perf_counter()
@@ -164,7 +164,7 @@ class Visuals:
         cols = boundary_pixels[:, 1]
 
         # Extract the exact unique grid offsets processed by the physics environment
-        env_origin = self.env.maps_origin.numpy()[idx]
+        env_origin = self.env.maps_storage.maps_origin.numpy()[idx]
         shifted_ox = env_origin[0]
         shifted_oy = env_origin[1]
 
@@ -191,8 +191,8 @@ class Visuals:
 
     def _setup_single_map_centerline(self, idx: int, m: Map) -> None:
         """Draws spline guide lines down the physical midpoint coordinates of each layout."""
-        cl_data = self.env.centerline_buf.numpy()[idx]
-        n_cl = self.env.maps_n_cl.numpy()[idx]
+        cl_data = self.env.maps_storage.centerline_buf.numpy()[idx]
+        n_cl = self.env.maps_storage.maps_n_cl.numpy()[idx]
 
         cl_z = 0.04
         cl_radius = 0.04
@@ -212,7 +212,7 @@ class Visuals:
 
     def _setup_dynamic_objects(self) -> None:
         """Allocates baseline mesh structures inside the rendering frame for primary validation."""
-        car_state = self.env.cars_buf[0].cpu().numpy()
+        car_state = self.env.views.cars_buf[0].cpu().numpy()
         car_x, car_y, car_psi = car_state[0], car_state[1], car_state[4]
         car_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(car_psi))
 
@@ -231,7 +231,7 @@ class Visuals:
     def _render_all_agents(self) -> None:
         """Handles structural allocation and updates for massive parallel agent swarms."""
         agent_count_divider = 256
-        car_states = self.env.cars_buf.cpu().numpy()[::agent_count_divider]
+        car_states = self.env.views.cars_buf.cpu().numpy()[::agent_count_divider]
         num_cars_to_render = len(car_states)
         
         car_z = 0.15
@@ -283,7 +283,7 @@ class Visuals:
 
     def _render_user_car(self) -> None:
         """Updates spatial transformations for individual user-controlled vehicle models."""
-        car_state = self.env.cars_buf[0].cpu().numpy()
+        car_state = self.env.views.cars_buf[0].cpu().numpy()
         car_x, car_y, car_psi = car_state[0], car_state[1], car_state[4]
         car_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(car_psi))
         car_z = 0.15
@@ -294,8 +294,8 @@ class Visuals:
 
     def _render_user_lidar(self) -> None:
         """Dispatches parallel raycasting kernels to evaluate and paint visual sensor reflections."""
-        obs_wp = wp.from_torch(self.env.obs_buf.contiguous(), dtype=wp.float32)
-        cars_wp = wp.from_torch(self.env.cars_buf.contiguous(), dtype=wp.float32)
+        obs_wp = wp.from_torch(self.env.views.obs_buf.contiguous(), dtype=wp.float32)
+        cars_wp = wp.from_torch(self.env.views.cars_buf.contiguous(), dtype=wp.float32)
 
         # Run parallel laser boundary intersection processing on the designated GPU engine
         wp.launch(
@@ -304,7 +304,7 @@ class Visuals:
             inputs=[
                 obs_wp,
                 cars_wp,
-                self.env.lidar_buf,
+                self.env.agents.lidar_buf,
                 self.lidar_hit_points,
             ],
             device=self.env.device,
