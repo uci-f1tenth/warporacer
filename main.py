@@ -99,7 +99,7 @@ def main(
     seed: int = 0,
     interactive: bool = False,
     live_viewer: bool = False,
-    iterations: int = 5000,
+    iterations: int = 1000,
     record_every_iteration: int = 100,
     record_duration_steps: int = 2000,
     switch_map_iter: int = 20,
@@ -121,7 +121,7 @@ def main(
     _validate_and_load_maps(maps_dir, switch_map_iter)
 
     with wp.ScopedDevice(target_device):
-        env = Environment(maps_dir, num_envs, seed, target_device, live_viewer)
+        env = Environment(maps_dir, num_envs, seed, target_device, live_viewer, max_active_maps=16)
 
         # Execution Stream A: Manual driving viewport loop
         if interactive:

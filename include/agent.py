@@ -1,6 +1,7 @@
 from collections import deque
 from pathlib import Path
 import time
+import random
 from typing import Any, Dict, Optional, Tuple
 
 from cv2 import COLOR_GRAY2RGB, cvtColor, fillPoly, polylines
@@ -287,7 +288,6 @@ def record_rollout(env: Environment, agent: Agent, num_steps: int, out_path: Pat
         raw, _, _ = env.reset()
 
         # 2. Randomly select an index from the currently active maps pool
-        import random
         map_idx = random.randint(0, env.num_maps - 1)
         m = env.maps[map_idx]
         print(f"Recording validation rollout on sampled map: {m.path_name}")
@@ -339,21 +339,23 @@ def record_rollout(env: Environment, agent: Agent, num_steps: int, out_path: Pat
         device = env.views.cars_buf.device
         num_features = env.views.cars_buf.shape[1] 
         
-        traj_states = torch.empty((num_steps, num_features), dtype=torch.float32, device=device)
-        resets_gpu = torch.empty(num_steps, dtype=torch.bool, device=device)
+        full_states_cpu = []
+        resets_cpu = []
 
         # --- COLLECT TRAJECTORY ---
         with torch.no_grad():
             for i in range(num_steps):
                 a: torch.Tensor = agent.deterministic(obs)
-                # FIXED: Corrected unpacking from 5 arguments to 6 here to clear the ValueError
                 raw, _, _, term, trunc, _ = env.step(a)
                 obs = process_observations(raw, obs_rms) if obs_rms else raw
-                traj_states[i] = env.views.cars_buf[0]
-                resets_gpu[i] = term[0] | trunc[0]
+                
+                # Append directly to CPU
+                full_states_cpu.append(env.views.cars_buf[0].cpu().numpy())
+                resets_cpu.append(bool((term[0] | trunc[0]).item()))
 
-        full_states_cpu = traj_states.cpu().numpy()
-        resets_cpu = resets_gpu.cpu().numpy()
+        # Convert once at the end
+        full_states_cpu = np.array(full_states_cpu)
+        resets_cpu = np.array(resets_cpu)
 
         x_arr = full_states_cpu[:, 0]
         y_arr = full_states_cpu[:, 1]
@@ -392,11 +394,10 @@ def record_rollout(env: Environment, agent: Agent, num_steps: int, out_path: Pat
         env.restore_state(snap)
         agent.train(was_training)
 
-#@profile
 def train(
     env: Environment,
     agent: Agent,
-    iterations: int = 5000,
+    iterations: int = 1000,
     rollouts: int = 64,
     epochs: int = 4,
     gamma: float = 0.99,
@@ -521,11 +522,9 @@ def train(
         len_cpu = cpu_len_history.numpy()
 
         if fin_mask_cpu.any():
-            for t in range(rollouts):
-                step_fin = fin_mask_cpu[t]
-                if step_fin.any():
-                    finished_rets.extend(ret_cpu[t][step_fin])
-                    finished_lens.extend(len_cpu[t][step_fin])
+            # Flat boolean indexing extracts all True elements instantly
+            finished_rets.extend(ret_cpu[fin_mask_cpu].tolist())
+            finished_lens.extend(len_cpu[fin_mask_cpu].tolist())
 
         # 1. Enforce initial contiguous layout
         b_obs = buffers.obs_b.reshape(B, OBS_DIM).contiguous()
@@ -547,8 +546,6 @@ def train(
             
             for start in range(0, B, mb):
                 end = start + mb
-                if end > B:
-                    continue
                     
                 # Grab just the indices for this specific minibatch (Virtually zero VRAM)
                 mb_indices = perm[start:end]
