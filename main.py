@@ -30,7 +30,9 @@ LF = 0.15875
 LR = 0.17145
 LWB = LF + LR
 MASS = 3.74
-LIDAR_MOUNT_X = 0.2733  # m, real base_link->laser offset (sim raytraces lidar from here)
+LIDAR_MOUNT_X = (
+    0.2733  # m, real base_link->laser offset (sim raytraces lidar from here)
+)
 
 STEER_MIN = -0.4189
 STEER_MAX = 0.4189
@@ -56,7 +58,7 @@ DR_FRAC = 0.15
 
 PROGRESS_SCALE = 100.0
 PROGRESS_V_COEF = 10.0
-TERM_PENALTY = 10.0
+TERM_PENALTY = 50.0
 
 NUM_LIDAR = 108
 LIDAR_FOV = np.radians(270.0)
@@ -389,9 +391,7 @@ class Map:
         kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
         skel = skel.copy()
         while True:
-            counts = convolve(
-                skel.astype(np.uint8), kernel, mode="constant", cval=0
-            )
+            counts = convolve(skel.astype(np.uint8), kernel, mode="constant", cval=0)
             endpoints = skel & (counts <= 1)
             if not endpoints.any():
                 break
@@ -640,9 +640,7 @@ class RacingEnv:
         )
 
     def _launch(self, act_torch):
-        seed_step = (
-            self.seed_base * 2654435761 + self._call * 83492791
-        ) & 0x7FFFFFFF
+        seed_step = (self.seed_base * 2654435761 + self._call * 83492791) & 0x7FFFFFFF
         for i, mb in enumerate(self.map_buffers):
             a, b = mb["env_start"], mb["env_end"]
             act_w = wp.from_torch(act_torch[a:b], dtype=wp.vec2)
@@ -651,9 +649,7 @@ class RacingEnv:
         self._call += 1
 
     def _launch_zero(self):
-        seed_step = (
-            self.seed_base * 2654435761 + self._call * 83492791
-        ) & 0x7FFFFFFF
+        seed_step = (self.seed_base * 2654435761 + self._call * 83492791) & 0x7FFFFFFF
         for i, mb in enumerate(self.map_buffers):
             self._launch_one(mb, mb["zero_act_v"], seed_step ^ ((i + 1) * 982451653))
         wp.synchronize_device(self.cars.device)
