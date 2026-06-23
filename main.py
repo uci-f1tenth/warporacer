@@ -301,7 +301,9 @@ def step_kernel(
     # sparse TERM_PENALTY (no progress refund), so a floored corner isn't cheap.
     clearance = edt_val - CAR_HALF_DIAG
     prox_f = wp.max((WALL_MARGIN - clearance) / WALL_MARGIN, 0.0)
-    prox_pen = WALL_PROX_COEF * prox_f * prox_f * (1.0 + wp.max(v, 0.0) / PROGRESS_V_COEF)
+    prox_pen = (
+        WALL_PROX_COEF * prox_f * prox_f * (1.0 + wp.max(v, 0.0) / PROGRESS_V_COEF)
+    )
     reward[i] = wp.where(term, -TERM_PENALTY, progress - prox_pen)
 
     if term:
@@ -887,7 +889,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
 def train(
     env,
     agent,
-    iterations=2000,
+    iterations=496,
     rollouts=24,
     epochs=5,
     minibatches=4,
@@ -1080,7 +1082,7 @@ def train(
 def main(
     map_yamls: list[Path],
     num_envs: int = 4096,
-    iterations: int = 2000,
+    iterations: int = 496,
     seed: int = 0,
     log_dir: Path = Path("./logs"),
     device: str = "",
