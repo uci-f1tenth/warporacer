@@ -159,7 +159,7 @@ def process_observations(raw_tensor: torch.Tensor, rms_module: RunningMeanStd) -
 
 
 @torch.compile(mode="reduce-overhead")
-def _train_step_compiled(
+def _full_train_step_compiled(
     agent: Agent,
     opt: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
@@ -176,7 +176,7 @@ def _train_step_compiled(
     vf_clip: float,
     ent_coef: float,
 ):
-    """Pure mathematical processing step. Zero loops, zero graph breaks."""
+    """Fuses everything into a single execution graph. No eager overhead."""
     opt.zero_grad(set_to_none=True)
     
     with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
@@ -202,13 +202,15 @@ def _train_step_compiled(
             
         loss = pg + vf_coef * v_loss - ent_coef * ent.mean()
         
+    # Scale loss and calculate gradients completely inside the graph
     scaler.scale(loss).backward()
     scaler.unscale_(opt)
     torch.nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
     scaler.step(opt)
     scaler.update()
     
-    return pg.detach(), v_loss.detach(), ent.mean().detach(), approx_kl.detach(), clipfrac.detach()
+    # Detach and clone outputs immediately to free the graph's internal memory locks
+    return pg.detach().clone(), v_loss.detach().clone(), ent.mean().detach().clone(), approx_kl.detach().clone(), clipfrac.detach().clone()
 
 
 @torch.compile
@@ -572,14 +574,12 @@ def train(
                 if end > B:
                     continue
 
-                # Ensure CUDA graph treats this step as a clean execution boundary
+                # Signal the boundary to the graph replay engine
                 torch.compiler.cudagraph_mark_step_begin()
 
-                opt.zero_grad(set_to_none=True)
-
-                # Force exact static shapes using .view() to guarantee graph reuse
-                loss, pg, v_loss, ent_m, approx_kl, clipfrac = _compute_loss_compiled(
-                    agent,
+                # One call runs the entire optimization step smoothly
+                pg, v_loss, ent_m, approx_kl, clipfrac = _full_train_step_compiled(
+                    agent, opt, scaler, max_grad_norm,
                     shuffled_obs[start:end].view(mb, OBS_DIM), 
                     shuffled_critic_obs[start:end].view(mb, b_critic_obs.shape[-1]), 
                     shuffled_act[start:end].view(mb, ACT_DIM), 
@@ -590,14 +590,7 @@ def train(
                     clip, vf_coef, vf_clip, current_ent_coef
                 )
 
-                # Run optimization in standard eager mode (no graph overhead penalties)
-                scaler.scale(loss).backward()
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
-                scaler.step(opt)
-                scaler.update()
-
-                # Fast GPU additions
+                # Pure GPU tracking additions
                 running_stats[0].add_(pg)
                 running_stats[1].add_(v_loss)
                 running_stats[2].add_(ent_m)
