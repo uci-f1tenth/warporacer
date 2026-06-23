@@ -41,7 +41,7 @@ PSI_PRIME_MAX = 6.0
 BETA_MAX = 1.2
 
 # Car
-WIDTH = 0.31
+WIDTH = 0.45
 LENGTH = 0.58
 CAR_HALF_DIAG = float(np.hypot(WIDTH / 2.0, LENGTH / 2.0))
 G = 9.81
@@ -446,9 +446,7 @@ class Map:
         kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
         skel = skel.copy()
         while True:
-            counts = convolve(
-                skel.astype(np.uint8), kernel, mode="constant", cval=0
-            )
+            counts = convolve(skel.astype(np.uint8), kernel, mode="constant", cval=0)
             endpoints = skel & (counts <= 1)
             if not endpoints.any():
                 break
@@ -608,9 +606,9 @@ class RacingEnv:
         cars_int = np.zeros((num_envs, 2), dtype=np.int32)
         for i, m in enumerate(self.maps):
             a, b = splits[i]
-            idxs = (
-                m.spawn_lo + rng.integers(0, m.spawn_len, size=b - a)
-            ) % len(m.centerline)
+            idxs = (m.spawn_lo + rng.integers(0, m.spawn_len, size=b - a)) % len(
+                m.centerline
+            )
             cars[a:b, 0] = m.centerline[idxs, 0]
             cars[a:b, 1] = m.centerline[idxs, 1]
             cars[a:b, 4] = m.angles[idxs]
@@ -712,9 +710,7 @@ class RacingEnv:
         )
 
     def _launch(self, act_torch):
-        seed_step = (
-            self.seed_base * 2654435761 + self._call * 83492791
-        ) & 0x7FFFFFFF
+        seed_step = (self.seed_base * 2654435761 + self._call * 83492791) & 0x7FFFFFFF
         for i, mb in enumerate(self.map_buffers):
             a, b = mb["env_start"], mb["env_end"]
             act_w = wp.from_torch(act_torch[a:b], dtype=wp.vec2)
@@ -723,9 +719,7 @@ class RacingEnv:
         self._call += 1
 
     def _launch_zero(self):
-        seed_step = (
-            self.seed_base * 2654435761 + self._call * 83492791
-        ) & 0x7FFFFFFF
+        seed_step = (self.seed_base * 2654435761 + self._call * 83492791) & 0x7FFFFFFF
         for i, mb in enumerate(self.map_buffers):
             self._launch_one(mb, mb["zero_act_v"], seed_step ^ ((i + 1) * 982451653))
         wp.synchronize_device(self.cars.device)
