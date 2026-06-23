@@ -3,6 +3,7 @@ from collections import deque
 from pathlib import Path
 
 import numpy as np
+import cv2
 from cv2 import IMREAD_GRAYSCALE, imread
 from scipy.ndimage import distance_transform_edt
 from scipy.signal import savgol_filter
@@ -69,6 +70,7 @@ class Map:
 
         # 5. Execute processing pipeline
         self._calculate_wall_bounds()
+        self._extract_wall_segments()
         self._compute_centerline()
         self._build_lut()
 
@@ -103,6 +105,47 @@ class Map:
         self.center_x = 0.0
         self.center_y = 0.0
         self.max_extent = float(max(self.wall_width, self.wall_length)) + 2.0
+
+    def _extract_wall_segments(self):
+        """Extracts drivable boundaries as 2D vector line segments."""
+        # 1. Convert boolean free space to uint8 for OpenCV compatibility
+        free_img = self.free.astype(np.uint8) * 255
+
+        # 2. Find contours (the boundaries between free space and walls)
+        # RETR_LIST gets outer walls and inner obstacles.
+        contours, _ = cv2.findContours(free_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+        segments = []
+        
+        for contour in contours:
+            # 3. Simplify the jagged pixel edges into smooth vector lines
+            # epsilon is the maximum distance from contour to approximated contour.
+            # 1.0 pixel is usually a perfect balance of accuracy vs segment reduction.
+            approx = cv2.approxPolyDP(contour, epsilon=1.0, closed=True)
+            
+            # Reshape OpenCV's output to a standard (N, 2) array of [col, row]
+            pts = approx.reshape(-1, 2) 
+            
+            if len(pts) < 3:
+                continue # Ignore microscopic noise artifacts
+                
+            # 4. Convert pixel coordinates (col, row) to world coordinates (X, Y)
+            world_x = self.ox + pts[:, 0] * self.res
+            world_y = self.oy + (self.h - 1 - pts[:, 1]) * self.res
+            
+            world_pts = np.column_stack([world_x, world_y])
+            
+            # 5. Create point-to-point line segments closing the loop
+            for i in range(len(world_pts)):
+                p1 = world_pts[i]
+                p2 = world_pts[(i + 1) % len(world_pts)]
+                
+                # Append as [x1, y1, x2, y2]
+                segments.append([p1[0], p1[1], p2[0], p2[1]])
+                
+        # Store as a flat, highly-optimized float32 array for the GPU
+        self.wall_segments = np.array(segments, dtype=np.float32)
+        print(f" -> Extracted {len(self.wall_segments)} wall segments for {self.path_name}")
 
     def _compute_centerline(self):
         """Extracts the optimal racing circuit centerline using skeletonization and Dijkstra's algorithm."""
