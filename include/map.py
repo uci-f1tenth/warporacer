@@ -157,7 +157,6 @@ class Map:
             pts, num_nodes, clearances, start_node, in_main_component, all_u, all_v, all_dists
         )
 
-    @profile
     def _extract_initial_skeleton_graph(self):
         """Phase 1: Generates skeleton node pixels and extracts direct pixel neighbor relations."""
         skel = skeletonize(self.free, method="zhang")
@@ -204,6 +203,7 @@ class Map:
             
         return pts, num_nodes, clearances, all_u, all_v, all_dists
 
+    @profile
     def _heal_skeleton_gaps(self, pts, num_nodes, all_u, all_v, all_dists):
         """Phase 2: Performs vectorized bridge building across micro-gaps for disjointed endpoints."""
         degrees = np.bincount(all_u, minlength=num_nodes)
@@ -256,6 +256,7 @@ class Map:
                     
         return all_u, all_v, all_dists
 
+    @profile
     def _prune_and_segment_main_loop(self, num_nodes, clearances, all_u, all_v, all_dists):
         """Phase 3: Strips spurious dead-ends vectorially and isolates the dominant loop component."""
         active_edges_mask = np.ones(len(all_u), dtype=bool)
@@ -293,6 +294,7 @@ class Map:
         
         return start_node, in_main_component
 
+    @profile
     def _route_and_smooth_circuit(self, pts, num_nodes, clearances, start_node, in_main_component, all_u, all_v, all_dists):
         """Phase 4: Computes bidirectional penalization routing, clears loops, and processes smooth coordinates."""
         physical_clearance_limit = 0.15
@@ -334,25 +336,26 @@ class Map:
         path2 = self._reconstruct_path(target_node, start_node, predecessors_2)
         best_circuit = path1 + path2[1:-1]
 
-        # Fast O(N) Detour Removal
+        # --- HYPER-OPTIMIZED TRACKING & DETOUR REMOVAL ---
+        # Replace dictionary lookups with a fast, pre-allocated flat tracking array
+        node_positions = np.full(num_nodes, -1, dtype=np.int32)
+        max_detour_len = len(best_circuit) * 0.25
+        
         simplified_circuit = []
-        node_indices = {}
-        max_detour_ratio = 0.25
-        max_detour_len = len(best_circuit) * max_detour_ratio
+        append_node = simplified_circuit.append
         
         for node in best_circuit:
-            if node in node_indices:
-                idx = node_indices[node]
+            idx = node_positions[node]
+            if idx != -1:
                 if len(simplified_circuit) - idx < max_detour_len:
-                    for popped_node in simplified_circuit[idx + 1:]:
-                        del node_indices[popped_node]
-                    simplified_circuit = simplified_circuit[: idx + 1]
-                else:
-                    simplified_circuit.append(node)
-                    node_indices[node] = len(simplified_circuit) - 1
-            else:
-                simplified_circuit.append(node)
-                node_indices[node] = len(simplified_circuit) - 1
+                    # Wipe values from tracking array for the dropped slice in one go
+                    dropped_nodes = simplified_circuit[idx + 1:]
+                    node_positions[dropped_nodes] = -1
+                    del simplified_circuit[idx + 1:]
+                    continue
+            
+            append_node(node)
+            node_positions[node] = len(simplified_circuit) - 1
                 
         best_circuit = simplified_circuit
 
@@ -375,13 +378,23 @@ class Map:
 
     @staticmethod
     def _reconstruct_path(start: int, target: int, preds: np.ndarray) -> list:
-        """Helper method to unpack predecessor arrays back into node lists."""
-        path, curr = [], target
+        """Fastest pure-Python unrolling of the predecessor tree."""
+        # Convert the numpy array to a native Python list *once* before looping.
+        # Indexing a Python list inside a raw loop is dramatically faster than 
+        # scalar indexing a NumPy array.
+        preds_list = preds.tolist()
+        
+        path = []
+        append = path.append
+        curr = target
+        
         while curr != -9999 and curr != start:
-            path.append(curr)
-            curr = preds[curr]
+            append(curr)
+            curr = preds_list[curr]
+            
         if curr == start:
-            path.append(start)
+            append(start)
+            
         path.reverse()
         return path
 
