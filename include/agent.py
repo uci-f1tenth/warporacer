@@ -1,7 +1,7 @@
 from collections import deque
 from pathlib import Path
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from cv2 import COLOR_GRAY2RGB, cvtColor, fillPoly, polylines
 import imageio.v2 as imageio
@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import wandb
 
-from include.constants import *
+from include.constants import ACT_DIM, DT, LENGTH, OBS_DIM, WIDTH
 from include.environment import Environment
 
 # Fast matrix multiplication layout alignment configurations
@@ -20,6 +20,8 @@ torch.backends.cudnn.allow_tf32 = True
 
 
 class RunningMeanStd:
+    """Tracks running mean, variance, and inverse standard deviation metrics."""
+
     def __init__(self, shape: Tuple[int, ...], device: torch.device) -> None:
         self.mean: torch.Tensor = torch.zeros(shape, dtype=torch.float32, device=device)
         self.var: torch.Tensor = torch.zeros(shape, dtype=torch.float32, device=device)
@@ -27,6 +29,7 @@ class RunningMeanStd:
         self.count: float = 1e-4
 
     def update(self, x: torch.Tensor) -> None:
+        """Updates internal moments using an online parallel variance update algorithm."""
         x = x.reshape(-1, *self.mean.shape).float()
         bv, bm = torch.var_mean(x, dim=0, unbiased=False)
         bc: int = x.shape[0]
@@ -40,31 +43,39 @@ class RunningMeanStd:
         self.inv_std = torch.rsqrt(self.var + 1e-8)
 
     def normalize(self, x: torch.Tensor, clip: float = 10.0) -> torch.Tensor:
+        """Standardizes inputs using current tracking statistics."""
         return ((x - self.mean) * self.inv_std).clamp(-clip, clip)
 
 
 class ReturnNormalizer:
+    """Normalizes episodic rewards using a discounted running tracking strategy."""
+
     def __init__(self, num_envs: int, gamma: float, device: torch.device) -> None:
         self.gamma: float = gamma
         self.returns: torch.Tensor = torch.zeros(num_envs, dtype=torch.float32, device=device)
         self.rms: RunningMeanStd = RunningMeanStd((), device)
 
     def update(self, reward: torch.Tensor, done: torch.Tensor) -> None:
+        """Accrues rolling rewards and shifts tracking windows on environment steps."""
         self.returns = self.returns * self.gamma + reward
         self.rms.update(self.returns)
-        self.returns = self.returns * (1.0 - done) # Reset fresh for the next step
+        self.returns = self.returns * (1.0 - done)
 
     def normalize(self, reward: torch.Tensor) -> torch.Tensor:
+        """Scales active rewards across standard tracking limits."""
         return reward * self.rms.inv_std
 
 
 def layer_init(layer: nn.Linear, std: float = np.sqrt(2.0), bias: float = 0.0) -> nn.Linear:
+    """Applies orthogonal parameter initializations to target projection layers."""
     nn.init.orthogonal_(layer.weight, std)
     nn.init.constant_(layer.bias, bias)
     return layer
 
 
 class Agent(nn.Module):
+    """Asymmetric Actor-Critic implementation supporting continuous environments."""
+
     LOGSTD_MIN: float = -2.0
     LOGSTD_MAX: float = -0.5
     HALF_LOG_TWO_PI: float = 0.9189385332046727
@@ -72,7 +83,6 @@ class Agent(nn.Module):
     def __init__(self, obs_dim: int, critic_obs_dim: int, act_dim: int, hidden: int = 256) -> None:
         super().__init__()
         
-        # 1. SWAP: Tanh() hidden activations replaced with SiLU() for better gradient flow
         self.actor: nn.Sequential = nn.Sequential(
             layer_init(nn.Linear(obs_dim, hidden)),
             nn.LayerNorm(hidden),
@@ -86,7 +96,6 @@ class Agent(nn.Module):
             layer_init(nn.Linear(hidden, act_dim), std=0.01),
         )
         
-        # 2. ASYMMETRIC CRITIC: Takes 'critic_obs_dim' which includes privileged environment data
         self.critic: nn.Sequential = nn.Sequential(
             layer_init(nn.Linear(critic_obs_dim, hidden)),
             nn.LayerNorm(hidden),
@@ -99,13 +108,14 @@ class Agent(nn.Module):
             nn.SiLU(),
             layer_init(nn.Linear(hidden, 1), std=1.0),
         )
-        self.log_std = nn.Parameter(torch.zeros(1, act_dim))
+        self.log_std: nn.Parameter = nn.Parameter(torch.zeros(1, act_dim))
 
     def value(self, critic_obs: torch.Tensor) -> torch.Tensor:
+        """Evaluates state values from privileged observation feeds."""
         return self.critic(critic_obs).squeeze(-1)
 
-    # Added critic_obs parameter. If None, it defaults to symmetric behavior.
-    def act_value(self, obs: torch.Tensor, critic_obs: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def act_value(self, obs: torch.Tensor, critic_obs: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Samples exploratory actions and gathers companion state values."""
         if critic_obs is None:
             critic_obs = obs
             
@@ -113,65 +123,36 @@ class Agent(nn.Module):
         ls = self.LOGSTD_MIN + (self.LOGSTD_MAX - self.LOGSTD_MIN) * torch.sigmoid(self.log_std)
         std: torch.Tensor = ls.exp()
         
-        # Sample from standard normal distribution
         noise = torch.randn_like(mean)
         raw_action = mean + noise * std
-        
-        # Squash cleanly to [-1, 1] for physics engine safety
         action_squashed = torch.tanh(raw_action)
         
-        # Analytical Jacobian Correction for Tanh Squashing
         log_prob = -((raw_action - mean) ** 2) / (2 * std.pow(2)) - ls - self.HALF_LOG_TWO_PI
         log_prob = log_prob.sum(-1) - torch.log(1.0 - action_squashed.pow(2) + 1e-6).sum(-1)
-        
-        # Use standard normal entropy as a proxy for exploration tracking
         entropy = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1)
         
         return raw_action, action_squashed, log_prob, entropy, self.critic(critic_obs).squeeze(-1)
 
     def evaluate(self, obs: torch.Tensor, critic_obs: torch.Tensor, raw_action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluates targeted action probabilities during policy optimization phases."""
         mean: torch.Tensor = self.actor(obs)
         ls = self.LOGSTD_MIN + (self.LOGSTD_MAX - self.LOGSTD_MIN) * torch.sigmoid(self.log_std)
         std: torch.Tensor = ls.exp()
         
         action_squashed = torch.tanh(raw_action)
-        
         log_prob = -((raw_action - mean) ** 2) / (2 * std.pow(2)) - ls - self.HALF_LOG_TWO_PI
         log_prob = log_prob.sum(-1) - torch.log(1.0 - action_squashed.pow(2) + 1e-6).sum(-1)
-        
         entropy = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1)
         
         return log_prob, entropy, self.critic(critic_obs).squeeze(-1)
 
     def deterministic(self, obs: torch.Tensor) -> torch.Tensor:
-        # 3. BUG FIX: Match the squashing logic!
-        # The actor outputs the pre-squashed mean. 
-        # Clamping it is mathematically incorrect if the environment expects a Tanh'd output.
+        """Generates deterministic actions matching bounds expected by the environment physics."""
         return torch.tanh(self.actor(obs))
 
 
-class KLAdaptiveLR:
-    def __init__(self, opt: torch.optim.Optimizer, target_kl: float = 0.015, factor: float = 1.5, lr_min: float = 1e-5, lr_max: float = 1e-3) -> None:
-        self.opt: torch.optim.Optimizer = opt
-        self.target: float = target_kl
-        self.factor: float = factor
-        self.lr_min: float = lr_min
-        self.lr_max: float = lr_max
-
-    def step(self, kl: float) -> None:
-        for pg in self.opt.param_groups:
-            lr: float = pg["lr"]
-            if kl > 2.0 * self.target:
-                pg["lr"] = max(self.lr_min, lr / self.factor)
-            elif kl < 0.5 * self.target:
-                pg["lr"] = min(self.lr_max, lr * self.factor)
-
-    @property
-    def lr(self) -> float:
-        return float(self.opt.param_groups[0]["lr"])
-
-
 def process_observations(raw_tensor: torch.Tensor, rms_module: RunningMeanStd) -> torch.Tensor:
+    """Splits rigid kinematics from structural ray scans to scale distance horizons."""
     kinematics = raw_tensor[..., :3]
     sensory_normalized = rms_module.normalize(raw_tensor[..., 3:])
     return torch.cat([kinematics, sensory_normalized], dim=-1)
@@ -192,10 +173,10 @@ def _train_step_compiled(
     vf_clip: float,
     ent_coef: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Executes a single compiled policy loss calculation pass under half-precision settings."""
     with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
         new_logp, ent, new_val = agent.evaluate(b_obs_idx, b_critic_obs_idx, b_act_idx)
         
-        # Cast to float32 to prevent exponentiation overflow/underflow in half-precision
         logratio: torch.Tensor = new_logp.float() - b_logp_idx.float()
         ratio: torch.Tensor = logratio.exp()
         
@@ -225,22 +206,19 @@ def compute_gae(
     val_b: torch.Tensor,
     next_val: torch.Tensor,
     term_b: torch.Tensor,
-    done_b: torch.Tensor,  # done_b = (term | trunc)
+    done_b: torch.Tensor,
     gamma: float,
     gae_lambda: float,
     rollouts: int,
 ) -> torch.Tensor:
+    """Backpropagates multi-step Generalized Advantage Estimations from rollout horizons."""
     adv_b: torch.Tensor = torch.zeros_like(rew_b)
     last: torch.Tensor = torch.zeros_like(next_val)
     
     for t in range(rollouts - 1, -1, -1):
-        # CRITICAL: Treat both crashes AND timeouts as trajectory cutoffs 
-        # to prevent bootstrapping from contaminated in-place reset observations.
         nondone: torch.Tensor = 1.0 - done_b[t]
-        
         next_v: torch.Tensor = next_val if t == rollouts - 1 else val_b[t + 1]
         
-        # Using nondone here drops the bootstrap cleanly at any reset event
         delta: torch.Tensor = rew_b[t] + gamma * next_v * nondone - val_b[t]
         last = delta + gamma * gae_lambda * nondone * last
         adv_b[t] = last
@@ -248,13 +226,53 @@ def compute_gae(
     return adv_b
 
 
-def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: Path, obs_rms: Optional[RunningMeanStd] = None) -> None:
+class RolloutBuffers:
+    """Manages tensor allocation memory pools to avoid re-allocating space in the loop."""
+
+    def __init__(self, rollouts: int, num_envs: int, device: torch.device) -> None:
+        self.obs_b: torch.Tensor = torch.zeros((rollouts, num_envs, OBS_DIM), device=device)
+        self.raw_obs_b: torch.Tensor = torch.zeros((rollouts, num_envs, OBS_DIM), device=device)
+        self.critic_obs_b: torch.Tensor = torch.zeros((rollouts, num_envs, OBS_DIM + 5), device=device)
+        self.act_b: torch.Tensor = torch.zeros((rollouts, num_envs, ACT_DIM), device=device)
+        self.logp_b: torch.Tensor = torch.zeros((rollouts, num_envs), device=device)
+        self.rew_b: torch.Tensor = torch.zeros((rollouts, num_envs), device=device)
+        self.done_b: torch.Tensor = torch.zeros((rollouts, num_envs), device=device)
+        self.term_b: torch.Tensor = torch.zeros((rollouts, num_envs), device=device)
+        self.val_b: torch.Tensor = torch.zeros((rollouts, num_envs), device=device)
+
+
+def _log_training_summary(it: int, global_step: int, sps: int, avg_ent: float, avg_v: float, avg_pg: float, avg_clip: float, final_kl: float, current_lr: float, current_epochs: int, log: Dict[str, Any], process_profile: psutil.Process, start_wall_clock: float) -> None:
+    """Formats and prints an iteration summary line."""
+    er = log.get("ep_return", float("nan"))
+    el = log.get("ep_length", float("nan"))
+    cpu = process_profile.cpu_percent()
+    ram = process_profile.memory_info().rss / 1048576
+
+    real_elapsed = time.time() - start_wall_clock
+    rh, rem = divmod(real_elapsed, 3600)
+    rm, rs = divmod(rem, 60)
+    real_str = f"{int(rh):02d}:{int(rm):02d}:{int(rs):02d}"
+
+    sim_elapsed_seconds = global_step * DT  
+    sh, srem = divmod(sim_elapsed_seconds, 3600)
+    sm, ss = divmod(srem, 60)
+    sim_str = f"{int(sh):02d}:{int(sm):02d}:{int(ss):02d}"
+
+    print(
+        f"[{it:4d}] Real:{real_str} Sim:{sim_str} | {sps:>5d} SPS | "
+        f"R:{er:6.1f} L:{el:5.1f} Ent:{avg_ent:.3f} | "
+        f"V:{avg_v:.3f} P:{avg_pg:.3f} Clp:{avg_clip:.2f} KL:{final_kl:.3f} | "
+        f"LR:{current_lr:.1e} Ep:{current_epochs} | RAM:{ram:4.0f}M CPU:{cpu:4.1f}%"
+    )
+
+
+def record_rollout(env: Environment, agent: Agent, num_steps: int, out_path: Path, obs_rms: Optional[RunningMeanStd] = None) -> None:
+    """Saves a rollout validation video to track steering and collision behavior."""
     snap: Dict[str, torch.Tensor] = env.save_state()
     was_training: bool = agent.training
     agent.eval()
     
     try:
-        # Query which map slice environment 0 is currently operating on
         map_idx = int(env.env_map_ids.numpy()[0])
         m = env.maps[map_idx]
         
@@ -274,7 +292,7 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
             py = m.h - 1 - (pts[:, 1] - m.oy) / m.res
             return np.column_stack((px, py)).astype(np.int32)
 
-        raw, raw_critic, _ = env.reset()
+        raw, _, _ = env.reset()
         obs: torch.Tensor = process_observations(raw, obs_rms) if obs_rms else raw
         out_path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -329,6 +347,7 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
         env.restore_state(snap)
         agent.train(was_training)
 
+
 def train(
     env: Environment,
     agent: Agent,
@@ -350,70 +369,30 @@ def train(
     switch_map_iter: int = 20,
     use_wandb_train: bool = False
 ) -> Tuple[float, RunningMeanStd, ReturnNormalizer, int]:
+    """Orchestrates high-throughput Proximal Policy Optimization loops across parallel tracking buffers."""
     device: torch.device = next(agent.parameters()).device
     process_profile = psutil.Process()
     N: int = env.num_envs
     
-    # -------------------------------------------------------------------------
-    # STATIC BATCH CALCULATIONS & ALLOCATIONS
-    # -------------------------------------------------------------------------
     B: int = rollouts * N
     TARGET_MINIBATCH_SIZE = 16384 * 4
     calculated_minibatches = max(1, B // TARGET_MINIBATCH_SIZE)
     mb: int = B // calculated_minibatches
-    permutation_indices = torch.arange(B, device=device) # Pre-allocated for the loop
+    permutation_indices = torch.arange(B, device=device)
     
-    total_params = sum(p.numel() for p in agent.parameters())
-    trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
-    
-    # -------------------------------------------------------------------------
-    # PARAMETER & HYPERPARAMETER TELEMETRY
-    # -------------------------------------------------------------------------
     print("=" * 80)
-    print(f"[{'TRAINING PIPELINE INITIALIZATION':^74}]")
+    print(f" -> Compute Device      : {device} | Parallel Envs (N): {N:,}")
+    print(f" -> Total Batch Size (B): {B:,} steps/iteration | Minibatches: {calculated_minibatches}")
     print("=" * 80)
-    print(f" -> Compute Device      : {device}")
-    print(f" -> Parallel Envs (N)   : {N:,}")
-    print(f" -> Rollout Steps (T)   : {rollouts}")
-    print(f" -> Total Batch Size (B): {B:,} steps/iteration")
-    print(f" -> Target MB Size      : {TARGET_MINIBATCH_SIZE:,}")
-    print(f" -> Actual MB Size (mb) : {mb:,}")
-    print(f" -> Minibatches / Epoch : {calculated_minibatches}")
-    print(f" -> Optimization Epochs : {epochs}")
-    print(f" -> Base Learning Rate  : {lr:<10} | Target KL Threshold: {target_kl}")
-    print(f" -> GAE Gamma           : {gamma:<10} | GAE Lambda        : {gae_lambda}")
-    print(f" -> Policy Clip Bounds  : {clip:<10} | Value Clip Bounds  : {vf_clip}")
-    print(f" -> Loss Weights        : Value: {vf_coef:<6} | Entropy: {ent_coef}")
-    print("-" * 80)
-    print(f" -> Total Parameters    : {total_params:,}")
-    print(f" -> Trainable Params    : {trainable_params:,}")
-    print("=" * 80)
-    # -------------------------------------------------------------------------
 
     opt: torch.optim.Optimizer = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5, fused=True)
-    for pg in opt.param_groups:
-        pg["lr"] = lr
-
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt,
-        T_max=iterations,
-        eta_min=4e-5
-    )
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=iterations, eta_min=4e-5)
     
     sensory_dim = OBS_DIM - 3
     obs_rms: RunningMeanStd = RunningMeanStd((sensory_dim,), device)
     ret_rms: ReturnNormalizer = ReturnNormalizer(N, gamma, device)
     scaler: torch.amp.GradScaler = torch.amp.GradScaler("cuda")
-
-    obs_b: torch.Tensor = torch.zeros((rollouts, N, OBS_DIM), device=device)
-    raw_obs_b: torch.Tensor = torch.zeros((rollouts, N, OBS_DIM), device=device)
-    critic_obs_b: torch.Tensor = torch.zeros((rollouts, N, OBS_DIM + 5), device=device)
-    act_b: torch.Tensor = torch.zeros((rollouts, N, ACT_DIM), device=device)
-    logp_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
-    rew_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
-    done_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
-    term_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
-    val_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
+    buffers = RolloutBuffers(rollouts, N, device)
 
     raw, raw_critic, _ = env.reset()
     obs_rms.update(raw[..., 3:]) 
@@ -427,36 +406,35 @@ def train(
     t0: float = time.time()
     last_t: float = t0
     current_epochs: int = epochs
-
     start_wall_clock = time.time()
+
     for it in range(iterations):
         agent.eval()
         with torch.no_grad():
             for t in range(rollouts):
-                obs_b[t] = obs
-                critic_obs_b[t] = raw_critic
+                buffers.obs_b[t] = obs
+                buffers.critic_obs_b[t] = raw_critic
                 act_raw, act_clamped, logp, _, val = agent.act_value(obs, critic_obs=raw_critic)
-                act_b[t] = act_raw 
-                logp_b[t] = logp
-                val_b[t] = val
+                buffers.act_b[t] = act_raw 
+                buffers.logp_b[t] = logp
+                buffers.val_b[t] = val
 
                 raw, raw_critic, raw_rew, term, trunc, _ = env.step(act_clamped) 
-                raw_obs_b[t] = raw
+                buffers.raw_obs_b[t] = raw
 
                 done: torch.Tensor = (term | trunc).float()
                 ret_rms.update(raw_rew, done)
-                rew_b[t] = ret_rms.normalize(raw_rew)
-                done_b[t] = done
-                term_b[t] = term.float()
+                buffers.rew_b[t] = ret_rms.normalize(raw_rew)
+                buffers.done_b[t] = done
+                buffers.term_b[t] = term.float()
+                
                 ep_ret.add_(raw_rew)
                 ep_len.add_(1.0)
                 
                 fin: torch.Tensor = done.bool()
                 if fin.any():
-                    res_rets = ep_ret[fin].to("cpu", non_blocking=True).numpy()
-                    res_lens = ep_len[fin].to("cpu", non_blocking=True).numpy()
-                    finished_rets.extend(res_rets)
-                    finished_lens.extend(res_lens)
+                    finished_rets.extend(ep_ret[fin].to("cpu", non_blocking=True).numpy())
+                    finished_lens.extend(ep_len[fin].to("cpu", non_blocking=True).numpy())
                     ep_ret[fin] = 0.0
                     ep_len[fin] = 0.0
                 obs = process_observations(raw, obs_rms)
@@ -466,31 +444,27 @@ def train(
                 
             next_val: torch.Tensor = agent.value(raw_critic)
 
-        obs_rms.update(raw_obs_b[..., 3:])
+        obs_rms.update(buffers.raw_obs_b[..., 3:])
         obs = process_observations(raw, obs_rms)
 
-        adv_b: torch.Tensor = compute_gae(rew_b, val_b, next_val, term_b, done_b, gamma, gae_lambda, rollouts)
-        ret_b: torch.Tensor = adv_b + val_b
-        
+        adv_b: torch.Tensor = compute_gae(buffers.rew_b, buffers.val_b, next_val, buffers.term_b, buffers.done_b, gamma, gae_lambda, rollouts)
+        ret_b: torch.Tensor = adv_b + buffers.val_b
         global_step += B
 
-        b_obs: torch.Tensor = obs_b.reshape(B, OBS_DIM)
-        b_act: torch.Tensor = act_b.reshape(B, ACT_DIM)
-        b_logp: torch.Tensor = logp_b.reshape(B)
-        b_adv: torch.Tensor = adv_b.reshape(B)
-        b_ret: torch.Tensor = ret_b.reshape(B)
-        b_val: torch.Tensor = val_b.reshape(B)
-
-        b_critic_obs: torch.Tensor = critic_obs_b.reshape(B, critic_obs_b.shape[-1])
+        b_obs = buffers.obs_b.reshape(B, OBS_DIM)
+        b_act = buffers.act_b.reshape(B, ACT_DIM)
+        b_logp = buffers.logp_b.reshape(B)
+        b_adv = adv_b.reshape(B)
+        b_ret = ret_b.reshape(B)
+        b_val = buffers.val_b.reshape(B)
+        b_critic_obs = buffers.critic_obs_b.reshape(B, buffers.critic_obs_b.shape[-1])
 
         agent.train()
-        
         tot_pg, tot_v, tot_ent, tot_kl, tot_clip = 0.0, 0.0, 0.0, 0.0, 0.0
         n_upd: int = 0
         current_ent_coef = max(0.001, ent_coef * (1.0 - (it / iterations)))
 
         for epoch in range(current_epochs):  
-            # Shuffle indices using the pre-allocated tensor
             perm = permutation_indices[torch.randperm(B, device=device)]
             epoch_kl = 0.0
             minibatches_run = 0
@@ -501,7 +475,6 @@ def train(
                     continue 
 
                 opt.zero_grad(set_to_none=True)
-                
                 loss, pg, v_loss, ent_m, approx_kl, clipfrac = _train_step_compiled(
                     agent, b_obs[idx], b_critic_obs[idx], b_act[idx], b_logp[idx], 
                     b_adv[idx], b_ret[idx], b_val[idx], clip, vf_coef, vf_clip, 
@@ -529,8 +502,6 @@ def train(
                 
         denom = max(n_upd, 1)
         avg_pg, avg_v, avg_ent, final_kl, avg_clip = tot_pg/denom, tot_v/denom, tot_ent/denom, tot_kl/denom, tot_clip/denom
-        
-        # Schedulers execute
         sched.step()
         
         if final_kl > 1.5 * target_kl:
@@ -541,21 +512,12 @@ def train(
         now: float = time.time()
         sps: int = int(rollouts * N / max(now - last_t, 1e-9))
         last_t = now
-        
-        # Extracted active learning rate securely from the base optimizer parameter group
         current_lr = float(opt.param_groups[0]["lr"])
 
         log: Dict[str, Any] = {
-            "policy_loss": avg_pg,
-            "value_loss": avg_v,
-            "entropy": avg_ent,
-            "approx_kl": final_kl,
-            "clipfrac": avg_clip,
-            "current_epochs": current_epochs,  
-            "log_std": agent.log_std.mean().item(),
-            "iter_lr": current_lr,
-            "sps": sps,
-            "iteration": it,
+            "policy_loss": avg_pg, "value_loss": avg_v, "entropy": avg_ent,
+            "approx_kl": final_kl, "clipfrac": avg_clip, "current_epochs": current_epochs,  
+            "log_std": agent.log_std.mean().item(), "iter_lr": current_lr, "sps": sps, "iteration": it,
         }
         if finished_rets:
             log["ep_return"] = float(np.mean(finished_rets))
@@ -568,49 +530,21 @@ def train(
                 print(f"[WandB] Log failed: {e}")
 
         if it % 10 == 0:
-            er = log.get("ep_return", float("nan"))
-            el = log.get("ep_length", float("nan"))
-            cpu = process_profile.cpu_percent()
-            ram = process_profile.memory_info().rss / 1048576
-
-            real_elapsed = time.time() - start_wall_clock
-            rh, rem = divmod(real_elapsed, 3600)
-            rm, rs = divmod(rem, 60)
-            real_str = f"{int(rh):02d}:{int(rm):02d}:{int(rs):02d}"
-
-            sim_elapsed_seconds = global_step * DT  
-            sh, srem = divmod(sim_elapsed_seconds, 3600)
-            sm, ss = divmod(srem, 60)
-            sim_str = f"{int(sh):02d}:{int(sm):02d}:{int(ss):02d}"
-
-            print(
-                f"[{it:4d}] Real:{real_str} Sim:{sim_str} | {sps:>5d} SPS | "
-                f"R:{er:6.1f} L:{el:5.1f} Ent:{avg_ent:.3f} | "
-                f"V:{avg_v:.3f} P:{avg_pg:.3f} Clp:{avg_clip:.2f} KL:{final_kl:.3f} | "
-                f"LR:{current_lr:.1e} Ep:{current_epochs} | RAM:{ram:4.0f}M CPU:{cpu:4.1f}%"
-            )
+            _log_training_summary(it, global_step, sps, avg_ent, avg_v, avg_pg, avg_clip, final_kl, current_lr, current_epochs, log, process_profile, start_wall_clock)
             
         if record_every_iteration > 0 and (it + 1) % record_every_iteration == 0:
             out: Path = log_dir / f"rollout_iter{it + 1:06d}.mp4"
-            print(f"record_rollout: out={out}")
             record_rollout(env, agent, record_duration_steps, out, obs_rms)
-
             if use_wandb_train:
                 try:
                     wandb.log({"rollout": wandb.Video(str(out), format="mp4")}, step=global_step)
                 except Exception as e:
-                    print(f"[WandB] Rollout video failed: {e}")
+                    print(f"[WandB] Rollout video upload failed: {e}")
         
         if switch_map_iter > 0 and (it + 1) % switch_map_iter == 0:
-            # 1. Hot-swap the VRAM map subset AND snap cars to the new tracks
             env.trigger_map_rotation()
-            
-            # 2. Force an explicit step-kernel pass with zero-actions to populate 
-            # the observation tensors with the new track data layout immediately
             env._launch(env._zero_act)
             env._sanitize()
-            
-            # 3. Re-synchronize state representation with the new layout allocation
             raw = env.obs_buf
             obs_rms.update(raw[..., 3:])
             obs = process_observations(raw, obs_rms)

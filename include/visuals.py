@@ -204,7 +204,7 @@ class Visuals:
 
     def _render_all_agents(self) -> None:
         """Handles structural allocation, color distribution, and updates for massive parallel agent swarms."""
-        agent_count_divider = 16
+        agent_count_divider = 256
             
         car_states = self.env.cars_buf.cpu().numpy()[::agent_count_divider]
         num_cars_to_render = len(car_states)
