@@ -165,11 +165,8 @@ def process_observations(raw_tensor: torch.Tensor, rms_module: RunningMeanStd) -
 
 
 @torch.compile(mode="reduce-overhead")
-def _full_train_step_compiled(
+def _calc_loss(
     agent: Agent,
-    opt: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
-    max_grad_norm: float,
     obs: torch.Tensor,
     critic_obs: torch.Tensor,
     act: torch.Tensor,
@@ -182,9 +179,7 @@ def _full_train_step_compiled(
     vf_clip: float,
     ent_coef: float,
 ):
-    """Fuses everything into a single execution graph. No eager overhead."""
-    opt.zero_grad(set_to_none=True)
-    
+    """Compiles the forward pass and loss computation."""
     with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
         new_logp, ent, new_val = agent.evaluate(obs, critic_obs, act)
         
@@ -194,9 +189,8 @@ def _full_train_step_compiled(
         approx_kl = ((ratio - 1.0) - logratio).mean()
         clipfrac = ((ratio - 1.0).abs() > clip).float().mean()
         
-        adv_mb = (adv - adv.mean()) / (adv.std() + 1e-8)
-        s1 = ratio * adv_mb
-        s2 = ratio.clamp(1 - clip, 1 + clip) * adv_mb
+        s1 = ratio * adv
+        s2 = ratio.clamp(1 - clip, 1 + clip) * adv
         pg = -torch.min(s1, s2).mean()
         
         v_err = new_val.float() - ret.float()
@@ -207,57 +201,39 @@ def _full_train_step_compiled(
             v_loss = 0.5 * v_err.square().mean()
             
         loss = pg + vf_coef * v_loss - ent_coef * ent.mean()
-        
-        # Calculate log_std mean entirely inside the autocast/compiled graph context
-        # (Assuming agent.log_std is a parameter or buffer on the same device)
         mean_log_std = agent.log_std.mean()
         
-    # Scale loss and calculate gradients completely inside the graph
-    scaler.scale(loss).backward()
-    scaler.unscale_(opt)
-    torch.nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
-    scaler.step(opt)
-    scaler.update()
-    
-    # Detach and clone outputs immediately to free the graph's internal memory locks
-    return (
-        pg.detach().clone(), 
-        v_loss.detach().clone(), 
-        ent.mean().detach().clone(), 
-        approx_kl.detach().clone(), 
-        clipfrac.detach().clone(),
-        mean_log_std.detach().clone()
-    )
+    # Return the graph-attached loss first, then detach the tracking metrics
+    return loss, pg.detach(), v_loss.detach(), ent.mean().detach(), approx_kl.detach(), clipfrac.detach(), mean_log_std.detach()
 
 
+@torch.jit.script
 def compute_gae(
-    rew_b: torch.Tensor,
-    val_b: torch.Tensor,
-    next_val: torch.Tensor,
-    term_b: torch.Tensor,
-    done_b: torch.Tensor,
-    gamma: float,
-    gae_lambda: float,
-    rollouts: int,
+    rew_b: torch.Tensor, 
+    val_b: torch.Tensor, 
+    next_val: torch.Tensor, 
+    term_b: torch.Tensor, 
+    done_b: torch.Tensor, 
+    gamma: float, 
+    gae_lambda: float, 
+    rollouts: int
 ) -> torch.Tensor:
-    return _compute_gae_backend(rew_b, val_b, next_val, term_b, done_b, gamma, gae_lambda, rollouts).clone()
-
-# Move the actual compilation to an internal backend function
-@torch.compile(mode="reduce-overhead")
-def _compute_gae_backend(rew_b, val_b, next_val, term_b, done_b, gamma, gae_lambda, rollouts):
+    # Vectorized computation of deltas
     next_values = torch.cat([val_b[1:], next_val.unsqueeze(0)], dim=0)
     nondone = 1.0 - done_b
     deltas = rew_b + gamma * next_values * nondone - val_b
     
-    adv_list = []
+    # Pre-allocate exactly once
+    adv_b = torch.empty_like(rew_b)
     last = torch.zeros_like(next_val)
     discount = gamma * gae_lambda
     
-    for t in reversed(range(rollouts)):
+    # TorchScript will compile this into a fast C++ loop without unrolling it
+    for t in range(rollouts - 1, -1, -1):
         last = deltas[t] + discount * nondone[t] * last
-        adv_list.append(last)
+        adv_b[t] = last
         
-    return torch.stack(adv_list[::-1], dim=0)
+    return adv_b
 
 
 class RolloutBuffers:
@@ -416,7 +392,7 @@ def record_rollout(env: Environment, agent: Agent, num_steps: int, out_path: Pat
         env.restore_state(snap)
         agent.train(was_training)
 
-@profile
+#@profile
 def train(
     env: Environment,
     agent: Agent,
@@ -492,9 +468,7 @@ def train(
             for t in range(rollouts):
                 buffers.obs_b[t] = obs
                 buffers.critic_obs_b[t] = raw_critic
-                #torch.cuda.synchronize()
                 act_raw, act_clamped, logp, _, val = agent.act_value_compiled(obs, raw_critic)
-                #torch.cuda.synchronize()
                 buffers.act_b[t] = act_raw 
                 buffers.logp_b[t] = logp
                 buffers.val_b[t] = val
@@ -537,9 +511,7 @@ def train(
         obs = process_observations(raw, obs_rms)
 
         # Compute GAE while the PCIe bus copies your metrics trackers over
-        #torch.cuda.synchronize()
         adv_b: torch.Tensor = compute_gae(buffers.rew_b, buffers.val_b, next_val, buffers.term_b, buffers.done_b, gamma, gae_lambda, rollouts)
-        #torch.cuda.synchronize()
         ret_b: torch.Tensor = adv_b + buffers.val_b
         global_step += B
 
@@ -568,6 +540,7 @@ def train(
         running_stats = torch.zeros(6, device=device)
         n_upd = 0
         current_ent_coef = max(0.001, ent_coef * (1.0 - (it / iterations)))
+        b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
 
         for epoch in range(current_epochs):  
             perm = torch.randperm(B, device=device)
@@ -584,19 +557,30 @@ def train(
                 
                 # Advanced indexing (e.g., b_obs[mb_indices]) automatically allocates 
                 # a tiny, contiguous tensor just for this minibatch.
-                #torch.cuda.synchronize()
-                pg, v_loss, ent_m, approx_kl, clipfrac, avg_std = _full_train_step_compiled(
-                    agent, opt, scaler, max_grad_norm,
-                    b_obs[mb_indices].view(mb, OBS_DIM), 
-                    b_critic_obs[mb_indices].view(mb, b_critic_obs.shape[-1]), 
-                    b_act[mb_indices].view(mb, ACT_DIM), 
-                    b_logp[mb_indices].view(mb), 
-                    b_adv[mb_indices].view(mb), 
-                    b_ret[mb_indices].view(mb), 
-                    b_val[mb_indices].view(mb), 
-                    clip, vf_coef, vf_clip, current_ent_coef
+                opt.zero_grad(set_to_none=True)
+
+                # Catch the loss as the first return variable
+                loss, pg, v_loss, ent_m, approx_kl, clipfrac, avg_std = _calc_loss(
+                    agent, 
+                    b_obs[mb_indices], 
+                    b_critic_obs[mb_indices], 
+                    b_act[mb_indices], 
+                    b_logp[mb_indices], 
+                    b_adv[mb_indices], 
+                    b_ret[mb_indices], 
+                    b_val[mb_indices], 
+                    clip, 
+                    vf_coef, 
+                    vf_clip, 
+                    current_ent_coef
                 )
-                #torch.cuda.synchronize()
+
+                # The AMP and Backward pass routine in Eager Mode
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
+                scaler.step(opt)
+                scaler.update()
 
                 running_stats[0].add_(pg)
                 running_stats[1].add_(v_loss)
