@@ -28,6 +28,7 @@ class Environment:
     cars_int: wp.array
     car_dr: wp.array
     obs: wp.array
+    critic_obs: wp.array
     rew: wp.array
     done: wp.array
     lidar_buf: wp.array
@@ -90,11 +91,13 @@ class Environment:
         self.cars_int = wp.zeros((self.num_envs, 3), dtype=int, device=d)
         self.car_dr = wp.zeros((self.num_envs, 4), dtype=float, device=d)
         self.obs = wp.zeros((self.num_envs, OBS_DIM), dtype=float, device=d)
+        self.critic_obs = wp.zeros((self.num_envs, OBS_DIM + 5), dtype=float, device=d)
         self.rew = wp.zeros(self.num_envs, dtype=float, device=d)
         self.done = wp.zeros(self.num_envs, dtype=int, device=d)
 
         # Mirror permanent tensor views onto persistent memory footprints
         self.obs_buf = wp.to_torch(self.obs)
+        self.critic_obs_buf = wp.to_torch(self.critic_obs)
         self.rew_buf = wp.to_torch(self.rew)
         self.done_buf = wp.to_torch(self.done)
         self.cars_buf = wp.to_torch(self.cars)
@@ -180,7 +183,7 @@ class Environment:
         self.rew_buf.zero_()
         self.done_buf.zero_()
 
-    def step(self, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    def step(self, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
         self._launch(wp.from_torch(action.detach().contiguous(), dtype=wp.vec2))
         self._sanitize()
         
@@ -190,20 +193,21 @@ class Environment:
 
         return (
             self.obs_buf,
+            self.critic_obs_buf,
             self.rew_buf,
             self.term_buf,
             self.trunc_buf,
             self._empty_info,
         )
     
-    def reset(self) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    def reset(self) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
         self._step_counter.fill_(MAX_STEPS)
         self._launch(self._zero_act)
         self._sanitize()
         self._step_counter.zero_()
         self.rew_buf.zero_()
         self.done_buf.zero_()
-        return self.obs_buf, self._empty_info
+        return self.obs_buf, self.critic_obs_buf, self._empty_info
 
     def save_state(self) -> Dict[str, Any]:
         return {
@@ -227,7 +231,7 @@ class Environment:
             step_kernel,
             dim=self.num_envs,
             inputs=[
-                act, self.obs, self.rew, self.done, self.cars, self.cars_int, self.car_dr,
+                act, self.obs, self.critic_obs, self.rew, self.done, self.cars, self.cars_int, self.car_dr,
                 self.map_origin, self.map.res, self.dt_buf, self.lut_buf, self.centerline_buf,
                 self.n_cl, self.lidar_buf, int(seed),
             ],
@@ -238,5 +242,6 @@ class Environment:
     
     def _sanitize(self) -> None:
         torch.nan_to_num_(self.obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)
+        torch.nan_to_num_(self.critic_obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)
         torch.nan_to_num_(self.cars_buf, nan=0.0, posinf=0.0, neginf=0.0)
         torch.nan_to_num_(self.rew_buf, nan=0.0, posinf=0.0, neginf=0.0)

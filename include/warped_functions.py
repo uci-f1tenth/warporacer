@@ -128,6 +128,7 @@ def rk4_step(
 def step_kernel(
     actions: wp.array[wp.vec2],
     obs: wp.array2d[wp.float32],
+    critic_obs: wp.array2d[wp.float32],
     reward: wp.array[wp.float32],
     done: wp.array[wp.int32],
     cars: wp.array2d[wp.float32],
@@ -362,6 +363,17 @@ def step_kernel(
     cars[i, 4] = psi
     cars[i, 5] = psip
     cars[i, 6] = beta
+
+    # Populate the Critic's Privileged State
+    # (It gets everything the Actor gets, PLUS the ground truth)
+    for k in range(OBS_DIM):
+        critic_obs[i, k] = obs[i, k]
+        
+    critic_obs[i, OBS_DIM] = car_dr[i, 0]     # Ground Truth Friction
+    critic_obs[i, OBS_DIM + 1] = car_dr[i, 1] # Ground Truth Mass
+    critic_obs[i, OBS_DIM + 2] = x            # Global X
+    critic_obs[i, OBS_DIM + 3] = y            # Global Y
+    critic_obs[i, OBS_DIM + 4] = beta         # Exact Slip Angle
     
     cars_int[i, 0] = steps
     cars_int[i, 1] = new_wp

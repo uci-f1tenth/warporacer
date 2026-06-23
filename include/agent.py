@@ -69,38 +69,46 @@ class Agent(nn.Module):
     LOGSTD_MAX: float = -0.5
     HALF_LOG_TWO_PI: float = 0.9189385332046727
 
-    def __init__(self, obs_dim: int = OBS_DIM, act_dim: int = ACT_DIM, hidden: int = 256) -> None:
+    def __init__(self, obs_dim: int, critic_obs_dim: int, act_dim: int, hidden: int = 256) -> None:
         super().__init__()
+        
+        # 1. SWAP: Tanh() hidden activations replaced with SiLU() for better gradient flow
         self.actor: nn.Sequential = nn.Sequential(
             layer_init(nn.Linear(obs_dim, hidden)),
             nn.LayerNorm(hidden),
-            nn.Tanh(),
+            nn.SiLU(), 
             layer_init(nn.Linear(hidden, hidden)),
             nn.LayerNorm(hidden),
-            nn.Tanh(),
+            nn.SiLU(),
             layer_init(nn.Linear(hidden, hidden)),
             nn.LayerNorm(hidden),
-            nn.Tanh(),
+            nn.SiLU(),
             layer_init(nn.Linear(hidden, act_dim), std=0.01),
         )
+        
+        # 2. ASYMMETRIC CRITIC: Takes 'critic_obs_dim' which includes privileged environment data
         self.critic: nn.Sequential = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, hidden)),
+            layer_init(nn.Linear(critic_obs_dim, hidden)),
             nn.LayerNorm(hidden),
-            nn.Tanh(),
+            nn.SiLU(),
             layer_init(nn.Linear(hidden, hidden)),
             nn.LayerNorm(hidden),
-            nn.Tanh(),
+            nn.SiLU(),
             layer_init(nn.Linear(hidden, hidden)),
             nn.LayerNorm(hidden),
-            nn.Tanh(),
+            nn.SiLU(),
             layer_init(nn.Linear(hidden, 1), std=1.0),
         )
         self.log_std = nn.Parameter(torch.zeros(1, act_dim))
 
-    def value(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.critic(obs).squeeze(-1)
+    def value(self, critic_obs: torch.Tensor) -> torch.Tensor:
+        return self.critic(critic_obs).squeeze(-1)
 
-    def act_value(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Added critic_obs parameter. If None, it defaults to symmetric behavior.
+    def act_value(self, obs: torch.Tensor, critic_obs: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if critic_obs is None:
+            critic_obs = obs
+            
         mean: torch.Tensor = self.actor(obs)
         ls = self.LOGSTD_MIN + (self.LOGSTD_MAX - self.LOGSTD_MIN) * torch.sigmoid(self.log_std)
         std: torch.Tensor = ls.exp()
@@ -119,9 +127,9 @@ class Agent(nn.Module):
         # Use standard normal entropy as a proxy for exploration tracking
         entropy = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1)
         
-        return raw_action, action_squashed, log_prob, entropy, self.critic(obs).squeeze(-1)
+        return raw_action, action_squashed, log_prob, entropy, self.critic(critic_obs).squeeze(-1)
 
-    def evaluate(self, obs: torch.Tensor, raw_action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def evaluate(self, obs: torch.Tensor, critic_obs: torch.Tensor, raw_action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mean: torch.Tensor = self.actor(obs)
         ls = self.LOGSTD_MIN + (self.LOGSTD_MAX - self.LOGSTD_MIN) * torch.sigmoid(self.log_std)
         std: torch.Tensor = ls.exp()
@@ -133,10 +141,13 @@ class Agent(nn.Module):
         
         entropy = (0.5 + self.HALF_LOG_TWO_PI + ls).sum(-1)
         
-        return log_prob, entropy, self.critic(obs).squeeze(-1)
+        return log_prob, entropy, self.critic(critic_obs).squeeze(-1)
 
     def deterministic(self, obs: torch.Tensor) -> torch.Tensor:
-        return torch.clamp(self.actor(obs), -1.0, 1.0)
+        # 3. BUG FIX: Match the squashing logic!
+        # The actor outputs the pre-squashed mean. 
+        # Clamping it is mathematically incorrect if the environment expects a Tanh'd output.
+        return torch.tanh(self.actor(obs))
 
 
 class KLAdaptiveLR:
@@ -189,7 +200,7 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
             py = m.h - 1 - (pts[:, 1] - m.oy) / m.res
             return np.column_stack((px, py)).astype(np.int32)
 
-        raw, _ = env.reset()
+        raw, raw_critic, _ = env.reset()
         obs: torch.Tensor = process_observations(raw, obs_rms) if obs_rms else raw
         out_path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -249,6 +260,7 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
 def _train_step_compiled(
     agent: Agent,
     b_obs_idx: torch.Tensor,
+    b_critic_obs_idx: torch.Tensor,
     b_act_idx: torch.Tensor,
     b_logp_idx: torch.Tensor,
     b_adv_idx: torch.Tensor,
@@ -260,7 +272,7 @@ def _train_step_compiled(
     ent_coef: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-        new_logp, ent, new_val = agent.evaluate(b_obs_idx, b_act_idx)
+        new_logp, ent, new_val = agent.evaluate(b_obs_idx, b_critic_obs_idx, b_act_idx)
         
         # Cast to float32 to prevent exponentiation overflow/underflow in half-precision
         logratio: torch.Tensor = new_logp.float() - b_logp_idx.float()
@@ -393,6 +405,7 @@ def train(
 
     obs_b: torch.Tensor = torch.zeros((rollouts, N, OBS_DIM), device=device)
     raw_obs_b: torch.Tensor = torch.zeros((rollouts, N, OBS_DIM), device=device)
+    critic_obs_b: torch.Tensor = torch.zeros((rollouts, N, OBS_DIM + 5), device=device)
     act_b: torch.Tensor = torch.zeros((rollouts, N, ACT_DIM), device=device)
     logp_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
     rew_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
@@ -400,7 +413,7 @@ def train(
     term_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
     val_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
 
-    raw, _ = env.reset()
+    raw, raw_critic, _ = env.reset()
     obs_rms.update(raw[..., 3:]) 
     obs: torch.Tensor = process_observations(raw, obs_rms)
     ep_ret: torch.Tensor = torch.zeros(N, device=device)
@@ -419,12 +432,13 @@ def train(
         with torch.no_grad():
             for t in range(rollouts):
                 obs_b[t] = obs
-                act_raw, act_clamped, logp, _, val = agent.act_value(obs)
+                critic_obs_b[t] = raw_critic
+                act_raw, act_clamped, logp, _, val = agent.act_value(obs, critic_obs=raw_critic)
                 act_b[t] = act_raw 
                 logp_b[t] = logp
                 val_b[t] = val
 
-                raw, raw_rew, term, trunc, _ = env.step(act_clamped) 
+                raw, raw_critic, raw_rew, term, trunc, _ = env.step(act_clamped) 
                 raw_obs_b[t] = raw
 
                 done: torch.Tensor = (term | trunc).float()
@@ -448,7 +462,7 @@ def train(
                 if env.vs and t % 4 == 0:
                     env.vs.render()
                 
-            next_val: torch.Tensor = agent.value(obs)
+            next_val: torch.Tensor = agent.value(raw_critic)
 
         obs_rms.update(raw_obs_b[..., 3:])
         obs = process_observations(raw, obs_rms)
@@ -464,6 +478,8 @@ def train(
         b_adv: torch.Tensor = adv_b.reshape(B)
         b_ret: torch.Tensor = ret_b.reshape(B)
         b_val: torch.Tensor = val_b.reshape(B)
+
+        b_critic_obs: torch.Tensor = critic_obs_b.reshape(B, critic_obs_b.shape[-1])
 
         agent.train()
         
@@ -485,7 +501,7 @@ def train(
                 opt.zero_grad(set_to_none=True)
                 
                 loss, pg, v_loss, ent_m, approx_kl, clipfrac = _train_step_compiled(
-                    agent, b_obs[idx], b_act[idx], b_logp[idx], 
+                    agent, b_obs[idx], b_critic_obs[idx], b_act[idx], b_logp[idx], 
                     b_adv[idx], b_ret[idx], b_val[idx], clip, vf_coef, vf_clip, 
                     current_ent_coef
                 )

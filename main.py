@@ -127,7 +127,7 @@ def main(
                     
             # Safe cross-OS device mapping using Warp's native naming properties
             torch_device_str = f"cuda:{target_device.ordinal}" if target_device.is_cuda else "cpu"
-            raw_agent = Agent(obs_dim=OBS_DIM).to(torch_device_str)
+            raw_agent = Agent(obs_dim=OBS_DIM, critic_obs_dim=(OBS_DIM+5), act_dim=ACT_DIM).to(torch_device_str)
             
             # 2. OPTIMIZATION: Wrap with reduce-overhead to align optimization speeds with your RTX 2070
             agent = torch.compile(raw_agent, mode="reduce-overhead")

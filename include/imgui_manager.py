@@ -82,6 +82,10 @@ class ImGuiManager:
             if imgui.begin_tab_item("Telemetry")[0]:
                 self._draw_telemetry_tab()
                 imgui.end_tab_item()
+
+            # Need to add a save/pause/resume model training feature
+            # Need to add inference mode
+            # Need to add disable/enable live viewer to increase training SPS
                 
             imgui.end_tab_bar()
 
