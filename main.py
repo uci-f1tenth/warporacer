@@ -58,7 +58,9 @@ DR_FRAC = 0.15
 
 PROGRESS_SCALE = 100.0
 PROGRESS_V_COEF = 10.0
-TERM_PENALTY = 25.0
+TERM_PENALTY = 100.0
+WALL_MARGIN = 0.20
+WALL_PROX_COEF = 0.2
 
 NUM_LIDAR = 108
 LIDAR_FOV = np.radians(270.0)
@@ -293,8 +295,14 @@ def step_kernel(
         * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
     )
 
-    term_pen = wp.where(term, -TERM_PENALTY, 0.0)
-    reward[i] = progress + term_pen
+    # Dense wall-proximity nudge: quadratic ramp inside WALL_MARGIN of the wall,
+    # speed-scaled so hugging a wall fast costs most -> teaches margin + slowing
+    # near walls. Strictly a penalty (can't be farmed). Crash step pays only the
+    # sparse TERM_PENALTY (no progress refund), so a floored corner isn't cheap.
+    clearance = edt_val - CAR_HALF_DIAG
+    prox_f = wp.max((WALL_MARGIN - clearance) / WALL_MARGIN, 0.0)
+    prox_pen = WALL_PROX_COEF * prox_f * prox_f * (1.0 + wp.max(v, 0.0) / PROGRESS_V_COEF)
+    reward[i] = wp.where(term, -TERM_PENALTY, progress - prox_pen)
 
     if term:
         done[i] = DONE_TERMINATED
