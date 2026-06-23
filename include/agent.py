@@ -224,7 +224,6 @@ def _full_train_step_compiled(
     )
 
 
-@torch.compile
 def compute_gae(
     rew_b: torch.Tensor,
     val_b: torch.Tensor,
@@ -235,19 +234,24 @@ def compute_gae(
     gae_lambda: float,
     rollouts: int,
 ) -> torch.Tensor:
-    """Backpropagates multi-step Generalized Advantage Estimations from rollout horizons."""
-    adv_b: torch.Tensor = torch.zeros_like(rew_b)
-    last: torch.Tensor = torch.zeros_like(next_val)
+    return _compute_gae_backend(rew_b, val_b, next_val, term_b, done_b, gamma, gae_lambda, rollouts).clone()
+
+# Move the actual compilation to an internal backend function
+@torch.compile(mode="reduce-overhead")
+def _compute_gae_backend(rew_b, val_b, next_val, term_b, done_b, gamma, gae_lambda, rollouts):
+    next_values = torch.cat([val_b[1:], next_val.unsqueeze(0)], dim=0)
+    nondone = 1.0 - done_b
+    deltas = rew_b + gamma * next_values * nondone - val_b
     
-    for t in range(rollouts - 1, -1, -1):
-        nondone: torch.Tensor = 1.0 - done_b[t]
-        next_v: torch.Tensor = next_val if t == rollouts - 1 else val_b[t + 1]
+    adv_list = []
+    last = torch.zeros_like(next_val)
+    discount = gamma * gae_lambda
+    
+    for t in reversed(range(rollouts)):
+        last = deltas[t] + discount * nondone[t] * last
+        adv_list.append(last)
         
-        delta: torch.Tensor = rew_b[t] + gamma * next_v * nondone - val_b[t]
-        last = delta + gamma * gae_lambda * nondone * last
-        adv_b[t] = last
-        
-    return adv_b
+    return torch.stack(adv_list[::-1], dim=0)
 
 
 class RolloutBuffers:
