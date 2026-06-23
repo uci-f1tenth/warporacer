@@ -161,43 +161,54 @@ def process_observations(raw_tensor: torch.Tensor, rms_module: RunningMeanStd) -
 @torch.compile(mode="reduce-overhead")
 def _train_step_compiled(
     agent: Agent,
-    b_obs_idx: torch.Tensor,
-    b_critic_obs_idx: torch.Tensor,
-    b_act_idx: torch.Tensor,
-    b_logp_idx: torch.Tensor,
-    b_adv_idx: torch.Tensor,
-    b_ret_idx: torch.Tensor,
-    b_val_idx: torch.Tensor,
+    opt: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    max_grad_norm: float,
+    obs: torch.Tensor,
+    critic_obs: torch.Tensor,
+    act: torch.Tensor,
+    logp: torch.Tensor,
+    adv: torch.Tensor,
+    ret: torch.Tensor,
+    val: torch.Tensor,
     clip: float,
     vf_coef: float,
     vf_clip: float,
     ent_coef: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Executes a single compiled policy loss calculation pass under half-precision settings."""
+):
+    """Pure mathematical processing step. Zero loops, zero graph breaks."""
+    opt.zero_grad(set_to_none=True)
+    
     with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-        new_logp, ent, new_val = agent.evaluate(b_obs_idx, b_critic_obs_idx, b_act_idx)
+        new_logp, ent, new_val = agent.evaluate(obs, critic_obs, act)
         
-        logratio: torch.Tensor = new_logp.float() - b_logp_idx.float()
-        ratio: torch.Tensor = logratio.exp()
+        logratio = new_logp.float() - logp.float()
+        ratio = logratio.exp()
         
-        approx_kl: torch.Tensor = ((ratio - 1.0) - logratio).mean()
-        clipfrac: torch.Tensor = ((ratio - 1.0).abs() > clip).float().mean()
+        approx_kl = ((ratio - 1.0) - logratio).mean()
+        clipfrac = ((ratio - 1.0).abs() > clip).float().mean()
         
-        adv_mb: torch.Tensor = (b_adv_idx - b_adv_idx.mean()) / (b_adv_idx.std() + 1e-8)
-        s1: torch.Tensor = ratio * adv_mb
-        s2: torch.Tensor = ratio.clamp(1 - clip, 1 + clip) * adv_mb
-        pg: torch.Tensor = -torch.min(s1, s2).mean()
+        adv_mb = (adv - adv.mean()) / (adv.std() + 1e-8)
+        s1 = ratio * adv_mb
+        s2 = ratio.clamp(1 - clip, 1 + clip) * adv_mb
+        pg = -torch.min(s1, s2).mean()
         
-        v_err: torch.Tensor = new_val.float() - b_ret_idx.float()
+        v_err = new_val.float() - ret.float()
         if vf_clip > 0:
-            v_clipped: torch.Tensor = b_val_idx.float() + (new_val.float() - b_val_idx.float()).clamp(-vf_clip, vf_clip)
-            v_loss: torch.Tensor = 0.5 * torch.max(v_err.square(), (v_clipped - b_ret_idx).square()).mean()
+            v_clipped = val.float() + (new_val.float() - val.float()).clamp(-vf_clip, vf_clip)
+            v_loss = 0.5 * torch.max(v_err.square(), (v_clipped - ret).square()).mean()
         else:
             v_loss = 0.5 * v_err.square().mean()
             
-        loss: torch.Tensor = pg + vf_coef * v_loss - ent_coef * ent.mean()
+        loss = pg + vf_coef * v_loss - ent_coef * ent.mean()
         
-    return loss, pg, v_loss, ent.mean(), approx_kl, clipfrac
+    scaler.scale(loss).backward()
+    scaler.unscale_(opt)
+    torch.nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
+    scaler.step(opt)
+    scaler.update()
+    
+    return pg.detach(), v_loss.detach(), ent.mean().detach(), approx_kl.detach(), clipfrac.detach()
 
 
 @torch.compile
@@ -382,6 +393,48 @@ def record_rollout(env: Environment, agent: Agent, num_steps: int, out_path: Pat
         env.restore_state(snap)
         agent.train(was_training)
 
+@torch.compile(mode="reduce-overhead")
+def _compute_loss_compiled(
+    agent: Agent,
+    obs: torch.Tensor,
+    critic_obs: torch.Tensor,
+    act: torch.Tensor,
+    logp: torch.Tensor,
+    adv: torch.Tensor,
+    ret: torch.Tensor,
+    val: torch.Tensor,
+    clip: float,
+    vf_coef: float,
+    vf_clip: float,
+    ent_coef: float,
+):
+    """Pure mathematical graph. Zero graph breaks, zero dynamic shape confusion."""
+    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+        new_logp, ent, new_val = agent.evaluate(obs, critic_obs, act)
+        
+        logratio = new_logp.float() - logp.float()
+        ratio = logratio.exp()
+        
+        approx_kl = ((ratio - 1.0) - logratio).mean()
+        clipfrac = ((ratio - 1.0).abs() > clip).float().mean()
+        
+        adv_mb = (adv - adv.mean()) / (adv.std() + 1e-8)
+        s1 = ratio * adv_mb
+        s2 = ratio.clamp(1 - clip, 1 + clip) * adv_mb
+        pg = -torch.min(s1, s2).mean()
+        
+        v_err = new_val.float() - ret.float()
+        if vf_clip > 0:
+            v_clipped = val.float() + (new_val.float() - val.float()).clamp(-vf_clip, vf_clip)
+            v_loss = 0.5 * torch.max(v_err.square(), (v_clipped - ret).square()).mean()
+        else:
+            v_loss = 0.5 * v_err.square().mean()
+            
+        loss = pg + vf_coef * v_loss - ent_coef * ent.mean()
+        
+    # Return everything cleanly
+    return loss, pg.detach(), v_loss.detach(), ent.mean().detach(), approx_kl.detach(), clipfrac.detach()
+
 @profile
 def train(
     env: Environment,
@@ -486,59 +539,82 @@ def train(
         ret_b: torch.Tensor = adv_b + buffers.val_b
         global_step += B
 
-        b_obs = buffers.obs_b.reshape(B, OBS_DIM)
-        b_act = buffers.act_b.reshape(B, ACT_DIM)
-        b_logp = buffers.logp_b.reshape(B)
-        b_adv = adv_b.reshape(B)
-        b_ret = ret_b.reshape(B)
-        b_val = buffers.val_b.reshape(B)
-        b_critic_obs = buffers.critic_obs_b.reshape(B, buffers.critic_obs_b.shape[-1])
+        # 1. Enforce initial contiguous layout
+        b_obs = buffers.obs_b.reshape(B, OBS_DIM).contiguous()
+        b_critic_obs = buffers.critic_obs_b.reshape(B, buffers.critic_obs_b.shape[-1]).contiguous()
+        b_act = buffers.act_b.reshape(B, ACT_DIM).contiguous()
+        b_logp = buffers.logp_b.reshape(B).contiguous()
+        b_adv = adv_b.reshape(B).contiguous()
+        b_ret = ret_b.reshape(B).contiguous()
+        b_val = buffers.val_b.reshape(B).contiguous()
 
         agent.train()
-        tot_pg, tot_v, tot_ent, tot_kl, tot_clip = 0.0, 0.0, 0.0, 0.0, 0.0
-        n_upd: int = 0
+        running_stats = torch.zeros(5, device=device)
+        n_upd = 0
         current_ent_coef = max(0.001, ent_coef * (1.0 - (it / iterations)))
 
         for epoch in range(current_epochs):  
-            perm = permutation_indices[torch.randperm(B, device=device)]
-            epoch_kl = 0.0
-            minibatches_run = 0
+            # Fast GPU-side full dataset shuffling
+            perm = torch.randperm(B, device=device)
             
+            # Reorder all data contiguously ONCE per epoch
+            shuffled_obs = b_obs[perm]
+            shuffled_critic_obs = b_critic_obs[perm]
+            shuffled_act = b_act[perm]
+            shuffled_logp = b_logp[perm]
+            shuffled_adv = b_adv[perm]
+            shuffled_ret = b_ret[perm]
+            shuffled_val = b_val[perm]
+            
+            # Sequential extraction avoids graph re-compilations completely
             for start in range(0, B, mb):
-                idx = perm[start : start + mb]
-                if idx.shape[0] != mb: 
-                    continue 
+                end = start + mb
+                if end > B:
+                    continue
+
+                # Ensure CUDA graph treats this step as a clean execution boundary
+                torch.compiler.cudagraph_mark_step_begin()
 
                 opt.zero_grad(set_to_none=True)
-                loss, pg, v_loss, ent_m, approx_kl, clipfrac = _train_step_compiled(
-                    agent, b_obs[idx], b_critic_obs[idx], b_act[idx], b_logp[idx], 
-                    b_adv[idx], b_ret[idx], b_val[idx], clip, vf_coef, vf_clip, 
-                    current_ent_coef
+
+                # Force exact static shapes using .view() to guarantee graph reuse
+                loss, pg, v_loss, ent_m, approx_kl, clipfrac = _compute_loss_compiled(
+                    agent,
+                    shuffled_obs[start:end].view(mb, OBS_DIM), 
+                    shuffled_critic_obs[start:end].view(mb, b_critic_obs.shape[-1]), 
+                    shuffled_act[start:end].view(mb, ACT_DIM), 
+                    shuffled_logp[start:end].view(mb), 
+                    shuffled_adv[start:end].view(mb), 
+                    shuffled_ret[start:end].view(mb), 
+                    shuffled_val[start:end].view(mb), 
+                    clip, vf_coef, vf_clip, current_ent_coef
                 )
-                
+
+                # Run optimization in standard eager mode (no graph overhead penalties)
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
                 scaler.step(opt)
                 scaler.update()
 
-                tot_pg += pg.item()
-                tot_v += v_loss.item()
-                tot_ent += ent_m.item()
-                tot_kl += approx_kl.item()
-                tot_clip += clipfrac.item()
+                # Fast GPU additions
+                running_stats[0].add_(pg)
+                running_stats[1].add_(v_loss)
+                running_stats[2].add_(ent_m)
+                running_stats[3].add_(approx_kl)
+                running_stats[4].add_(clipfrac)
                 n_upd += 1
                 
-                epoch_kl += approx_kl.item()
-                minibatches_run += 1
-            
-            if minibatches_run > 0 and (epoch_kl / minibatches_run) > target_kl * 2.0:
-                break
-                
+        # Move metrics to CPU all at once at the very end
         denom = max(n_upd, 1)
-        avg_pg, avg_v, avg_ent, final_kl, avg_clip = tot_pg/denom, tot_v/denom, tot_ent/denom, tot_kl/denom, tot_clip/denom
-        sched.step()
+        stats_cpu = (running_stats / denom).to("cpu", non_blocking=True)
         
+        avg_pg, avg_v, avg_ent, final_kl, avg_clip = (
+            float(stats_cpu[0]), float(stats_cpu[1]), float(stats_cpu[2]), float(stats_cpu[3]), float(stats_cpu[4])
+        )
+        sched.step()
+
+        # Dynamic epoch scaling remains safe out here
         if final_kl > 1.5 * target_kl:
             current_epochs = max(1, current_epochs - 1)
         elif final_kl < target_kl / 1.5:
