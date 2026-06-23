@@ -66,8 +66,15 @@ TERM_PENALTY = (
 # speed-scaled (mirrors progress) so hugging a wall *fast* costs the most, which
 # teaches the car to slow as clearance drops. Strictly a penalty (never paid as
 # reward) so it can't be farmed the way decoupling v_along to plain v was.
-WALL_MARGIN = 0.35  # m of clearance beyond the car half-diagonal where the penalty starts
-WALL_PROX_COEF = 1.0  # penalty at zero clearance; quadratic ramp from 0 at WALL_MARGIN
+# Kept deliberately low/narrow so this stays a gentle nudge. At COEF=1.0/MARGIN
+# =0.35 the at-wall penalty was ~10-40x the per-step progress, so in a tight turn
+# (where low clearance is unavoidable) the policy froze/hesitated to dodge a cost
+# it couldn't escape. Now the band is narrow (only bites very close to contact)
+# and the peak is a few x progress — a real nudge, not a wall the car stalls at.
+# The hard crash deterrent stays TERM_PENALTY; this just discourages needlessly
+# grazing a wall.
+WALL_MARGIN = 0.20  # m of clearance beyond the car half-diagonal where the penalty starts
+WALL_PROX_COEF = 0.2  # penalty at zero clearance; quadratic ramp from 0 at WALL_MARGIN
 
 NUM_LIDAR = 108
 LIDAR_FOV = np.radians(270.0)
