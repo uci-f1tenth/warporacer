@@ -56,6 +56,16 @@ TERM_PENALTY = (
     25.0  # crash cost; must dominate the pre-crash progress a floored corner can farm
 )
 
+# Dense wall-proximity shaping. The crash penalty above is SPARSE — the policy
+# only learns about a wall at the instant it hits one, which is too late to
+# teach margin. This penalty grows as the car's clearance to the nearest wall
+# shrinks inside WALL_MARGIN, so the policy keeps a buffer instead. It's
+# speed-scaled (mirrors progress) so hugging a wall *fast* costs the most, which
+# teaches the car to slow as clearance drops. Strictly a penalty (never paid as
+# reward) so it can't be farmed the way decoupling v_along to plain v was.
+WALL_MARGIN = 0.25  # m of clearance beyond the car half-diagonal where the penalty starts
+WALL_PROX_COEF = 0.5  # penalty at zero clearance; quadratic ramp from 0 at WALL_MARGIN
+
 NUM_LIDAR = 108
 LIDAR_FOV = np.radians(270.0)
 LIDAR_RANGE = 20.0
@@ -273,9 +283,20 @@ def step_kernel(
         * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
     )
 
+    # Dense wall-proximity penalty: active only inside the WALL_MARGIN clearance
+    # band, ramping quadratically (gentle at the edge, steep near the wall) and
+    # scaled by speed so going fast near a wall costs the most. clearance is >= 0
+    # on every non-crash step (clearance < 0 is exactly the `term` condition).
+    clearance = edt_val - CAR_HALF_DIAG
+    prox_f = wp.max((WALL_MARGIN - clearance) / WALL_MARGIN, 0.0)
+    prox_pen = (
+        WALL_PROX_COEF * prox_f * prox_f * (1.0 + wp.max(v, 0.0) / PROGRESS_V_COEF)
+    )
+
     # On a crash, pay ONLY the terminal penalty — no speed-progress refund — so
-    # flooring a corner into the wall can never net out cheaper than slowing.
-    reward[i] = wp.where(term, -TERM_PENALTY, progress)
+    # flooring a corner into the wall can never net out cheaper than slowing. On
+    # every other step, progress minus the wall-proximity penalty.
+    reward[i] = wp.where(term, -TERM_PENALTY, progress - prox_pen)
 
     if term:
         done[i] = DONE_TERMINATED
