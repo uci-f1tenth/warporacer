@@ -602,15 +602,15 @@ def train(
                     print(f"[WandB] Rollout video failed: {e}")
         
         if switch_map_iter > 0 and (it + 1) % switch_map_iter == 0:
-            # Replaces old cycle_next_map call
-            env._shuffle_and_assign_maps()
+            # 1. Hot-swap the VRAM map subset AND snap cars to the new tracks
+            env.trigger_map_rotation()
             
-            # Force an explicit step-kernel pass with zero-actions to populate 
+            # 2. Force an explicit step-kernel pass with zero-actions to populate 
             # the observation tensors with the new track data layout immediately
             env._launch(env._zero_act)
             env._sanitize()
             
-            # Re-synchronize state representation with the new layout allocation
+            # 3. Re-synchronize state representation with the new layout allocation
             raw = env.obs_buf
             obs_rms.update(raw[..., 3:])
             obs = process_observations(raw, obs_rms)

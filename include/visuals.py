@@ -24,9 +24,8 @@ class Visuals:
     Acts as a reactive viewport interface that tracks, renders, and captures user inputs
     for the underlying physics structures contained within the simulation environment.
     """
-    def __init__(self, env: "Environment", map_layout: Map):
+    def __init__(self, env: "Environment"):
         self.env = env
-        self.map = map_layout
     
         # Log hardware device mapping states to verify hardware acceleration context
         print(f"Warp Device: {wp.get_device().name}")
@@ -61,18 +60,21 @@ class Visuals:
         self.initialized_all_agents = False
         self.lidar_hit_points = wp.zeros(NUM_LIDAR, dtype=wp.vec3, device=self.env.device)
 
-        # Trigger structural registration configurations for the baseline track map layout
-        self.switch_track_layout(self.map)
+        # Replace self.switch_track_layout(self.map) with this:
+        self.refresh_maps()
 
-    def switch_track_layout(self, new_map: Map) -> None:
-        """Flushes and re-registers map geometries directly inside the running window."""
-        self.map = new_map
+        # Force the starting viewport to hover directly over the center of your packed layout
+        center_coord = self.env.floor_square_size / 2.0
+        self.renderer.camera_pos = [center_coord, 1, center_coord] # X Z instead of XY cuz nvidia weird
+
+    def refresh_maps(self) -> None:
+        """Flushes and re-registers all active map geometries directly inside the running window."""
         self.initialized_all_agents = False
         
         # Clear existing primitive shapes and invalidate active GPU memory bindings
         self.renderer.clear()
         
-        # Regenerate fresh structural static layers onto the new layout matrix specifications
+        # Regenerate fresh structural static layers using the environment's active map list
         self._setup_map()
         
         # Pre-allocate zero-index components for independent single-car validation
@@ -136,11 +138,6 @@ class Visuals:
         for idx, single_map in enumerate(self.env.maps):
             self._setup_single_map_walls(idx, single_map)
             self._setup_single_map_centerline(idx, single_map)
-
-        # Force the starting viewport to hover directly over the center of your packed layout
-        center_coord = self.env.floor_square_size / 2.0
-        
-        self.renderer.camera_pos = [center_coord, 1, center_coord] # X Z instead of XY cuz nvidia weird
 
     def _setup_single_map_walls(self, idx: int, m: Map) -> None:
         """Extracts track boundaries to plot wall point clouds using their exact 2D grid coordinates."""

@@ -62,26 +62,55 @@ class Environment:
     look_step: int
     _call: int
 
-    def __init__(self, maps_dir: Path, num_envs: int, seed: int, target_device: wp.Device, live_viewer: bool, switch_map_iter: int = 1000):
+    def __init__(self, maps_dir: Path, num_envs: int, seed: int, target_device: wp.Device, live_viewer: bool, max_active_maps: int = 4):
         self.num_envs = num_envs
         self.seed = seed
         self.seed_base = seed  
         self._call = 0         
         self.device = target_device
-        self.switch_map_iter = switch_map_iter
         
+        self.max_active_maps = max_active_maps
         self.floor_square_size = 0.0
         self.available_maps = []
+        
+        # 1. Define vs as None BEFORE triggering any rotations
+        self.vs = None 
+        
         self._initialize_map_library(maps_dir)
-        
-        # Explicit allocations done only ONCE
         self._allocate_persistent_buffers()
-        self._initialize_all_maps()
         
-        self.vs = None
+        # 2. Trigger the first map load (will safely pass the 'if self.vs is not None' check now)
+        self.trigger_map_rotation()
+        
+        # 3. Initialize the actual visualizer if requested
+        # (Make sure you removed the redundant 'self.vs = None' that used to be right above this)
         if live_viewer:
             from include.visuals import Visuals
-            self.vs = Visuals(self, self.maps[0])
+            self.vs = Visuals(self)
+            
+    def trigger_map_rotation(self) -> None:
+        """Called externally by the training loop to swap the active map pool."""
+        # Step the internal seed forward so we don't pick the same maps forever
+        self._call += 1 
+        rng = np.random.default_rng(self.seed + self._call)
+        
+        # Determine how many maps to load (cannot exceed available maps)
+        sample_size = min(self.max_active_maps, len(self.available_maps))
+        
+        # Sample unique map paths
+        chosen_paths = rng.choice(self.available_maps, size=sample_size, replace=False)
+        
+        # Parse only the chosen subset into memory
+        self.maps = [Map(p) for p in chosen_paths]
+        self.num_maps = len(self.maps)
+        
+        # Rebuild GPU buffers for the new subset and snap agents to them
+        self._initialize_active_maps()
+        self._shuffle_and_assign_maps()
+
+        # Add this to the very bottom:
+        if self.vs is not None:
+            self.vs.refresh_maps()
 
     def _initialize_map_library(self, maps_dir: Path) -> None:
         resolved_target = Path(maps_dir).resolve()
@@ -123,13 +152,11 @@ class Environment:
         self._zero_act = wp.zeros(self.num_envs, dtype=wp.vec2, device=d)
         self.env_map_ids = wp.zeros(self.num_envs, dtype=int, device=d)
 
-    def _initialize_all_maps(self) -> None:
-        """Pads and bakes all map structures into static GPU memory footprints once using a square-growing MaxRects algorithm."""
+    def _initialize_active_maps(self) -> None:
+        """Pads and bakes the CURRENT ACTIVE subset of map structures into static GPU memory."""
         d = self.device
-        self.maps = [Map(p) for p in self.available_maps]
-        self.num_maps = len(self.maps)
         
-        # Identify bounding constraint limits across all tracks
+        # Identify bounding constraint limits across active tracks
         max_shape_0 = max(m.dt.T.shape[0] for m in self.maps)
         max_shape_1 = max(m.dt.T.shape[1] for m in self.maps)
         max_n_cl = max(len(m.centerline) for m in self.maps)
@@ -273,8 +300,6 @@ class Environment:
         self.maps_origin = wp.array(origins_list, dtype=wp.vec2, device=d)
         self.maps_res = wp.array(res_list, dtype=float, device=d)
         self.maps_look_step = wp.array(look_step_list, dtype=int, device=d)
-        
-        self._shuffle_and_assign_maps()
 
     def _shuffle_and_assign_maps(self) -> None:
         """Distributes vector batches across track profiles and switches start configurations."""
@@ -314,8 +339,7 @@ class Environment:
         torch.eq(self.done_buf, DONE_TERMINATED, out=self.term_buf)
         torch.eq(self.done_buf, DONE_TRUNCATED, out=self.trunc_buf)
 
-        if self.switch_map_iter > 0 and self._call % self.switch_map_iter == 0:
-            self._shuffle_and_assign_maps()
+        # Removed internal self.switch_map_iter check
 
         return (
             self.obs_buf, self.critic_obs_buf, self.rew_buf,
