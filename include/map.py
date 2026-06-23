@@ -142,12 +142,7 @@ class Map:
         """Extracts continuous optimal circuit centerlines using graph heuristics."""
         
         # 1. Faster Skeletonization (Try OpenCV C++ Thinning, fallback to skimage)
-        try:
-            free_uint8 = (self.free * 255).astype(np.uint8)
-            skel = cv2.ximgproc.thinning(free_uint8, thinningType=cv2.ximgproc.THINNING_GUOHALL) > 0
-        except (AttributeError, ImportError):
-            from skimage.morphology import skeletonize
-            skel = skeletonize(self.free)
+        skel = skeletonize(self.free)
 
         pts = np.argwhere(skel)
         num_nodes = len(pts)
@@ -250,16 +245,20 @@ class Map:
         min_clearance_px = max(2.0, physical_clearance_limit / self.res)
         penalty_scale = 8.0
 
-        d_row, d_col, d_weight = [], [], []
-        for u in main_comp_indices:
-            for v, dist in adj[u].items():
-                if in_main_component[v]:
-                    clr = clearances[v]
-                    if clr >= min_clearance_px:
-                        weight = dist + (penalty_scale / (clr + 1e-3))
-                        d_row.append(u)
-                        d_col.append(v)
-                        d_weight.append(weight)
+        # Use a list comprehension to build the edges directly from the healed adjacency dict.
+        # This bypasses the heavy overhead of repeatedly calling .append() in Python.
+        edges = [
+            (u, v, dist + (penalty_scale / (clearances[v] + 1e-3)))
+            for u in main_comp_indices
+            for v, dist in adj[u].items()
+            if in_main_component[v] and clearances[v] >= min_clearance_px
+        ]
+
+        if not edges:
+            raise RuntimeError("Routing disconnected: No valid edges after clearance filtering.")
+
+        # Unpack the list of tuples directly into arrays
+        d_row, d_col, d_weight = zip(*edges)
 
         # 8. Route forward to furthest point
         dijkstra_graph = csr_matrix((d_weight, (d_row, d_col)), shape=(num_nodes, num_nodes))

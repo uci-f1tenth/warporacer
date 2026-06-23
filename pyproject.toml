@@ -11,6 +11,7 @@ dependencies = [
     "line-profiler>=5.0.2",
     "matplotlib>=3.10.9",
     "ninja>=1.11.1.2",            # Fuses compilation and smooths multi-platform TorchInductor tasks
+    "numba>=0.65.1",
     "numpy>=2.4.4",
     "opencv-contrib-python>=4.13.0.92",
     "opencv-python>=4.13.0.92",
