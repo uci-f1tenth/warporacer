@@ -341,19 +341,30 @@ def train(
     N: int = env.num_envs
     
     # -------------------------------------------------------------------------
-    # PARAMETER & HYPERPARAMETER TELEMETRY
+    # STATIC BATCH CALCULATIONS & ALLOCATIONS
     # -------------------------------------------------------------------------
+    B: int = rollouts * N
+    TARGET_MINIBATCH_SIZE = 16384 * 4
+    calculated_minibatches = max(1, B // TARGET_MINIBATCH_SIZE)
+    mb: int = B // calculated_minibatches
+    permutation_indices = torch.arange(B, device=device) # Pre-allocated for the loop
+    
     total_params = sum(p.numel() for p in agent.parameters())
     trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
-    total_batch_size = rollouts * N
     
+    # -------------------------------------------------------------------------
+    # PARAMETER & HYPERPARAMETER TELEMETRY
+    # -------------------------------------------------------------------------
     print("=" * 80)
     print(f"[{'TRAINING PIPELINE INITIALIZATION':^74}]")
     print("=" * 80)
     print(f" -> Compute Device      : {device}")
     print(f" -> Parallel Envs (N)   : {N:,}")
     print(f" -> Rollout Steps (T)   : {rollouts}")
-    print(f" -> Total Batch Size (B): {total_batch_size:,} steps/iteration")
+    print(f" -> Total Batch Size (B): {B:,} steps/iteration")
+    print(f" -> Target MB Size      : {TARGET_MINIBATCH_SIZE:,}")
+    print(f" -> Actual MB Size (mb) : {mb:,}")
+    print(f" -> Minibatches / Epoch : {calculated_minibatches}")
     print(f" -> Optimization Epochs : {epochs}")
     print(f" -> Base Learning Rate  : {lr:<10} | Target KL Threshold: {target_kl}")
     print(f" -> GAE Gamma           : {gamma:<10} | GAE Lambda        : {gae_lambda}")
@@ -366,12 +377,9 @@ def train(
     # -------------------------------------------------------------------------
 
     opt: torch.optim.Optimizer = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5, fused=True)
-    
-    # Drop base optimizer LR down slightly for smoother high-batch step mechanics
     for pg in opt.param_groups:
         pg["lr"] = lr
 
-    # Cosine annealing that safely floors at 4e-5
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt,
         T_max=iterations,
@@ -381,7 +389,6 @@ def train(
     sensory_dim = OBS_DIM - 3
     obs_rms: RunningMeanStd = RunningMeanStd((sensory_dim,), device)
     ret_rms: ReturnNormalizer = ReturnNormalizer(N, gamma, device)
-
     scaler: torch.amp.GradScaler = torch.amp.GradScaler("cuda")
 
     obs_b: torch.Tensor = torch.zeros((rollouts, N, OBS_DIM), device=device)
@@ -411,14 +418,13 @@ def train(
         agent.eval()
         with torch.no_grad():
             for t in range(rollouts):
-                # Inside your data generation loop:
                 obs_b[t] = obs
                 act_raw, act_clamped, logp, _, val = agent.act_value(obs)
-                act_b[t] = act_raw # Store the raw action for mathematical consistency during training
+                act_b[t] = act_raw 
                 logp_b[t] = logp
                 val_b[t] = val
 
-                raw, raw_rew, term, trunc, _ = env.step(act_clamped) # Step the environment with the clamped action
+                raw, raw_rew, term, trunc, _ = env.step(act_clamped) 
                 raw_obs_b[t] = raw
 
                 done: torch.Tensor = (term | trunc).float()
@@ -445,18 +451,12 @@ def train(
             next_val: torch.Tensor = agent.value(obs)
 
         obs_rms.update(raw_obs_b[..., 3:])
-        # Re-normalize the trailing state using the fresh statistics before the next iteration
         obs = process_observations(raw, obs_rms)
 
         adv_b: torch.Tensor = compute_gae(rew_b, val_b, next_val, term_b, done_b, gamma, gae_lambda, rollouts)
         ret_b: torch.Tensor = adv_b + val_b
         
-        B: int = rollouts * N
         global_step += B
-
-        TARGET_MINIBATCH_SIZE = 16384 * 4
-        calculated_minibatches = max(1, B // TARGET_MINIBATCH_SIZE)
-        mb: int = B // calculated_minibatches
 
         b_obs: torch.Tensor = obs_b.reshape(B, OBS_DIM)
         b_act: torch.Tensor = act_b.reshape(B, ACT_DIM)
@@ -470,18 +470,17 @@ def train(
         tot_pg, tot_v, tot_ent, tot_kl, tot_clip = 0.0, 0.0, 0.0, 0.0, 0.0
         n_upd: int = 0
         current_ent_coef = max(0.001, ent_coef * (1.0 - (it / iterations)))
-        permutation_indices = torch.arange(B, device=device)
 
         for epoch in range(current_epochs):  
+            # Shuffle indices using the pre-allocated tensor
             perm = permutation_indices[torch.randperm(B, device=device)]
             epoch_kl = 0.0
             minibatches_run = 0
             
-            # Drop the remainder batch if it isn't an exact match
             for start in range(0, B, mb):
                 idx = perm[start : start + mb]
                 if idx.shape[0] != mb: 
-                    continue # Skip the odd-sized remainder to protect torch.compile
+                    continue 
 
                 opt.zero_grad(set_to_none=True)
                 
@@ -507,14 +506,13 @@ def train(
                 epoch_kl += approx_kl.item()
                 minibatches_run += 1
             
-            # Post-epoch check: Stop optimizing if the average drift this epoch is too high
             if minibatches_run > 0 and (epoch_kl / minibatches_run) > target_kl * 2.0:
                 break
                 
         denom = max(n_upd, 1)
         avg_pg, avg_v, avg_ent, final_kl, avg_clip = tot_pg/denom, tot_v/denom, tot_ent/denom, tot_kl/denom, tot_clip/denom
         
-        # Scheduler execution step
+        # Schedulers execute
         sched.step()
         
         if final_kl > 1.5 * target_kl:
