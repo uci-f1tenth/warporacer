@@ -202,6 +202,10 @@ def _full_train_step_compiled(
             
         loss = pg + vf_coef * v_loss - ent_coef * ent.mean()
         
+        # Calculate log_std mean entirely inside the autocast/compiled graph context
+        # (Assuming agent.log_std is a parameter or buffer on the same device)
+        mean_log_std = agent.log_std.mean()
+        
     # Scale loss and calculate gradients completely inside the graph
     scaler.scale(loss).backward()
     scaler.unscale_(opt)
@@ -210,7 +214,14 @@ def _full_train_step_compiled(
     scaler.update()
     
     # Detach and clone outputs immediately to free the graph's internal memory locks
-    return pg.detach().clone(), v_loss.detach().clone(), ent.mean().detach().clone(), approx_kl.detach().clone(), clipfrac.detach().clone()
+    return (
+        pg.detach().clone(), 
+        v_loss.detach().clone(), 
+        ent.mean().detach().clone(), 
+        approx_kl.detach().clone(), 
+        clipfrac.detach().clone(),
+        mean_log_std.detach().clone()
+    )
 
 
 @torch.compile
@@ -442,6 +453,15 @@ def train(
     scaler: torch.amp.GradScaler = torch.amp.GradScaler("cuda")
     buffers = RolloutBuffers(rollouts, N, device)
 
+    # --- SETUP ASYNC TRACKING TRACKS (PINNED CPU MEMORY) ---
+    gpu_fin_history = torch.zeros((rollouts, N), dtype=torch.bool, device=device)
+    gpu_ret_history = torch.zeros((rollouts, N), dtype=torch.float32, device=device)
+    gpu_len_history = torch.zeros((rollouts, N), dtype=torch.float32, device=device)
+
+    cpu_fin_history = torch.zeros((rollouts, N), dtype=torch.bool, pin_memory=True)
+    cpu_ret_history = torch.zeros((rollouts, N), dtype=torch.float32, pin_memory=True)
+    cpu_len_history = torch.zeros((rollouts, N), dtype=torch.float32, pin_memory=True)
+
     raw, raw_critic, _ = env.reset()
     obs_rms.update(raw[..., 3:]) 
     obs: torch.Tensor = process_observations(raw, obs_rms)
@@ -462,7 +482,7 @@ def train(
             for t in range(rollouts):
                 buffers.obs_b[t] = obs
                 buffers.critic_obs_b[t] = raw_critic
-                act_raw, act_clamped, logp, _, val = agent.act_value(obs, critic_obs=raw_critic)
+                act_raw, act_clamped, logp, _, val = agent.act_value(obs, raw_critic)
                 buffers.act_b[t] = act_raw 
                 buffers.logp_b[t] = logp
                 buffers.val_b[t] = val
@@ -479,12 +499,16 @@ def train(
                 ep_ret.add_(raw_rew)
                 ep_len.add_(1.0)
                 
-                fin: torch.Tensor = done.bool()
-                if fin.any():
-                    finished_rets.extend(ep_ret[fin].to("cpu", non_blocking=True).numpy())
-                    finished_lens.extend(ep_len[fin].to("cpu", non_blocking=True).numpy())
-                    ep_ret[fin] = 0.0
-                    ep_len[fin] = 0.0
+                # Silently record states completely on the GPU (No if branches, no .any() traps!)
+                done_bool = done.bool()
+                gpu_fin_history[t] = done_bool
+                gpu_ret_history[t] = ep_ret
+                gpu_len_history[t] = ep_len
+                
+                # Vectorized reset on the GPU
+                ep_ret[done_bool] = 0.0
+                ep_len[done_bool] = 0.0
+                
                 obs = process_observations(raw, obs_rms)
 
                 if env.vs and t % 4 == 0:
@@ -492,12 +516,30 @@ def train(
                 
             next_val: torch.Tensor = agent.value(raw_critic)
 
+        # --- NON-BLOCKING BACKGROUND TRANSFERS ---
+        cpu_fin_history.copy_(gpu_fin_history, non_blocking=True)
+        cpu_ret_history.copy_(gpu_ret_history, non_blocking=True)
+        cpu_len_history.copy_(gpu_len_history, non_blocking=True)
+
         obs_rms.update(buffers.raw_obs_b[..., 3:])
         obs = process_observations(raw, obs_rms)
 
+        # Compute GAE while the PCIe bus copies your metrics trackers over
         adv_b: torch.Tensor = compute_gae(buffers.rew_b, buffers.val_b, next_val, buffers.term_b, buffers.done_b, gamma, gae_lambda, rollouts)
         ret_b: torch.Tensor = adv_b + buffers.val_b
         global_step += B
+
+        # --- SAFE EVALUATION OF COMPLETED EPISODES ---
+        fin_mask_cpu = cpu_fin_history.numpy()
+        ret_cpu = cpu_ret_history.numpy()
+        len_cpu = cpu_len_history.numpy()
+
+        if fin_mask_cpu.any():
+            for t in range(rollouts):
+                step_fin = fin_mask_cpu[t]
+                if step_fin.any():
+                    finished_rets.extend(ret_cpu[t][step_fin])
+                    finished_lens.extend(len_cpu[t][step_fin])
 
         # 1. Enforce initial contiguous layout
         b_obs = buffers.obs_b.reshape(B, OBS_DIM).contiguous()
@@ -509,15 +551,13 @@ def train(
         b_val = buffers.val_b.reshape(B).contiguous()
 
         agent.train()
-        running_stats = torch.zeros(5, device=device)
+        running_stats = torch.zeros(6, device=device)
         n_upd = 0
         current_ent_coef = max(0.001, ent_coef * (1.0 - (it / iterations)))
 
         for epoch in range(current_epochs):  
-            # Fast GPU-side full dataset shuffling
             perm = torch.randperm(B, device=device)
             
-            # Reorder all data contiguously ONCE per epoch
             shuffled_obs = b_obs[perm]
             shuffled_critic_obs = b_critic_obs[perm]
             shuffled_act = b_act[perm]
@@ -526,17 +566,14 @@ def train(
             shuffled_ret = b_ret[perm]
             shuffled_val = b_val[perm]
             
-            # Sequential extraction avoids graph re-compilations completely
             for start in range(0, B, mb):
                 end = start + mb
                 if end > B:
                     continue
 
-                # Signal the boundary to the graph replay engine
                 torch.compiler.cudagraph_mark_step_begin()
 
-                # One call runs the entire optimization step smoothly
-                pg, v_loss, ent_m, approx_kl, clipfrac = _full_train_step_compiled(
+                pg, v_loss, ent_m, approx_kl, clipfrac, avg_std = _full_train_step_compiled(
                     agent, opt, scaler, max_grad_norm,
                     shuffled_obs[start:end].view(mb, OBS_DIM), 
                     shuffled_critic_obs[start:end].view(mb, b_critic_obs.shape[-1]), 
@@ -548,24 +585,23 @@ def train(
                     clip, vf_coef, vf_clip, current_ent_coef
                 )
 
-                # Pure GPU tracking additions
                 running_stats[0].add_(pg)
                 running_stats[1].add_(v_loss)
                 running_stats[2].add_(ent_m)
                 running_stats[3].add_(approx_kl)
                 running_stats[4].add_(clipfrac)
+                running_stats[5].add_(avg_std)
                 n_upd += 1
                 
-        # Move metrics to CPU all at once at the very end
         denom = max(n_upd, 1)
         stats_cpu = (running_stats / denom).to("cpu", non_blocking=True)
         
-        avg_pg, avg_v, avg_ent, final_kl, avg_clip = (
-            float(stats_cpu[0]), float(stats_cpu[1]), float(stats_cpu[2]), float(stats_cpu[3]), float(stats_cpu[4])
+        avg_pg, avg_v, avg_ent, final_kl, avg_clip, current_log_std = (
+            float(stats_cpu[0]), float(stats_cpu[1]), float(stats_cpu[2]), 
+            float(stats_cpu[3]), float(stats_cpu[4]), float(stats_cpu[5])
         )
         sched.step()
 
-        # Dynamic epoch scaling remains safe out here
         if final_kl > 1.5 * target_kl:
             current_epochs = max(1, current_epochs - 1)
         elif final_kl < target_kl / 1.5:
@@ -577,9 +613,16 @@ def train(
         current_lr = float(opt.param_groups[0]["lr"])
 
         log: Dict[str, Any] = {
-            "policy_loss": avg_pg, "value_loss": avg_v, "entropy": avg_ent,
-            "approx_kl": final_kl, "clipfrac": avg_clip, "current_epochs": current_epochs,  
-            "log_std": agent.log_std.mean().item(), "iter_lr": current_lr, "sps": sps, "iteration": it,
+            "policy_loss": avg_pg, 
+            "value_loss": avg_v, 
+            "entropy": avg_ent,
+            "approx_kl": final_kl, 
+            "clipfrac": avg_clip, 
+            "current_epochs": current_epochs,  
+            "log_std": current_log_std,  # <--- Zero overhead, 100% current value!
+            "iter_lr": current_lr, 
+            "sps": sps, 
+            "iteration": it,
         }
         if finished_rets:
             log["ep_return"] = float(np.mean(finished_rets))
