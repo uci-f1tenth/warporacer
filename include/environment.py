@@ -142,6 +142,11 @@ class Environment:
         )
 
         self.maps = [Map(p) for p in chosen_paths]
+        # import concurrent.futures
+        # self.maps = []
+        # if sample_size > 0:
+        #     with concurrent.futures.ThreadPoolExecutor() as executor:
+        #         self.maps = list(executor.map(Map, chosen_paths))
         self.num_maps = len(self.maps)
 
         global_shifts = self._initialize_active_maps()

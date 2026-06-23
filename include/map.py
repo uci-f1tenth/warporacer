@@ -5,9 +5,11 @@ import heapq
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Tuple
 
+import cv2
 from cv2 import IMREAD_GRAYSCALE, imread
 import numpy as np
-from scipy.ndimage import distance_transform_edt
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components, dijkstra
 from scipy.signal import savgol_filter
 from scipy.spatial import KDTree
 from skimage.morphology import skeletonize
@@ -57,6 +59,7 @@ class Map:
 
         return cls._cache[abs_path]
 
+    @profile
     def __init__(self, path: Path) -> None:
         """Initializes structural map matrices from cached configuration lines."""
         if getattr(self, "_initialized", False):
@@ -82,7 +85,11 @@ class Map:
 
         # 3. Create boolean map of drivable space using metadata thresholds
         self.free = self.raw >= OCC_THRESH
-        self.dt = distance_transform_edt(self.free)
+        self.dt = cv2.distanceTransform(
+            self.free.astype(np.uint8), 
+            cv2.DIST_L2, 
+            cv2.DIST_MASK_PRECISE
+        )
 
         # 4. Extract dimensional data and coordinate origin from metadata
         self.ox, self.oy, _ = self.meta["origin"]
@@ -97,6 +104,7 @@ class Map:
 
         self._initialized = True
 
+    @profile
     def _calculate_wall_bounds(self) -> None:
         """Calculates physical dimensions of the track and balances world spaces."""
         track_pts = np.argwhere(self.free)
@@ -129,52 +137,66 @@ class Map:
             float(max(self.wall_width, self.wall_length)) + extent_padding
         )
 
+    @profile
     def _compute_centerline(self) -> None:
         """Extracts continuous optimal circuit centerlines using graph heuristics."""
-        skel = skeletonize(self.free)
-        pts = np.argwhere(skel)
+        
+        # 1. Faster Skeletonization (Try OpenCV C++ Thinning, fallback to skimage)
+        try:
+            free_uint8 = (self.free * 255).astype(np.uint8)
+            skel = cv2.ximgproc.thinning(free_uint8, thinningType=cv2.ximgproc.THINNING_GUOHALL) > 0
+        except (AttributeError, ImportError):
+            from skimage.morphology import skeletonize
+            skel = skeletonize(self.free)
 
-        if len(pts) == 0:
+        pts = np.argwhere(skel)
+        num_nodes = len(pts)
+        if num_nodes == 0:
             raise RuntimeError(f"Skeleton empty on {self.img_path.name}.")
 
-        node_to_px = {i: tuple(pt) for i, pt in enumerate(pts)}
-        px_to_node = {tuple(pt): i for i, pt in enumerate(pts)}
-        node_clearance = {i: float(self.dt[node_to_px[i]]) for i in node_to_px}
+        # 2. O(1) Grid Lookup and Vectorized Clearance
+        node_grid = np.full((self.h, self.w), -1, dtype=np.int32)
+        node_grid[pts[:, 0], pts[:, 1]] = np.arange(num_nodes)
+        clearances = self.dt[pts[:, 0], pts[:, 1]]
 
-        # Build graph adjacencies using structural dictionary maps
-        adj: Dict[int, Dict[int, float]] = {i: {} for i in node_to_px}
+        # 3. Build Initial Adjacency List (List of Dicts is faster than Dict of Dicts)
+        adj = [{} for _ in range(num_nodes)]
+        degrees = np.zeros(num_nodes, dtype=np.int32)
         diagonal_weight = 1.41421356
 
-        for i, (r, c) in node_to_px.items():
+        for i in range(num_nodes):
+            r, c = pts[i]
             for dr, dc in ADJ:
                 nr, nc = r + dr, c + dc
-                if (nr, nc) in px_to_node:
-                    is_diag = dr != 0 and dc != 0
-                    adj[i][px_to_node[(nr, nc)]] = (
-                        diagonal_weight if is_diag else 1.0
-                    )
+                if 0 <= nr < self.h and 0 <= nc < self.w:
+                    nbr = node_grid[nr, nc]
+                    if nbr != -1:
+                        is_diag = (dr != 0 and dc != 0)
+                        dist = diagonal_weight if is_diag else 1.0
+                        adj[i][nbr] = dist
+                        degrees[i] += 1
 
-        # Heal disjointed structural skeleton components
-        kdtree = KDTree(pts)
-        max_gap_pixels = 12.0
-        endpoints = [i for i, neighbors in adj.items() if len(neighbors) <= 1]
+        # 4. Heal disjointed structural skeleton components
+        endpoints = np.where(degrees <= 1)[0]
+        if len(endpoints) > 0:
+            kdtree = KDTree(pts)
+            max_gap_pixels = 12.0
+            for u in endpoints:
+                u_px = pts[u]
+                indices = kdtree.query_ball_point(u_px, r=max_gap_pixels)
+                for v in indices:
+                    if v == u or v in adj[u]:
+                        continue
+                    v_px = pts[v]
+                    dist = float(np.hypot(u_px[0] - v_px[0], u_px[1] - v_px[1]))
+                    if dist > 1.5:
+                        adj[u][v] = dist
+                        adj[v][u] = dist
+                        degrees[u] += 1
+                        degrees[v] += 1
 
-        for u in endpoints:
-            u_px = node_to_px[u]
-            indices = kdtree.query_ball_point(u_px, r=max_gap_pixels)
-            for v in indices:
-                if v == u or v in adj[u]:
-                    continue
-                v_px = node_to_px[v]
-                dist = float(np.hypot(u_px[0] - v_px[0], u_px[1] - v_px[1]))
-                if dist > 1.5:
-                    adj[u][v] = dist
-                    adj[v][u] = dist
-
-        # Prune dead-end leaf branch arrays
-        degrees = {i: len(neighbors) for i, neighbors in adj.items()}
-        q = deque([i for i, d in degrees.items() if d == 1])
-
+        # 5. Prune dead-end leaf branch arrays
+        q = deque(np.where(degrees == 1)[0])
         while q:
             u = q.popleft()
             for v in list(adj[u].keys()):
@@ -186,111 +208,88 @@ class Map:
             adj[u].clear()
             degrees[u] = 0
 
-        valid_nodes = set(i for i, d in degrees.items() if d >= 2)
-        if not valid_nodes:
+        valid_nodes_mask = degrees >= 2
+        valid_indices = np.where(valid_nodes_mask)[0]
+        if len(valid_indices) == 0:
             raise RuntimeError(f"No closed loops found on {self.img_path.name}.")
 
-        # Extract largest connected topological circuit cluster
-        visited = set()
-        components = []
-        for node in valid_nodes:
-            if node not in visited:
-                comp = []
-                cq: deque[int] = deque([node])
-                visited.add(node)
-                while cq:
-                    curr = cq.popleft()
-                    comp.append(curr)
-                    for nbr in adj[curr]:
-                        if nbr in valid_nodes and nbr not in visited:
-                            visited.add(nbr)
-                            cq.append(nbr)
-                components.append(comp)
+        # 6. Extract largest connected component using SciPy CSR Matrix
+        p_row, p_col = [], []
+        for u in valid_indices:
+            for v in adj[u].keys():
+                if valid_nodes_mask[v]:
+                    p_row.append(u)
+                    p_col.append(v)
 
-        main_component = set(max(components, key=len))
-        start_node = max(main_component, key=lambda n: node_clearance[n])
+        pruned_graph = csr_matrix((np.ones(len(p_row)), (p_row, p_col)), shape=(num_nodes, num_nodes))
+        _, labels = connected_components(csgraph=pruned_graph, directed=False, return_labels=True)
 
+        valid_labels = labels[valid_indices]
+        unique_labels, counts = np.unique(valid_labels, return_counts=True)
+        largest_comp_label = unique_labels[np.argmax(counts)]
+
+        in_main_component = (labels == largest_comp_label) & valid_nodes_mask
+        main_comp_indices = np.where(in_main_component)[0]
+        start_node = main_comp_indices[np.argmax(clearances[main_comp_indices])]
+
+        # 7. Build Weighted Sparse Matrix for Dijkstra Fast Routing
         physical_clearance_limit = 0.15
         min_clearance_px = max(2.0, physical_clearance_limit / self.res)
+        penalty_scale = 8.0
 
-        def dijkstra_soft(
-            src: int,
-            target: int = None,
-            penalty_nodes: set = None,
-        ) -> Tuple[Dict[int, float], Dict[int, Any]]:
-            """Finds minimal clearance paths using soft wall penalties."""
-            if penalty_nodes is None:
-                penalty_nodes = set()
+        d_row, d_col, d_weight = [], [], []
+        for u in main_comp_indices:
+            for v, dist in adj[u].items():
+                if in_main_component[v]:
+                    clr = clearances[v]
+                    if clr >= min_clearance_px:
+                        weight = dist + (penalty_scale / (clr + 1e-3))
+                        d_row.append(u)
+                        d_col.append(v)
+                        d_weight.append(weight)
 
-            pq = [(0.0, src)]
-            costs = {src: 0.0}
-            parent = {src: None}
-
-            penalty_scale = 8.0
-            collision_penalty = 5000.0
-
-            while pq:
-                curr_cost, u = heapq.heappop(pq)
-                if target is not None and u == target:
-                    break
-                if curr_cost > costs.get(u, float("inf")):
-                    continue
-
-                for v, edge_dist in adj[u].items():
-                    if v not in main_component:
-                        continue
-
-                    clearance = node_clearance[v]
-                    if clearance < min_clearance_px:
-                        continue
-
-                    weight = edge_dist + (penalty_scale / (clearance + 1e-3))
-                    if v in penalty_nodes:
-                        weight += collision_penalty
-
-                    new_cost = curr_cost + weight
-                    if new_cost < costs.get(v, float("inf")):
-                        costs[v] = new_cost
-                        parent[v] = u
-                        heapq.heappush(pq, (new_cost, v))
-
-            return costs, parent
-
-        # Route to the furthest available spatial component point
-        forward_costs, _ = dijkstra_soft(start_node)
-        far_nodes = sorted(
-            [n for n in forward_costs if n in main_component],
-            key=lambda n: forward_costs[n],
-            reverse=True,
+        # 8. Route forward to furthest point
+        dijkstra_graph = csr_matrix((d_weight, (d_row, d_col)), shape=(num_nodes, num_nodes))
+        dist_matrix, predecessors = dijkstra(
+            csgraph=dijkstra_graph, directed=True, indices=start_node, return_predecessors=True
         )
 
-        if not far_nodes:
+        valid_dists = dist_matrix[main_comp_indices]
+        valid_dists[np.isinf(valid_dists)] = -1  # Ignore unreachable nodes
+        target_node = main_comp_indices[np.argmax(valid_dists)]
+
+        if target_node == start_node or dist_matrix[target_node] <= 0:
             raise RuntimeError("Routing disconnected during exploration.")
-        target_node = far_nodes[0]
 
-        # Extract forward path trace
-        _, p1_tree = dijkstra_soft(start_node, target_node)
-        path1, curr = [], target_node
-        while curr is not None:
-            path1.append(curr)
-            curr = p1_tree[curr]
-        path1.reverse()
+        def reconstruct_path(start, target, preds):
+            path, curr = [], target
+            while curr != -9999 and curr != start:  # -9999 is SciPy's null predecessor
+                path.append(curr)
+                curr = preds[curr]
+            if curr == start:
+                path.append(start)
+            path.reverse()
+            return path
 
-        # Extract inbound path trace around obstacles
-        internal_nodes = set(path1[1:-1])
-        _, p2_tree = dijkstra_soft(
-            target_node, start_node, penalty_nodes=internal_nodes
+        path1 = reconstruct_path(start_node, target_node, predecessors)
+
+        # 9. Route inbound path avoiding the initial trace (applying collision penalties)
+        internal_nodes = np.array(path1[1:-1], dtype=np.int32)
+        collision_penalty = 5000.0
+
+        d_weight_penalized = np.array(d_weight)
+        penalized_edges = np.isin(d_col, internal_nodes)
+        d_weight_penalized[penalized_edges] += collision_penalty
+
+        dijkstra_graph_penalized = csr_matrix((d_weight_penalized, (d_row, d_col)), shape=(num_nodes, num_nodes))
+        _, predecessors_2 = dijkstra(
+            csgraph=dijkstra_graph_penalized, directed=True, indices=target_node, return_predecessors=True
         )
 
-        path2, curr = [], start_node
-        while curr is not None:
-            path2.append(curr)
-            curr = p2_tree[curr]
-        path2.reverse()
-
+        path2 = reconstruct_path(target_node, start_node, predecessors_2)
         best_circuit = path1 + path2[1:-1]
 
-        # Fast O(N) detour loop removal check
+        # 10. Fast O(N) detour loop removal check
         simplified_circuit = []
         node_indices = {}
         max_detour_ratio = 0.25
@@ -300,7 +299,7 @@ class Map:
             if node in node_indices:
                 idx = node_indices[node]
                 if len(simplified_circuit) - idx < max_detour_len:
-                    for popped_node in simplified_circuit[idx + 1 :]:
+                    for popped_node in simplified_circuit[idx + 1:]:
                         del node_indices[popped_node]
                     simplified_circuit = simplified_circuit[: idx + 1]
                 else:
@@ -312,11 +311,9 @@ class Map:
 
         best_circuit = simplified_circuit
 
-        # Map pixel coordinates directly back into world coordinate vectors
-        best_path_px = np.array([node_to_px[n] for n in best_circuit])
-        origin_px = np.array(
-            [self.h - 1 + self.oy / self.res, -self.ox / self.res]
-        )
+        # 11. Coordinate mapping & smoothing
+        best_path_px = pts[best_circuit]
+        origin_px = np.array([self.h - 1 + self.oy / self.res, -self.ox / self.res])
         start_idx = np.argmin(((best_path_px - origin_px) ** 2).sum(axis=1))
         best_path_rolled = np.roll(best_path_px, -start_idx, axis=0)
 
@@ -327,16 +324,15 @@ class Map:
             ]
         )
 
-        # Apply digital filter to smooth centerline path geometry variations
         poly_order = 3
         self.centerline = savgol_filter(
             world, SMOOTH_WINDOW, poly_order, axis=0, mode="wrap"
         )
 
-        # Precompute sequential track heading tracking yaw lines
         diffs = np.diff(self.centerline, axis=0, append=self.centerline[:1])
         self.angles = np.arctan2(diffs[:, 1], diffs[:, 0])
 
+    @profile
     def _build_lut(self) -> None:
         """Generates coordinate grids to sample closest index parameters."""
         cl_px = np.column_stack(
@@ -347,7 +343,18 @@ class Map:
         )
 
         tree = KDTree(cl_px)
-        query_points = np.indices((self.h, self.w)).reshape(2, -1).T
+        
+        # 1. Extract only the (y, x) coordinates of drivable pixels
+        y_coords, x_coords = np.nonzero(self.free)
+        
+        # 2. Stack them into an (N, 2) array for the KDTree
+        query_points = np.column_stack((y_coords, x_coords))
 
+        # 3. Query the tree ONLY for drivable space (cutting workload by ~85-95%)
         nearest_indices = tree.query(query_points, workers=-1)[1]
-        self.lut = nearest_indices.reshape(self.h, self.w)
+
+        # 4. Initialize the LUT with -1 (meaning "wall/invalid/out-of-bounds")
+        self.lut = np.full((self.h, self.w), -1, dtype=np.int32)
+        
+        # 5. Map the computed indices back to their exact pixel locations on the grid
+        self.lut[y_coords, x_coords] = nearest_indices
