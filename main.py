@@ -44,7 +44,7 @@ PSI_PRIME_MAX = 6.0
 BETA_MAX = 1.2
 
 # Car
-WIDTH = 0.31
+WIDTH = 0.5
 LENGTH = 0.58
 CAR_HALF_DIAG = float(np.hypot(WIDTH / 2.0, LENGTH / 2.0))
 G = 9.81
@@ -879,7 +879,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
 def train(
     env,
     agent,
-    iterations=800,
+    iterations=2000,
     rollouts=24,
     epochs=5,
     minibatches=4,
@@ -1072,7 +1072,7 @@ def train(
 def main(
     map_yamls: list[Path],
     num_envs: int = 4096,
-    iterations: int = 800,
+    iterations: int = 2000,
     seed: int = 0,
     log_dir: Path = Path("./logs"),
     device: str = "",
