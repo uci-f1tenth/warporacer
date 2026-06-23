@@ -1,7 +1,5 @@
 """Track map library class managing image parsing, skeletons, and coordinate lookups."""
 
-from collections import deque
-import heapq
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Tuple
 
@@ -51,12 +49,10 @@ class Map:
     def __new__(cls, path: Path) -> "Map":
         """Intercepts instance creation to implement Flyweight/Multiton mapping cache."""
         abs_path = path.resolve()
-
         if abs_path not in cls._cache:
             instance = super().__new__(cls)
             instance._initialized = False
             cls._cache[abs_path] = instance
-
         return cls._cache[abs_path]
 
     @profile
@@ -115,47 +111,26 @@ class Map:
             min_r, min_c = track_pts.min(axis=0)
             max_r, max_c = track_pts.max(axis=0)
 
-        # Physical track bounds in meters
         self.wall_width = float((max_c - min_c) * self.res)
         self.wall_length = float((max_r - min_r) * self.res)
 
-        # Map pixel centers to world-space coordinates
-        center_c = (min_c + max_c) / 2.0
-        center_r = (min_r + max_r) / 2.0
-        orig_center_x = self.ox + center_c * self.res
-        orig_center_y = self.oy + (self.h - 1 - center_r) * self.res
-
         # Shift raw origins so that track center lands perfectly on (0, 0)
+        orig_center_x = self.ox + (min_c + max_c) / 2.0 * self.res
+        orig_center_y = self.oy + (self.h - 1 - (min_r + max_r) / 2.0) * self.res
         self.ox -= orig_center_x
         self.oy -= orig_center_y
 
         self.center_x = 0.0
         self.center_y = 0.0
-
-        extent_padding = 2.0
-        self.max_extent = (
-            float(max(self.wall_width, self.wall_length)) + extent_padding
-        )
+        self.max_extent = float(max(self.wall_width, self.wall_length)) + 2.0
 
     @profile
     def _compute_centerline(self) -> None:
         """Extracts continuous optimal circuit centerlines using high-performance graph heuristics."""
-        
-        # Phase 1: Morphological Skeletonization and Adjacency Processing
         pts, num_nodes, clearances, all_u, all_v, all_dists = self._extract_initial_skeleton_graph()
-        
-        # Phase 2: Heal Disjointed Structural Components via KDTree Vectorization
         all_u, all_v, all_dists = self._heal_skeleton_gaps(pts, num_nodes, all_u, all_v, all_dists)
-        
-        # Phase 3: Prune Dead-Ends and Segment Core Topological Loops
-        start_node, in_main_component = self._prune_and_segment_main_loop(
-            num_nodes, clearances, all_u, all_v, all_dists
-        )
-        
-        # Phase 4: Path Routing, Detour Removal, and Coordinate Spline Transformation
-        self._route_and_smooth_circuit(
-            pts, num_nodes, clearances, start_node, in_main_component, all_u, all_v, all_dists
-        )
+        start_node, in_main_component = self._prune_and_segment_main_loop(num_nodes, clearances, all_u, all_v, all_dists)
+        self._route_and_smooth_circuit(pts, num_nodes, clearances, start_node, in_main_component, all_u, all_v, all_dists)
 
     def _extract_initial_skeleton_graph(self):
         """Phase 1: Generates skeleton node pixels and extracts direct pixel neighbor relations."""
@@ -172,16 +147,11 @@ class Map:
         all_u, all_v, all_dists = [], [], []
         
         for dr, dc in ADJ:
-            sr = pts[:, 0] + dr
-            sc = pts[:, 1] + dc
-            
-            valid = (sr >= 0) & (sr < self.h) & (sc >= 0) & (sc < self.w)
-            valid_idx = np.where(valid)[0]
-            
-            v_nodes = node_grid[sr[valid_idx], sc[valid_idx]]
+            # Because borders are sealed to 0, skeleton nodes can never be on the image edge.
+            # Neighbors are always within array bounds. Outer bounds checking removed.
+            v_nodes = node_grid[pts[:, 0] + dr, pts[:, 1] + dc]
             hit_mask = v_nodes != -1
-            
-            u_nodes = valid_idx[hit_mask]
+            u_nodes = np.where(hit_mask)[0]
             v_nodes = v_nodes[hit_mask]
             
             if len(u_nodes) == 0:
@@ -211,26 +181,20 @@ class Map:
 
         if len(endpoints) > 0:
             kdtree = KDTree(pts)
-            max_gap_pixels = 12.0
             existing_edges = set(zip(all_u, all_v))
             
             pairs_u, pairs_v = [], []
             for u in endpoints:
-                u_px = pts[u]
-                indices = kdtree.query_ball_point(u_px, r=max_gap_pixels)
+                indices = kdtree.query_ball_point(pts[u], r=12.0)
                 for v in indices:
-                    if v == u or (u, v) in existing_edges:
-                        continue
-                    pairs_u.append(u)
-                    pairs_v.append(v)
-                    
+                    if v != u and (u, v) not in existing_edges:
+                        pairs_u.append(u)
+                        pairs_v.append(v)
+                        
             if pairs_u:
                 arr_u = np.array(pairs_u, dtype=np.int32)
                 arr_v = np.array(pairs_v, dtype=np.int32)
-                
-                u_coords = pts[arr_u]
-                v_coords = pts[arr_v]
-                dists = np.linalg.norm(u_coords - v_coords, axis=1)
+                dists = np.linalg.norm(pts[arr_u] - pts[arr_v], axis=1)
                 
                 valid_mask = dists > 1.5
                 filtered_u = arr_u[valid_mask]
@@ -238,17 +202,14 @@ class Map:
                 filtered_dists = dists[valid_mask]
                 
                 if len(filtered_dists) > 0:
-                    heal_u = np.empty(2 * len(filtered_u), dtype=np.int32)
-                    heal_u[0::2] = filtered_u
-                    heal_u[1::2] = filtered_v
-                    
-                    heal_v = np.empty(2 * len(filtered_v), dtype=np.int32)
-                    heal_v[0::2] = filtered_v
-                    heal_v[1::2] = filtered_u
-                    
-                    heal_dists = np.empty(2 * len(filtered_dists), dtype=np.float64)
-                    heal_dists[0::2] = filtered_dists
-                    heal_dists[1::2] = filtered_dists
+                    n_heal = len(filtered_u)
+                    heal_u = np.empty(2 * n_heal, dtype=np.int32)
+                    heal_v = np.empty(2 * n_heal, dtype=np.int32)
+                    heal_dists = np.empty(2 * n_heal, dtype=np.float64)
+
+                    heal_u[0::2], heal_u[1::2] = filtered_u, filtered_v
+                    heal_v[0::2], heal_v[1::2] = filtered_v, filtered_u
+                    heal_dists[0::2], heal_dists[1::2] = filtered_dists, filtered_dists
                     
                     all_u = np.concatenate([all_u, heal_u])
                     all_v = np.concatenate([all_v, heal_v])
@@ -266,8 +227,7 @@ class Map:
             leaves = np.where(degrees == 1)[0]
             if len(leaves) == 0:
                 break
-            invalid_mask = np.isin(all_u, leaves) | np.isin(all_v, leaves)
-            active_edges_mask &= ~invalid_mask
+            active_edges_mask &= ~(np.isin(all_u, leaves) | np.isin(all_v, leaves))
 
         all_u_p = all_u[active_edges_mask]
         all_v_p = all_v[active_edges_mask]
@@ -278,33 +238,24 @@ class Map:
             raise RuntimeError(f"No closed loops found on {self.img_path.name}.")
 
         valid_edges_mask = valid_nodes_mask[all_u_p] & valid_nodes_mask[all_v_p]
-        p_row = all_u_p[valid_edges_mask]
-        p_col = all_v_p[valid_edges_mask]
-
-        pruned_graph = csr_matrix((np.ones(len(p_row)), (p_row, p_col)), shape=(num_nodes, num_nodes))
+        pruned_graph = csr_matrix((np.ones(len(valid_edges_mask)), (all_u_p[valid_edges_mask], all_v_p[valid_edges_mask])), shape=(num_nodes, num_nodes))
         _, labels = connected_components(csgraph=pruned_graph, directed=False, return_labels=True)
         
-        valid_labels = labels[valid_indices]
-        unique_labels, counts = np.unique(valid_labels, return_counts=True)
-        largest_comp_label = unique_labels[np.argmax(counts)]
-        
-        in_main_component = (labels == largest_comp_label) & valid_nodes_mask
-        main_comp_indices = np.where(in_main_component)[0]
-        start_node = main_comp_indices[np.argmax(clearances[main_comp_indices])]
+        unique_labels, counts = np.unique(labels[valid_indices], return_counts=True)
+        in_main_component = (labels == unique_labels[np.argmax(counts)]) & valid_nodes_mask
+        start_node = np.where(in_main_component)[0][np.argmax(clearances[in_main_component])]
         
         return start_node, in_main_component
 
     @profile
     def _route_and_smooth_circuit(self, pts, num_nodes, clearances, start_node, in_main_component, all_u, all_v, all_dists):
         """Phase 4: Computes bidirectional penalization routing, clears loops, and processes smooth coordinates."""
-        physical_clearance_limit = 0.15
-        min_clearance_px = max(2.0, physical_clearance_limit / self.res)
-        penalty_scale = 8.0
+        min_clearance_px = max(2.0, 0.15 / self.res)
 
         route_mask = in_main_component[all_u] & in_main_component[all_v] & (clearances[all_v] >= min_clearance_px)
         d_row = all_u[route_mask]
         d_col = all_v[route_mask]
-        d_weight = all_dists[route_mask] + (penalty_scale / (clearances[d_col] + 1e-3))
+        d_weight = all_dists[route_mask] + (8.0 / (clearances[d_col] + 1e-3))
 
         if len(d_weight) == 0:
             raise RuntimeError("Routing disconnected: No valid edges after clearance filtering.")
@@ -323,44 +274,31 @@ class Map:
         path1 = self._reconstruct_path(start_node, target_node, predecessors)
 
         # Inbound Path Trace Routing with Collision Avoidance
-        internal_nodes = np.array(path1[1:-1], dtype=np.int32)
-        collision_penalty = 5000.0
-        
         d_weight_penalized = np.array(d_weight)
-        penalized_edges = np.isin(d_col, internal_nodes)
-        d_weight_penalized[penalized_edges] += collision_penalty
+        d_weight_penalized[np.isin(d_col, np.array(path1[1:-1], dtype=np.int32))] += 5000.0
         
         dijkstra_graph_penalized = csr_matrix((d_weight_penalized, (d_row, d_col)), shape=(num_nodes, num_nodes))
         _, predecessors_2 = dijkstra(csgraph=dijkstra_graph_penalized, directed=True, indices=target_node, return_predecessors=True)
         
-        path2 = self._reconstruct_path(target_node, start_node, predecessors_2)
-        best_circuit = path1 + path2[1:-1]
+        best_circuit = path1 + self._reconstruct_path(target_node, start_node, predecessors_2)[1:-1]
 
-        # --- HYPER-OPTIMIZED TRACKING & DETOUR REMOVAL ---
-        # Replace dictionary lookups with a fast, pre-allocated flat tracking array
+        # --- DETOUR REMOVAL ---
         node_positions = np.full(num_nodes, -1, dtype=np.int32)
         max_detour_len = len(best_circuit) * 0.25
-        
         simplified_circuit = []
         append_node = simplified_circuit.append
         
         for node in best_circuit:
             idx = node_positions[node]
-            if idx != -1:
-                if len(simplified_circuit) - idx < max_detour_len:
-                    # Wipe values from tracking array for the dropped slice in one go
-                    dropped_nodes = simplified_circuit[idx + 1:]
-                    node_positions[dropped_nodes] = -1
-                    del simplified_circuit[idx + 1:]
-                    continue
-            
+            if idx != -1 and (len(simplified_circuit) - idx < max_detour_len):
+                node_positions[simplified_circuit[idx + 1:]] = -1
+                del simplified_circuit[idx + 1:]
+                continue
             append_node(node)
             node_positions[node] = len(simplified_circuit) - 1
                 
-        best_circuit = simplified_circuit
-
         # Spatial Coordinate Mapping
-        best_path_px = pts[best_circuit]
+        best_path_px = pts[simplified_circuit]
         origin_px = np.array([self.h - 1 + self.oy / self.res, -self.ox / self.res])
         start_idx = np.argmin(((best_path_px - origin_px) ** 2).sum(axis=1))
         best_path_rolled = np.roll(best_path_px, -start_idx, axis=0)
@@ -372,43 +310,29 @@ class Map:
         
         poly_order = 3
         n_points = len(world)
-        
-        # --- PRE-ALLOCATED DIRECT-WRITE INTERPOLATION ---
         step = max(1, n_points // 1000) 
         
-        if step > 1 and (n_points // step) > poly_order:
-            downsampled_world = world[::step]
-            n_down = len(downsampled_world)
+        # Unified downsampled vs raw smoothing pathways into a single execution block
+        is_downsampled = step > 1 and (n_points // step) > poly_order
+        working_track = world[::step] if is_downsampled else world
+        n_working = len(working_track)
+        
+        safe_window = min(SMOOTH_WINDOW // step if is_downsampled else SMOOTH_WINDOW, n_working - 1) | 1
+        if safe_window <= poly_order:
+            safe_window = (poly_order + 1) | 1
             
-            safe_window = min(SMOOTH_WINDOW // step, n_down - 1) | 1
-            if safe_window <= poly_order:
-                safe_window = (poly_order + 1) | 1
-                
-            pad_len = safe_window
-            padded = np.vstack([downsampled_world[-pad_len:], downsampled_world, downsampled_world[:pad_len]])
-            smoothed_padded = savgol_filter(padded, safe_window, poly_order, axis=0, mode="nearest")
-            smoothed_down = smoothed_padded[pad_len:-pad_len]
-            
-            # 1. Pre-allocate the exact 2D memory block once
+        padded = np.vstack([working_track[-safe_window:], working_track, working_track[:safe_window]])
+        smoothed_padded = savgol_filter(padded, safe_window, poly_order, axis=0, mode="nearest")
+        smoothed_track = smoothed_padded[safe_window:-safe_window]
+        
+        if is_downsampled:
             self.centerline = np.empty((n_points, 2), dtype=world.dtype)
-            
-            # 2. Reuse simple 1D coordinate spaces
             x_orig = np.arange(n_points)
-            x_down = np.arange(0, n_points, step)[:n_down]
-            
-            # 3. Direct-assign the raw C-arrays into the columns (No np.column_stack needed)
-            self.centerline[:, 0] = np.interp(x_orig, x_down, smoothed_down[:, 0])
-            self.centerline[:, 1] = np.interp(x_orig, x_down, smoothed_down[:, 1])
-            
+            x_down = np.arange(0, n_points, step)[:n_working]
+            self.centerline[:, 0] = np.interp(x_orig, x_down, smoothed_track[:, 0])
+            self.centerline[:, 1] = np.interp(x_orig, x_down, smoothed_track[:, 1])
         else:
-            safe_window = min(SMOOTH_WINDOW, n_points - 1) | 1
-            if safe_window > poly_order:
-                pad_len = safe_window
-                padded = np.vstack([world[-pad_len:], world, world[:pad_len]])
-                smoothed_padded = savgol_filter(padded, safe_window, poly_order, axis=0, mode="nearest")
-                self.centerline = smoothed_padded[pad_len:-pad_len]
-            else:
-                self.centerline = world.copy()
+            self.centerline = smoothed_track
                 
         # Final fast vector transformations
         diffs = np.diff(self.centerline, axis=0, append=self.centerline[:1])
@@ -417,11 +341,7 @@ class Map:
     @staticmethod
     def _reconstruct_path(start: int, target: int, preds: np.ndarray) -> list:
         """Fastest pure-Python unrolling of the predecessor tree."""
-        # Convert the numpy array to a native Python list *once* before looping.
-        # Indexing a Python list inside a raw loop is dramatically faster than 
-        # scalar indexing a NumPy array.
         preds_list = preds.tolist()
-        
         path = []
         append = path.append
         curr = target
@@ -439,26 +359,12 @@ class Map:
     @profile
     def _build_lut(self) -> None:
         """Generates coordinate grids to sample closest index parameters."""
-        cl_px = np.column_stack(
-            [
-                self.h - 1 - (self.centerline[:, 1] - self.oy) / self.res,
-                (self.centerline[:, 0] - self.ox) / self.res,
-            ]
-        )
-
-        tree = KDTree(cl_px)
-        
-        # 1. Extract only the (y, x) coordinates of drivable pixels
+        cl_px = np.column_stack([
+            self.h - 1 - (self.centerline[:, 1] - self.oy) / self.res,
+            (self.centerline[:, 0] - self.ox) / self.res,
+        ])
         y_coords, x_coords = np.nonzero(self.free)
-        
-        # 2. Stack them into an (N, 2) array for the KDTree
-        query_points = np.column_stack((y_coords, x_coords))
+        nearest_indices = KDTree(cl_px).query(np.column_stack((y_coords, x_coords)), workers=-1)[1]
 
-        # 3. Query the tree ONLY for drivable space (cutting workload by ~85-95%)
-        nearest_indices = tree.query(query_points, workers=-1)[1]
-
-        # 4. Initialize the LUT with -1 (meaning "wall/invalid/out-of-bounds")
         self.lut = np.full((self.h, self.w), -1, dtype=np.int32)
-        
-        # 5. Map the computed indices back to their exact pixel locations on the grid
         self.lut[y_coords, x_coords] = nearest_indices
