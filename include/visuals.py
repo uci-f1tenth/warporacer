@@ -63,10 +63,6 @@ class Visuals:
         # Replace self.switch_track_layout(self.map) with this:
         self.refresh_maps()
 
-        # Force the starting viewport to hover directly over the center of your packed layout
-        center_coord = self.env.floor_square_size / 2.0
-        self.renderer.camera_pos = [center_coord, 1, center_coord] # X Z instead of XY cuz nvidia weird
-
     def refresh_maps(self) -> None:
         """Flushes and re-registers all active map geometries directly inside the running window."""
         self.initialized_all_agents = False
@@ -127,7 +123,7 @@ class Visuals:
 
         self.renderer.render_plane(
             name="unified_square_ground",
-            pos=[center_coord, center_coord, 0.0],
+            pos=[0.0, 0.0, 0.0],
             rot=np.array(wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), np.pi / 2.0)),
             width=center_coord,   # Extends from center to edge (Half-width parameter)
             length=center_coord,  # Extends from center to edge (Half-length parameter)
