@@ -177,85 +177,6 @@ def process_observations(raw_tensor: torch.Tensor, rms_module: RunningMeanStd) -
     return torch.cat([kinematics, sensory_normalized], dim=-1)
 
 
-def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: Path, obs_rms: Optional[RunningMeanStd] = None) -> None:
-    snap: Dict[str, torch.Tensor] = env.save_state()
-    was_training: bool = agent.training
-    agent.eval()
-    
-    try:
-        m = env.map
-        corners: np.ndarray = np.array(
-            [
-                [-LENGTH / 2, -WIDTH / 2],
-                [LENGTH / 2, -WIDTH / 2],
-                [LENGTH / 2, WIDTH / 2],
-                [-LENGTH / 2, WIDTH / 2],
-            ]
-        )
-
-        base_frame: np.ndarray = cvtColor(m.raw, COLOR_GRAY2RGB)
-
-        def w2p_vec(pts: np.ndarray) -> np.ndarray:
-            px = (pts[:, 0] - m.ox) / m.res
-            py = m.h - 1 - (pts[:, 1] - m.oy) / m.res
-            return np.column_stack((px, py)).astype(np.int32)
-
-        raw, raw_critic, _ = env.reset()
-        obs: torch.Tensor = process_observations(raw, obs_rms) if obs_rms else raw
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        device = env.cars_buf.device
-        num_features = env.cars_buf.shape[1] 
-        traj_states = torch.empty((num_steps, num_features), dtype=torch.float32, device=device)
-        resets_gpu = torch.empty(num_steps, dtype=torch.bool, device=device)
-
-        with torch.no_grad():
-            for i in range(num_steps):
-                a: torch.Tensor = agent.deterministic(obs)
-                raw, _, term, trunc, _ = env.step(a)
-                obs = process_observations(raw, obs_rms) if obs_rms else raw
-                traj_states[i] = env.cars_buf[0]
-                resets_gpu[i] = term[0] | trunc[0]
-
-        full_states_cpu = traj_states.cpu().numpy()
-        resets_cpu = resets_gpu.cpu().numpy()
-
-        x_arr = full_states_cpu[:, 0]
-        y_arr = full_states_cpu[:, 1]
-        psi_arr = full_states_cpu[:, 4]
-
-        centers = np.column_stack((x_arr, y_arr))
-        px_centers = w2p_vec(centers) 
-        c_arr = np.cos(psi_arr)
-        s_arr = np.sin(psi_arr)
-
-        trail: deque = deque(maxlen=300)
-        
-        with imageio.get_writer(str(out_path), fps=int(1 / DT), macro_block_size=2) as w:
-            for i in range(num_steps):
-                if resets_cpu[i]:
-                    trail.clear()
-                    
-                trail.append(px_centers[i])
-                frame: np.ndarray = base_frame.copy()
-                
-                if len(trail) > 1:
-                    polylines(frame, [np.array(trail)], False, (0, 200, 0), 2)
-                    
-                c, s = c_arr[i], s_arr[i]
-                R: np.ndarray = np.array([[c, -s], [s, c]])
-                
-                world_pts: np.ndarray = corners @ R.T + centers[i]
-                px_world = w2p_vec(world_pts)
-                
-                fillPoly(frame, [px_world], (255, 50, 50))
-                w.append_data(frame)
-
-    finally:
-        env.restore_state(snap)
-        agent.train(was_training)
-
-
 @torch.compile(mode="reduce-overhead")
 def _train_step_compiled(
     agent: Agent,
@@ -326,6 +247,87 @@ def compute_gae(
         
     return adv_b
 
+
+def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: Path, obs_rms: Optional[RunningMeanStd] = None) -> None:
+    snap: Dict[str, torch.Tensor] = env.save_state()
+    was_training: bool = agent.training
+    agent.eval()
+    
+    try:
+        # Query which map slice environment 0 is currently operating on
+        map_idx = int(env.env_map_ids.numpy()[0])
+        m = env.maps[map_idx]
+        
+        corners: np.ndarray = np.array(
+            [
+                [-LENGTH / 2, -WIDTH / 2],
+                [LENGTH / 2, -WIDTH / 2],
+                [LENGTH / 2, WIDTH / 2],
+                [-LENGTH / 2, WIDTH / 2],
+            ]
+        )
+
+        base_frame: np.ndarray = cvtColor(m.raw, COLOR_GRAY2RGB)
+
+        def w2p_vec(pts: np.ndarray) -> np.ndarray:
+            px = (pts[:, 0] - m.ox) / m.res
+            py = m.h - 1 - (pts[:, 1] - m.oy) / m.res
+            return np.column_stack((px, py)).astype(np.int32)
+
+        raw, raw_critic, _ = env.reset()
+        obs: torch.Tensor = process_observations(raw, obs_rms) if obs_rms else raw
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        device = env.cars_buf.device
+        num_features = env.cars_buf.shape[1] 
+        traj_states = torch.empty((num_steps, num_features), dtype=torch.float32, device=device)
+        resets_gpu = torch.empty(num_steps, dtype=torch.bool, device=device)
+
+        with torch.no_grad():
+            for i in range(num_steps):
+                a: torch.Tensor = agent.deterministic(obs)
+                raw, _, term, trunc, _ = env.step(a)
+                obs = process_observations(raw, obs_rms) if obs_rms else raw
+                traj_states[i] = env.cars_buf[0]
+                resets_gpu[i] = term[0] | trunc[0]
+
+        full_states_cpu = traj_states.cpu().numpy()
+        resets_cpu = resets_gpu.cpu().numpy()
+
+        x_arr = full_states_cpu[:, 0]
+        y_arr = full_states_cpu[:, 1]
+        psi_arr = full_states_cpu[:, 4]
+
+        centers = np.column_stack((x_arr, y_arr))
+        px_centers = w2p_vec(centers) 
+        c_arr = np.cos(psi_arr)
+        s_arr = np.sin(psi_arr)
+
+        trail: deque = deque(maxlen=300)
+        
+        with imageio.get_writer(str(out_path), fps=int(1 / DT), macro_block_size=2) as w:
+            for i in range(num_steps):
+                if resets_cpu[i]:
+                    trail.clear()
+                    
+                trail.append(px_centers[i])
+                frame: np.ndarray = base_frame.copy()
+                
+                if len(trail) > 1:
+                    polylines(frame, [np.array(trail)], False, (0, 200, 0), 2)
+                    
+                c, s = c_arr[i], s_arr[i]
+                R: np.ndarray = np.array([[c, -s], [s, c]])
+                
+                world_pts: np.ndarray = corners @ R.T + centers[i]
+                px_world = w2p_vec(world_pts)
+                
+                fillPoly(frame, [px_world], (255, 50, 50))
+                w.append_data(frame)
+
+    finally:
+        env.restore_state(snap)
+        agent.train(was_training)
 
 def train(
     env: Environment,
@@ -600,9 +602,15 @@ def train(
                     print(f"[WandB] Rollout video failed: {e}")
         
         if switch_map_iter > 0 and (it + 1) % switch_map_iter == 0:
-            env.cycle_next_map(randomize=True)
+            # Replaces old cycle_next_map call
+            env._shuffle_and_assign_maps()
             
-            #Re-synchronize state representation with the new layout allocation
+            # Force an explicit step-kernel pass with zero-actions to populate 
+            # the observation tensors with the new track data layout immediately
+            env._launch(env._zero_act)
+            env._sanitize()
+            
+            # Re-synchronize state representation with the new layout allocation
             raw = env.obs_buf
             obs_rms.update(raw[..., 3:])
             obs = process_observations(raw, obs_rms)

@@ -96,8 +96,7 @@ class ImGuiManager:
         imgui.text("--- Global Status ---")
         imgui.text(f"Active Vehicles: {self.env.num_envs}")
         imgui.text(f"Simulation Step: {self.env._call}")
-        imgui.text(f"Current Track Index: {self.env.current_map_idx}")
-        imgui.text(f"Active Track File: {self.env.map.path_name}")
+        imgui.text(f"Active Track File: {self.env.maps[0].path_name}")
         
         imgui.separator()
         imgui.spacing()
@@ -113,16 +112,21 @@ class ImGuiManager:
         imgui.text("Direct Track Selection:")
         imgui.spacing()
         
-        # Procedurally print explicit direct selections for every map discovered on device
+       # Dynamically acquire the true active map index from the running environment state
+        current_map_idx = getattr(self.env, "current_map_idx", 0)
+
         for idx, map_path in enumerate(self.env.available_maps):
-            # Visually highlight the currently active track selection item
-            is_active = (idx == self.env.current_map_idx)
+            # Evaluate against the actual active tracking index 
+            is_active = (idx == current_map_idx)
             if is_active:
-                imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.2, 1.0, 0.2, 1.0)) # Bright Green tint
+                imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.2, 1.0, 0.2, 1.0))
                 
             if imgui.selectable(f"Track [{idx}]: {map_path.name}", is_active)[0]:
                 if not is_active:
                     self.env.load_map_by_index(idx)
+                    # Force update the current window active track name immediately
+                    if hasattr(self.renderer, "switch_track_layout"):
+                        self.renderer.switch_track_layout(self.env.maps[idx])
                     
             if is_active:
                 imgui.pop_style_color()
@@ -137,7 +141,7 @@ class ImGuiManager:
             # NOTE: We only pull agent 0 to the CPU to prevent massive frame drops.
             # Pulling thousands of agents to the CPU every frame for UI will destroy performance.
             car_state = self.env.cars_buf[0].cpu().numpy()
-            car_reward = self.env.rew_buf[0].cpu().numpy()
+            car_reward = float(self.env.rew_buf[0].cpu().numpy())
             
             car_x = car_state[0]
             car_y = car_state[1]

@@ -18,12 +18,15 @@ class Environment:
     seed: int
     seed_base: int
     device: str
-    map: Map
+    maps: list[Map]
+    num_maps: int
+    switch_map_iter: int
     vs: Optional['Visuals']
     
-    dt_buf: wp.array
-    lut_buf: wp.array
-    centerline_buf: wp.array
+    # Persistent 3D/2D Batched Map Buffers (Stored on GPU VRAM)
+    dt_buf: wp.array          # Shape: (num_maps, max_w, max_h)
+    lut_buf: wp.array         # Shape: (num_maps, max_w, max_h)
+    centerline_buf: wp.array  # Shape: (num_maps, max_n_cl) of wp.vec3
     cars: wp.array
     cars_int: wp.array
     car_dr: wp.array
@@ -34,7 +37,14 @@ class Environment:
     lidar_buf: wp.array
     _zero_act: wp.array
     
-    map_origin: wp.vec2
+    # GPU-Side Track Metadata Arrays
+    maps_origin: wp.array     # Shape: (num_maps) of wp.vec2
+    maps_res: wp.array        # Shape: (num_maps) of float
+    maps_n_cl: wp.array       # Shape: (num_maps) of int
+    maps_look_step: wp.array   # Shape: (num_maps) of int
+
+    # Environment-to-Track Routing Buffer
+    env_map_ids: wp.array     # Shape: (num_envs) of int
     
     obs_buf: torch.Tensor
     rew_buf: torch.Tensor
@@ -51,27 +61,25 @@ class Environment:
     look_step: int
     _call: int
 
-    def __init__(self, maps_dir: Path, num_envs: int, seed: int, target_device: wp.Device, live_viewer: bool):
+    def __init__(self, maps_dir: Path, num_envs: int, seed: int, target_device: wp.Device, live_viewer: bool, switch_map_iter: int = 1000):
         self.num_envs = num_envs
         self.seed = seed
         self.seed_base = seed  
         self._call = 0         
         self.device = target_device
+        self.switch_map_iter = switch_map_iter
         
         self.available_maps = []
-        self.current_map_idx = 0
-        
         self._initialize_map_library(maps_dir)
         
-        # Explicit allocations done only ONCE to prevent losing compilation pointer references
+        # Explicit allocations done only ONCE
         self._allocate_persistent_buffers()
-        
-        self.load_map_by_index(self.current_map_idx)
+        self._initialize_all_maps()
         
         self.vs = None
         if live_viewer:
             from include.visuals import Visuals
-            self.vs = Visuals(self, self.map)
+            self.vs = Visuals(self, self.maps[0])
 
     def _initialize_map_library(self, maps_dir: Path) -> None:
         resolved_target = Path(maps_dir).resolve()
@@ -111,75 +119,81 @@ class Environment:
         angles = np.linspace(-LIDAR_FOV / 2, LIDAR_FOV / 2, NUM_LIDAR, dtype=np.float32)
         self.lidar_buf = wp.array(np.column_stack([np.cos(angles), np.sin(angles)]), dtype=wp.vec2, device=d)
         self._zero_act = wp.zeros(self.num_envs, dtype=wp.vec2, device=d)
+        self.env_map_ids = wp.zeros(self.num_envs, dtype=int, device=d)
 
-    def load_map_by_index(self, idx: int) -> None:
-        if not (0 <= idx < len(self.available_maps)):
-            raise IndexError(f"[Env Error] Target index {idx} falls outside map library boundary limits.")
-            
-        self.current_map_idx = idx
-        current_map_path = self.available_maps[self.current_map_idx]
-        
-        print(f"[Environment] Activating track layout [{self.current_map_idx}]: {current_map_path.name}")
-        self.load_map(current_map_path, reset_call_count=True)
-        
-        if hasattr(self, 'vs') and self.vs is not None:
-            self.vs.switch_track_layout(self.map)
-
-    def cycle_next_map(self, randomize: bool = False) -> None:
-        if len(self.available_maps) <= 1:
-            return
-        if randomize:
-            choices = [i for i in range(len(self.available_maps)) if i != self.current_map_idx]
-            next_idx = int(np.random.choice(choices))
-        else:
-            next_idx = (self.current_map_idx + 1) % len(self.available_maps)
-            
-        self.load_map_by_index(next_idx)
-
-    def load_map(self, map_path: Path, reset_call_count: bool = False) -> None:
-        self.map = Map(map_path)
-        if reset_call_count:
-            self._call = 0
-        self._update_map_dependent_buffers()
-
-    def _update_map_dependent_buffers(self) -> None:
-        """In-place updates internal track data arrays to prevent breaking graph pointers."""
-        self.look_step = self.map.look_step
+    def _initialize_all_maps(self) -> None:
+        """Pads and bakes all map structures into static GPU memory footprints once."""
         d = self.device
+        self.maps = [Map(p) for p in self.available_maps]
+        self.num_maps = len(self.maps)
+        
+        # Identify bounding constraint limits across all tracks to maintain square alignment
+        max_shape_0 = max(m.dt.T.shape[0] for m in self.maps)
+        max_shape_1 = max(m.dt.T.shape[1] for m in self.maps)
+        max_n_cl = max(len(m.centerline) for m in self.maps)
+        
+        # Build host-side allocation pads
+        dt_np = np.zeros((self.num_maps, max_shape_0, max_shape_1), dtype=np.float32)
+        lut_np = np.zeros((self.num_maps, max_shape_0, max_shape_1), dtype=np.int32)
+        cl_np = np.zeros((self.num_maps, max_n_cl, 3), dtype=np.float32)
+        
+        n_cl_list, origins_list, res_list, look_step_list = [], [], [], []
+        
+        for idx, m in enumerate(self.maps):
+            s0, s1 = m.dt.T.shape
+            dt_np[idx, :s0, :s1] = m.dt.T.astype(np.float32)
+            lut_np[idx, :s0, :s1] = m.lut.T.astype(np.int32)
+            
+            n_cl_curr = len(m.centerline)
+            cl_np[idx, :n_cl_curr, 0:2] = m.centerline
+            cl_np[idx, :n_cl_curr, 2] = m.angles
+            
+            n_cl_list.append(n_cl_curr)
+            origins_list.append(wp.vec2(m.ox, m.oy))
+            res_list.append(float(m.res))
+            look_step_list.append(int(m.look_step))
+            
+        # Ship packed tensors permanently over to GPU VRAM
+        self.dt_buf = wp.array(dt_np, dtype=float, device=d)
+        self.lut_buf = wp.array(lut_np, dtype=int, device=d)
+        self.centerline_buf = wp.array(cl_np, dtype=wp.vec3, device=d)
+        
+        self.maps_n_cl = wp.array(n_cl_list, dtype=int, device=d)
+        self.maps_origin = wp.array(origins_list, dtype=wp.vec2, device=d)
+        self.maps_res = wp.array(res_list, dtype=float, device=d)
+        self.maps_look_step = wp.array(look_step_list, dtype=int, device=d)
+        
+        # Execute initial randomized distribution
+        self._shuffle_and_assign_maps()
 
-        # Re-initialize track arrays safely
-        self.dt_buf = wp.array(self.map.dt.T.astype(np.float32), dtype=float, device=d)
-        self.lut_buf = wp.array(self.map.lut.T.astype(np.int32), dtype=int, device=d)
-        self.centerline_buf = wp.array(
-            np.column_stack([self.map.centerline, self.map.angles]).astype(np.float32),
-            dtype=wp.vec3, device=d
-        )
-        self.n_cl = len(self.map.centerline)
-        self.map_origin = wp.vec2(self.map.ox, self.map.oy)
-
-        # Procedurally populate starting line poses safely in-place on the host side
-        rng = np.random.default_rng(self.seed)
-        idxs = rng.integers(0, self.n_cl, size=self.num_envs)
+    def _shuffle_and_assign_maps(self) -> None:
+        """Distributes vector batches across track profiles and switches start configurations."""
+        rng = np.random.default_rng(self.seed + self._call)
+        
+        # Uniform random distribution of map selections to environments
+        assigned_maps = rng.integers(0, self.num_maps, size=self.num_envs).astype(np.int32)
+        self.env_map_ids.assign(assigned_maps)
         
         cars_np = np.zeros((self.num_envs, 7), dtype=np.float32)
-        cars_np[:, 0] = self.map.centerline[idxs, 0]
-        cars_np[:, 1] = self.map.centerline[idxs, 1]
-        cars_np[:, 4] = self.map.angles[idxs]
-        
         cars_int_np = np.zeros((self.num_envs, 3), dtype=np.int32)
-        cars_int_np[:, 1] = idxs
         
-        dr_init_np = (1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((self.num_envs, 4), dtype=np.float32))
-
-        # Correct NVIDIA Warp syntax for in-place assignment from NumPy arrays
+        for i in range(self.num_envs):
+            m_idx = assigned_maps[i]
+            m = self.maps[m_idx]
+            cl_idx = rng.integers(0, len(m.centerline))
+            
+            # Reposition vehicles directly on their target track's starting nodes
+            cars_np[i, 0] = m.centerline[cl_idx, 0]
+            cars_np[i, 1] = m.centerline[cl_idx, 1]
+            cars_np[i, 4] = m.angles[cl_idx]
+            cars_int_np[i, 1] = cl_idx
+            
         self.cars.assign(cars_np)
         self.cars_int.assign(cars_int_np)
+        
+        dr_init_np = (1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((self.num_envs, 4), dtype=np.float32))
         self.car_dr.assign(dr_init_np)
-
-        # Warm-up compile phase execution
-        self._launch(self._zero_act)
-        self._sanitize()
-        self._step_counter.zero_()
+        
         self.rew_buf.zero_()
         self.done_buf.zero_()
 
@@ -187,17 +201,15 @@ class Environment:
         self._launch(wp.from_torch(action.detach().contiguous(), dtype=wp.vec2))
         self._sanitize()
         
-        # In-place logical checks on underlying tracking buffers
         torch.eq(self.done_buf, DONE_TERMINATED, out=self.term_buf)
         torch.eq(self.done_buf, DONE_TRUNCATED, out=self.trunc_buf)
 
+        if self.switch_map_iter > 0 and self._call % self.switch_map_iter == 0:
+            self._shuffle_and_assign_maps()
+
         return (
-            self.obs_buf,
-            self.critic_obs_buf,
-            self.rew_buf,
-            self.term_buf,
-            self.trunc_buf,
-            self._empty_info,
+            self.obs_buf, self.critic_obs_buf, self.rew_buf,
+            self.term_buf, self.trunc_buf, self._empty_info,
         )
     
     def reset(self) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
@@ -232,14 +244,13 @@ class Environment:
             dim=self.num_envs,
             inputs=[
                 act, self.obs, self.critic_obs, self.rew, self.done, self.cars, self.cars_int, self.car_dr,
-                self.map_origin, self.map.res, self.dt_buf, self.lut_buf, self.centerline_buf,
-                self.n_cl, self.lidar_buf, int(seed),
+                self.centerline_buf, self.dt_buf, self.lut_buf, self.maps_origin, self.maps_res,
+                self.maps_n_cl, self.maps_look_step, self.env_map_ids, self.lidar_buf, int(seed),
             ],
         )
         self._call += 1
-        # Synchronize streams to guarantee that Warp completes before PyTorch modifications run
         wp.synchronize_device()
-    
+
     def _sanitize(self) -> None:
         torch.nan_to_num_(self.obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)
         torch.nan_to_num_(self.critic_obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)

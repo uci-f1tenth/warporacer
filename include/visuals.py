@@ -39,12 +39,12 @@ class Visuals:
             screen_height=720,
             near_plane=0.1,
             far_plane=1000,
-            up_axis="Z",  # Note: Internal sun directions are fixed inside this instance
+            up_axis="Z",  
             background_color=(0, 0, 0),
             draw_grid=False,
             draw_axis=False,
             draw_sky=False,
-            device=wp.get_device()
+            device=env.device #  Uses your explicitly requested runtime device
         )
 
         # Mount HUD overlay layer management system using OpenGL callbacks
@@ -191,11 +191,13 @@ class Visuals:
 
     def _render_all_agents(self) -> None:
         """Handles structural allocation, color distribution, and updates for massive parallel agent swarms."""
-        # Adjust this divider to control rendering density (e.g., 100 renders 1% of total agents)
         agent_count_divider = 16
         
-        # OPTIMIZATION 1: Single GPU-to-CPU transfer & immediate array slicing.
-        # This grabs only the subset of cars we actually intend to render.
+        # Safeguard: If the environment swapped track layouts under the hood, force-refresh the visual layers
+        if self.map.path_name != self.env.maps[0].path_name:
+            # Assumes your Environment exposes an active map layout tracking reference
+            self.switch_track_layout(self.env.maps[0])
+            
         car_states = self.env.cars_buf.cpu().numpy()[::agent_count_divider]
         num_cars_to_render = len(car_states)
         

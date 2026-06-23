@@ -81,21 +81,21 @@ def main(
 
     # Map Mode Selection & Validation Pipelines
     # -----------------------------------------------------------------------------
+    # The 3D tensor environment always requires a directory path to aggregate layout buffers
+    if not maps_dir.is_dir():
+        raise NotADirectoryError(
+            f"[Error] maps_dir must be a valid directory containing layout assets: {maps_dir}"
+        )
+        
+    available_maps = list(maps_dir.glob("*.yaml"))
+    if not available_maps:
+        raise FileNotFoundError(f"[Error] No .yaml map files found in directory: {maps_dir}")
+
     if switch_map_iter == 0:
-        if not maps_dir.is_file():
-            raise FileNotFoundError(
-                f"[Error] switch_map_iter is 0 (Single Map Mode), but maps_dir is not a valid file: {maps_dir}"
-            )
-        print(f"[Mode] Single Map Mode. Running exclusively on: {maps_dir.name}")
+        # Single-map mode simply locks all parallel environments to the first loaded map index
+        print(f"[Mode] Single Map Mode. Running exclusively on baseline layout: {available_maps[0].name}")
     else:
-        if not maps_dir.is_dir():
-            raise NotADirectoryError(
-                f"[Error] switch_map_iter is {switch_map_iter} (Multi-Map Mode), but maps_dir is not a valid directory: {maps_dir}"
-            )
-        available_maps = list(maps_dir.glob("*.yaml"))
-        if not available_maps:
-            raise FileNotFoundError(f"[Error] No .yaml map files found in directory: {maps_dir}")
-        print(f"[Mode] Multi-Map Mode. Loaded {len(available_maps)} maps from: {maps_dir.name}")
+        print(f"[Mode] Multi-Map Mode. Batched {len(available_maps)} layouts concurrently from: {maps_dir.name}")
 
     # Bind the contextual physical compute resource block
     with wp.ScopedDevice(target_device):

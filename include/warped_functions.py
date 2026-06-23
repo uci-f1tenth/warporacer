@@ -134,18 +134,26 @@ def step_kernel(
     cars: wp.array2d[wp.float32],
     cars_int: wp.array2d[wp.int32],
     car_dr: wp.array2d[wp.float32],
-    origin: wp.vec2,
-    res: float,
-    dt_map: wp.array2d[wp.float32],
-    cl_lut: wp.array2d[wp.int32],
-    centerline: wp.array[wp.vec3],
-    n_cl: int,
+    centerline: wp.array2d[wp.vec3],       # Shape: (num_maps, max_n_cl)
+    dt_map: wp.array3d[wp.float32],        # Shape: (num_maps, max_w, max_h)
+    cl_lut: wp.array3d[wp.int32],          # Shape: (num_maps, max_w, max_h)
+    maps_origin: wp.array[wp.vec2],        # Shape: (num_maps)
+    maps_res: wp.array[wp.float32],        # Shape: (num_maps)
+    maps_n_cl: wp.array[wp.int32],         # Shape: (num_maps)
+    maps_look_step: wp.array[wp.int32],    # Shape: (num_maps)
+    env_map_ids: wp.array[wp.int32],       # Shape: (num_envs)
     lidar_dirs: wp.array[wp.vec2],
     seed_base: int,
 ):
     i = wp.tid()
     
-    # Extract current physical state
+    # Extract dynamic track profile context for this thread
+    map_idx = env_map_ids[i]
+    origin = maps_origin[map_idx]
+    res = maps_res[map_idx]
+    n_cl = maps_n_cl[map_idx]
+    
+    # Extract current physical state (Keep original variables here)
     x = cars[i, 0]
     y = cars[i, 1]
     delta = cars[i, 2]
@@ -163,8 +171,9 @@ def step_kernel(
     lf_s = car_dr[i, 2]
     lr_s = car_dr[i, 3]
 
-    mw = dt_map.shape[0]
-    mh = dt_map.shape[1]
+    # Shapes now reflect 3D Tensor indexing (skip dimension 0)
+    mw = dt_map.shape[1]
+    mh = dt_map.shape[2]
     mh_f = wp.float32(mh) - 1.0
     df32 = wp.float32(DR_FRAC)
 
@@ -201,8 +210,8 @@ def step_kernel(
     px = wp.clamp(wp.int32((x - origin[0]) / res), 0, mw - 1)
     py = wp.clamp(wp.int32(mh_f - (y - origin[1]) / res), 0, mh - 1)
     
-    # Waypoint track delta extraction
-    new_wp = cl_lut[px, py]
+    # Lookups now use 3D map index and 2D centerline row
+    new_wp = cl_lut[map_idx, px, py]
     d_wp = new_wp - wp_i
     if 2 * d_wp > n_cl:
         d_wp -= n_cl
@@ -210,7 +219,7 @@ def step_kernel(
         d_wp += n_cl
 
     # Pull local track geometry constants
-    cpt_local = centerline[new_wp]
+    cpt_local = centerline[map_idx, new_wp]
     cx_local = cpt_local[0]
     cy_local = cpt_local[1]
     cth_local = cpt_local[2]
@@ -226,7 +235,7 @@ def step_kernel(
 
     # Compute termination limits
     true_lateral_dist = wp.abs(-(x - cx_local) * s_cth_local + (y - cy_local) * c_cth_local)
-    edt_val = dt_map[px, py] * res
+    edt_val = dt_map[map_idx, px, py] * res
     is_stable = wp.isfinite(x) and wp.isfinite(y) and wp.isfinite(v) and wp.isfinite(psi)
     is_off_track = true_lateral_dist > MAX_CENTERLINE_DEV  
     
@@ -249,7 +258,7 @@ def step_kernel(
         base_progress = base_progress * BACKWARDS_PROGRESS_PENALTY_MUL
 
     target_wp = (new_wp + dynamic_look_step) % n_cl
-    cth_target = centerline[target_wp][2]
+    cth_target = centerline[map_idx, target_wp][2]
     v_along = v * wp.max(0.0, wp.cos(beta + psi - cth_target))
     vel_progress = v_along * PROGRESS_V_COEF
 
@@ -268,7 +277,8 @@ def step_kernel(
         if rnd >= n_cl:
             rnd = n_cl - 1
             
-        rpt = centerline[rnd]
+        # Query thread-specific map slice
+        rpt = centerline[map_idx, rnd]
         x = rpt[0]
         y = rpt[1]
         psi = rpt[2]
@@ -287,15 +297,14 @@ def step_kernel(
         car_dr[i, 2] = wp.float32(1.0) - df32 + wp.float32(2.0) * df32 * wp.randf(rng)
         car_dr[i, 3] = wp.float32(1.0) - df32 + wp.float32(2.0) * df32 * wp.randf(rng)
 
-        # Synchronize lookups with the new reset waypoint coordinates
-        cpt_local = centerline[new_wp]
+        # Query thread-specific map slice
+        cpt_local = centerline[map_idx, new_wp]
         cx_local = cpt_local[0]
         cy_local = cpt_local[1]
         cth_local = cpt_local[2]
         s_cth_local = wp.sin(cth_local)
         c_cth_local = wp.cos(cth_local)
         
-        # Reset observation look step to baseline because velocity is now 0.0
         dynamic_look_step = wp.int32(wp.float32(BASE_STRIDE))
 
     # =========================================================================
@@ -329,7 +338,8 @@ def step_kernel(
             ry = wp.int32(ray[1])
             if rx < 0 or rx >= mw or ry < 0 or ry >= mh:
                 break
-            step_px = dt_map[rx, ry]
+            # Query distance value via 3D map reference
+            step_px = dt_map[map_idx, rx, ry]
             ray = ray + dpx * step_px
             dist += step_px
             if step_px == 0.0:
@@ -344,7 +354,8 @@ def step_kernel(
     idx = new_wp
     for k in range(NUM_LOOKAHEAD):
         idx = (idx + dynamic_look_step) % n_cl
-        w = centerline[idx]
+        # Query waypoint matrix via 2D lookup track reference
+        w = centerline[map_idx, idx]
         dx = w[0] - x
         dy = w[1] - y
         obs[i, OBS_LOOK_OFF + k * 2] = dx * ch + dy * sh

@@ -65,6 +65,9 @@ class Map:
         self.ox, self.oy, _ = self.meta["origin"]
         self.h, self.w = self.raw.shape
         self.res = float(self.meta["resolution"])
+        
+        # Expose shape footprint explicitly for Environment validation checks
+        self.shape = (self.h, self.w)
 
         # 5. Execute processing pipeline
         self._calculate_wall_bounds()
