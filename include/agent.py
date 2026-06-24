@@ -421,10 +421,9 @@ def train(
     N: int = env.num_envs
     
     B: int = rollouts * N
-    TARGET_MINIBATCH_SIZE = 16384 * 4
+    TARGET_MINIBATCH_SIZE = 16384 * 16
     calculated_minibatches = max(1, B // TARGET_MINIBATCH_SIZE)
     mb: int = B // calculated_minibatches
-    permutation_indices = torch.arange(B, device=device)
     
     print("=" * 80)
     print(f" -> Compute Device      : {device} | Parallel Envs (N): {N:,}")
@@ -458,10 +457,9 @@ def train(
     finished_lens: deque = deque(maxlen=100)
 
     global_step: int = 0
-    t0: float = time.time()
-    last_t: float = t0
-    current_epochs: int = epochs
     start_wall_clock = time.time()
+    last_t: float = start_wall_clock
+    current_epochs: int = epochs
 
     for it in range(iterations):
         agent.eval()
@@ -648,4 +646,4 @@ def train(
             obs_rms.update(raw[..., 3:])
             obs = process_observations(raw, obs_rms)
             
-    return time.time() - t0, obs_rms, ret_rms, global_step
+    return time.time() - start_wall_clock, obs_rms, ret_rms, global_step
