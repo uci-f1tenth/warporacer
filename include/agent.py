@@ -250,7 +250,7 @@ def _log_training_summary(it: int, global_step: int, sps: int, avg_ent: float, a
     er = log.get("ep_return", float("nan"))
     el = log.get("ep_length", float("nan"))
     cpu = process_profile.cpu_percent()
-    ram = process_profile.memory_info().rss / 1048576
+    gpu_util = torch.cuda.utilization()
 
     real_elapsed = time.time() - start_wall_clock
     rh, rem = divmod(real_elapsed, 3600)
@@ -266,7 +266,7 @@ def _log_training_summary(it: int, global_step: int, sps: int, avg_ent: float, a
         f"[{it:4d}] Real:{real_str} Sim:{sim_str} | {sps:>5d} SPS | "
         f"R:{er:6.1f} L:{el:5.1f} Ent:{avg_ent:.3f} | "
         f"V:{avg_v:.3f} P:{avg_pg:.3f} Clp:{avg_clip:.2f} KL:{final_kl:.3f} | "
-        f"LR:{current_lr:.1e} Ep:{current_epochs} | RAM:{ram:4.0f}M CPU:{cpu:4.1f}%"
+        f"LR:{current_lr:.1e} Ep:{current_epochs} | GPU:{gpu_util:3d}% CPU:{cpu:4.1f}%"
     )
 
 
@@ -516,7 +516,7 @@ def train(
     N: int = env.num_envs
     
     B: int = rollouts * N
-    TARGET_MINIBATCH_SIZE: int = 16384 * 16
+    TARGET_MINIBATCH_SIZE: int = 16384 * 8
     calculated_minibatches: int = max(1, B // TARGET_MINIBATCH_SIZE)
     mb: int = int(B // calculated_minibatches)
 

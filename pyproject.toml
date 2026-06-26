@@ -11,6 +11,7 @@ dependencies = [
     "matplotlib>=3.10.9",
     "ninja>=1.12.0",
     "numpy>=2.4.4",
+    "nvidia-ml-py>=13.610.43",
     "opencv-contrib-python>=4.13.0",
     "psutil>=6.0.0",
     "pyglet>=2.1.14",
