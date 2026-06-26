@@ -108,7 +108,7 @@ class Environment:
         seed: int,
         target_device: wp.Device,
         live_viewer: bool,
-        max_active_maps: int = 10,
+        max_active_maps: int,
     ) -> None:
         """Initializes the simulation cluster and structures tracking views."""
         self.num_envs = num_envs

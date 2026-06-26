@@ -394,6 +394,108 @@ def record_rollout(env: Environment, agent: Agent, num_steps: int, out_path: Pat
         env.restore_state(snap)
         agent.train(was_training)
 
+def print_ppo_initialization_report(
+    agent, device, N: int, rollouts: int, B: int, 
+    TARGET_MINIBATCH_SIZE: int, calculated_minibatches: int, mb: int,
+    iterations: int, epochs: int, gamma: float, gae_lambda: float, 
+    clip: float, vf_clip: float, vf_coef: float, ent_coef: float, 
+    max_grad_norm: float, lr: float, target_kl: float,
+    switch_map_iter: int, use_wandb_train: bool, log_dir: any, record_every_iteration: int,
+    opt, sched, obs_rms, ret_rms, scaler, buffers, cpu_history_tensor
+) -> None:
+    """Performs strict Python reflection to audit all pre-loop initializations and objects."""
+    import torch
+    import torch.nn as nn
+
+    # 1. Dynamic Layer Reflection & Structural Extraction
+    linear_layers_actor = [m for m in agent.actor.modules() if isinstance(m, nn.Linear)]
+    obs_dim = linear_layers_actor[0].in_features if linear_layers_actor else 0
+    act_dim = linear_layers_actor[-1].out_features if linear_layers_actor else 0
+    hidden_dim = linear_layers_actor[0].out_features if linear_layers_actor else 0
+    actor_depth = len(linear_layers_actor) # <--- Dynamic Actor Depth
+
+    linear_layers_critic = [m for m in agent.critic.modules() if isinstance(m, nn.Linear)]
+    critic_dim = linear_layers_critic[0].in_features if linear_layers_critic else 0
+    critic_depth = len(linear_layers_critic) # <--- Dynamic Critic Depth
+
+    total_params = sum(p.numel() for p in agent.parameters())
+    is_compiled = hasattr(agent, "act_value_compiled") and type(agent.act_value_compiled).__name__ != "method"
+
+    # 2. Dynamic Optimizer & Scheduler Inspection (Uses: opt, sched, iterations)
+    opt_name = type(opt).__name__
+    opt_eps = opt.param_groups[0].get("eps", 1e-8)
+    opt_fused = opt.defaults.get("fused", False)
+    
+    sched_name = type(sched).__name__
+    sched_max_iter = getattr(sched, "T_max", iterations)
+    sched_eta_min = getattr(sched, "eta_min", 0.0)
+
+    # 3. Normalizer State Inspection (Uses: obs_rms, ret_rms, gamma)
+    obs_rms_shape = obs_rms.mean.shape if hasattr(obs_rms, "mean") else "Unknown"
+    ret_rms_gamma = getattr(ret_rms, "gamma", gamma)
+
+    # 4. Memory Allocations & Pinned Host Check (Uses: scaler, cpu_history_tensor, buffers)
+    is_amp_enabled = scaler.is_enabled()
+    is_memory_pinned = cpu_history_tensor.is_pinned()
+
+    buffer_bytes = sum(b.element_size() * b.nelement() for b in buffers.__dict__.values() if isinstance(b, torch.Tensor))
+    total_alloc_mb = buffer_bytes / (1024 * 1024)
+
+    print("\n" + "═" * 90)
+    print(f" AUDITED PPO RUNTIME INITIALIZATION SUMMARY ".center(90, "═"))
+    print("═" * 90)
+
+    # --- SECTION 1: HARDWARE & ACCELERATION CONFIG (Uses: device, is_compiled, is_amp_enabled) ---
+    print(f"  [ BACKEND HARDWARE RUNTIME CONFIGURATION ]")
+    print(f"    • Compute Device Target      : {device}")
+    print(f"    • Matrix Layout Alignment    : TensorFloat-32 (TF32) ──> Matmul: {torch.backends.cuda.matmul.allow_tf32} | cuDNN: {torch.backends.cudnn.allow_tf32}")
+    print(f"    • Policy Graph Compilation   : torch.compile Execution Active ──> {is_compiled}")
+    print(f"    • Mixed Precision Scaler     : torch.amp.GradScaler Enabled ──> {is_amp_enabled}")
+    print("-" * 90)
+
+    # --- SECTION 2: LIVE MODEL TOPOLOGY AUDIT ---
+    print(f"  [ LIVE MODEL TOPOLOGY AUDIT ]")
+    print(f"    • Network Layer Depth        : Actor Depth: {actor_depth} layers | Critic Depth: {critic_depth} layers")
+    print(f"    • Feature Projections        : Input State Vector: {obs_dim} ──> Hidden Units: {hidden_dim} ──> Action Heads: {act_dim}")
+    print(f"    • Privileged Critic Input    : Centralized Value State Vector Width: {critic_dim}")
+    print(f"    • Verified Parameter Volume  : Total Parameter Parameters: {total_params:,}")
+    print("-" * 90)
+
+    # --- SECTION 3: REUSE PIPELINE (Uses: N, rollouts, B, mb, calculated_minibatches, total_alloc_mb, is_memory_pinned, epochs, TARGET_MINIBATCH_SIZE) ---
+    print(f"  [ PIPELINE DATA DISTRIBUTION & MEMORY FOOTPRINT ]")
+    print(f"    • Parallel Track Workers (N) : {N:,} streams")
+    print(f"    • Steps Collected per Env (T): {rollouts:,} rollout steps")
+    print(f"    • Flattened Dataset Size (B) : {B:,} transitions")
+    print(f"    • Target Slice Partition Step: {TARGET_MINIBATCH_SIZE:,} transitions")
+    print(f"    • True Minibatch Segment (mb): {mb:,} transitions per gradient step ({calculated_minibatches} minibatches)")
+    print(f"    • Exact Sample Point Reuse   : {epochs * calculated_minibatches} optimizing updates per data vector")
+    print(f"    • Rollout Buffers Footprint  : Pre-allocated Buffer Tensors: {total_alloc_mb:.2f} MB")
+    print(f"    • PCIe Async Buffer Mirror   : Host System Memory Pinned (Zero-Copy) ──> {is_memory_pinned}")
+    if B % mb != 0:
+        print(f"    ⚠️  DIVISIBILITY WARNING      : Total Batch ({B:,}) is not divisible by mb ({mb:,}). Remainder slice: {B % mb:,}")
+    print("-" * 90)
+
+    # --- SECTION 4: HYPERPARAMETERS (Uses: opt_name, opt_fused, opt_eps, sched_name, lr, sched_eta_min, sched_max_iter, ret_rms_gamma, gae_lambda, obs_rms_shape, clip, vf_coef, vf_clip, max_grad_norm, ent_coef, target_kl) ---
+    print(f"  [ ACTIVE REINFORCEMENT LEARNING CONSTRAINTS ]")
+    print(f"    • Core Engine Optimizer      : {opt_name} (Fused Execution Engine ──> {opt_fused} | eps={opt_eps})")
+    print(f"    • Learning Rate Schedule     : {sched_name} (Max LR: {lr:.2e} ──> Base Min LR: {sched_eta_min:.2e} over {sched_max_iter} steps)")
+    print(f"    • Scaling Reward Vector      : Return Tracking Discount Vector (Gamma) ──> {ret_rms_gamma} | GAE Lambda ──> {gae_lambda}")
+    print(f"    • Observation Tracking Scope : Running Mean Tracking Shape Array ──> {list(obs_rms_shape)}")
+    print(f"    • Policy Clip Boundary (ε)   : {clip} (Constrains ratios inside [{1.0-clip:.2f}, {1.0+clip:.2f}])")
+    print(f"    • Value Function Restraints  : Loss Coefficient: {vf_coef} | Clipping Window: {vf_clip}")
+    print(f"    • Regularization Metrics     : Max Gradient Norm Limit: {max_grad_norm} | Initial Entropy: {ent_coef}")
+    print(f"    • Divergence Bounds Gate     : Lower Target KL: {target_kl} | Max Adaptive Gating Limit: {1.5 * target_kl:.4f}")
+    print("-" * 90)
+
+    # --- SECTION 5: METRICS & LIFECYCLES (Uses: iterations, B, switch_map_iter, record_every_iteration, log_dir, use_wandb_train) ---
+    print(f"  [ ENVIRONMENT MONITORING LOGISTICS ]")
+    print(f"    • Projected Total Lifecycles : {iterations:,} Iterations | {B * iterations:,} Total Step Transitions")
+    print(f"    • Map Rotation Sequence      : Automated rotation triggered every {switch_map_iter:,} iterations")
+    print(f"    • Hardware Rendering Interv. : MP4 video compilation checkpointed every {record_every_iteration:,} iterations")
+    print(f"    • Workspace Output Target    : {log_dir}")
+    print(f"    • Telemetry Stream Engine    : WandB Sync Backend ──> {'ENABLED' if use_wandb_train else 'DISABLED'}")
+    print("═" * 90 + "\n")
+
 def train(
     env: Environment,
     agent: Agent,
@@ -421,14 +523,9 @@ def train(
     N: int = env.num_envs
     
     B: int = rollouts * N
-    TARGET_MINIBATCH_SIZE = 16384 * 16
-    calculated_minibatches = max(1, B // TARGET_MINIBATCH_SIZE)
-    mb: int = B // calculated_minibatches
-    
-    print("=" * 80)
-    print(f" -> Compute Device      : {device} | Parallel Envs (N): {N:,}")
-    print(f" -> Total Batch Size (B): {B:,} steps/iteration | Minibatches: {calculated_minibatches}")
-    print("=" * 80)
+    TARGET_MINIBATCH_SIZE: int = 16384 * 8
+    calculated_minibatches: int = max(1, B // TARGET_MINIBATCH_SIZE)
+    mb: int = int(B // calculated_minibatches)
 
     opt: torch.optim.Optimizer = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5, fused=True)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=iterations, eta_min=4e-5)
@@ -460,6 +557,16 @@ def train(
     start_wall_clock = time.time()
     last_t: float = start_wall_clock
     current_epochs: int = epochs
+
+    print_ppo_initialization_report(
+        agent, device, N, rollouts, B, 
+        TARGET_MINIBATCH_SIZE, calculated_minibatches, mb,
+        iterations, epochs, gamma, gae_lambda, 
+        clip, vf_clip, vf_coef, ent_coef, 
+        max_grad_norm, lr, target_kl,
+        switch_map_iter, use_wandb_train, log_dir, record_every_iteration,
+        opt, sched, obs_rms, ret_rms, scaler, buffers, cpu_fin_history
+    )
 
     for it in range(iterations):
         agent.eval()
@@ -611,7 +718,7 @@ def train(
             "approx_kl": final_kl, 
             "clipfrac": avg_clip, 
             "current_epochs": current_epochs,  
-            "log_std": current_log_std,  # <--- Zero overhead, 100% current value!
+            "log_std": current_log_std,
             "iter_lr": current_lr, 
             "sps": sps, 
             "iteration": it,

@@ -53,7 +53,7 @@ def _validate_and_load_maps(maps_dir: Path, switch_map_iter: int) -> List[Path]:
     if switch_map_iter == 0:
         print(f"[Mode] Single Map Mode. Locking baseline layout: {available_maps[0].name}")
     else:
-        print(f"[Mode] Multi-Map Mode. Batched {len(available_maps)} layouts concurrently.")
+        print(f"[Mode] Multi-Map Mode. Found {len(available_maps)} maps.")
         
     return available_maps
 
@@ -103,6 +103,7 @@ def main(
     record_every_iteration: int = 100,
     record_duration_steps: int = 2000,
     switch_map_iter: int = 20,
+    max_active_maps: int = 16,
     device: Optional[str] = None,
     use_wandb: bool = False,
     log_dir_str: str = typer.Option("./logs", help="Target output logging directory"),
@@ -121,7 +122,7 @@ def main(
     _validate_and_load_maps(maps_dir, switch_map_iter)
 
     with wp.ScopedDevice(target_device):
-        env = Environment(maps_dir, num_envs, seed, target_device, live_viewer, max_active_maps=16)
+        env = Environment(maps_dir, num_envs, seed, target_device, live_viewer, max_active_maps)
 
         # Execution Stream A: Manual driving viewport loop
         if interactive:
