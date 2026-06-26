@@ -94,19 +94,30 @@ def _save_agent_checkpoint(agent: torch.nn.Module, obs_rms: any, log_dir: Path) 
 
 
 def main(
+    device: Optional[str] = None,
     maps_dir_str: str = typer.Option("maps/", help="Path to maps file or directory"),
-    num_envs: int = 16384,
     seed: int = 0,
+    num_envs: int = 16384,
     interactive: bool = False,
     live_viewer: bool = False,
+    max_active_maps: int = 20,
     iterations: int = 1000,
+    rollouts: int = 64,
+    epochs: int = 4,
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    clip: float = 0.2,
+    vf_clip: float = 0.2,
+    vf_coef: float = 0.5,
+    ent_coef: float = 0.01,
+    max_grad_norm: float = 0.5,
+    lr: float = 5.0e-4,
+    target_kl: float = 0.010,
+    log_dir_str: str = typer.Option("./logs", help="Target output logging directory"),
     record_every_iteration: int = 100,
     record_duration_steps: int = 2000,
     switch_map_iter: int = 20,
-    max_active_maps: int = 16,
-    device: Optional[str] = None,
-    use_wandb: bool = False,
-    log_dir_str: str = typer.Option("./logs", help="Target output logging directory"),
+    use_wandb: bool = False
 ) -> None:
     """Main orchestrator handling parallel reinforcement learning or interactive car runs."""
     maps_dir = Path(maps_dir_str).resolve()
@@ -141,12 +152,23 @@ def main(
         elapsed, obs_rms, _, step = train(
             env,
             agent,
-            iterations=iterations,
-            log_dir=log_dir,
-            record_every_iteration=record_every_iteration,
-            record_duration_steps=record_duration_steps,
-            switch_map_iter=switch_map_iter,
-            use_wandb_train=use_wandb
+            iterations,
+            rollouts,
+            epochs,
+            gamma,
+            gae_lambda,
+            clip,
+            vf_clip,
+            vf_coef,
+            ent_coef,
+            max_grad_norm,
+            lr,
+            target_kl,
+            log_dir,
+            record_every_iteration,
+            record_duration_steps,
+            switch_map_iter,
+            use_wandb
         )
         print(f"[Done!] Optimization path complete in {elapsed:.1f}s")
 
