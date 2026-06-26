@@ -81,16 +81,13 @@ class Agent(nn.Module):
     LOGSTD_MAX: float = -0.5
     HALF_LOG_TWO_PI: float = 0.9189385332046727
 
-    def __init__(self, obs_dim: int, critic_obs_dim: int, act_dim: int, hidden: int = 256) -> None:
+    def __init__(self, obs_dim: int, critic_obs_dim: int, act_dim: int, hidden: int = 128) -> None:
         super().__init__()
         
         self.actor: nn.Sequential = nn.Sequential(
             layer_init(nn.Linear(obs_dim, hidden)),
             nn.LayerNorm(hidden),
             nn.SiLU(), 
-            layer_init(nn.Linear(hidden, hidden)),
-            nn.LayerNorm(hidden),
-            nn.SiLU(),
             layer_init(nn.Linear(hidden, hidden)),
             nn.LayerNorm(hidden),
             nn.SiLU(),
@@ -104,14 +101,10 @@ class Agent(nn.Module):
             layer_init(nn.Linear(hidden, hidden)),
             nn.LayerNorm(hidden),
             nn.SiLU(),
-            layer_init(nn.Linear(hidden, hidden)),
-            nn.LayerNorm(hidden),
-            nn.SiLU(),
             layer_init(nn.Linear(hidden, 1), std=1.0),
         )
-        self.log_std: nn.Parameter = nn.Parameter(torch.zeros(1, act_dim))
 
-        # Compile the actor and the math for massive rollout speedups
+        self.log_std: nn.Parameter = nn.Parameter(torch.zeros(1, act_dim))
         self.act_value_compiled = torch.compile(self._act_value, mode="reduce-overhead")
 
     def value(self, critic_obs: torch.Tensor) -> torch.Tensor:
@@ -523,7 +516,7 @@ def train(
     N: int = env.num_envs
     
     B: int = rollouts * N
-    TARGET_MINIBATCH_SIZE: int = 16384 * 8
+    TARGET_MINIBATCH_SIZE: int = 16384 * 16
     calculated_minibatches: int = max(1, B // TARGET_MINIBATCH_SIZE)
     mb: int = int(B // calculated_minibatches)
 
