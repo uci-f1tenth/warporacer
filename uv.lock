@@ -30,6 +30,22 @@ wheels = [
 ]
 
 [[package]]
+name = "casadi"
+version = "3.7.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/92/62/1e98662024915ecb09c6894c26a3f497f4afa66570af3f53db4651fc45f1/casadi-3.7.2.tar.gz", hash = "sha256:b4d7bd8acdc4180306903ae1c9eddaf41be2a3ae2fa7154c57174ae64acdc60d", size = 6053600, upload-time = "2025-09-10T10:05:49.521Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/19/60/76074fcbd1cc246dd542a91ca53ed638133c3fb52ebf8400ea8edffd7a98/casadi-3.7.2-cp314-none-macosx_10_13_x86_64.macosx_10_13_intel.whl", hash = "sha256:f8faf88720477f63b48e96f443ba557931ddd3f5d7d08fc905148893b5c25917", size = 47116064, upload-time = "2025-09-11T08:15:13.381Z" },
+    { url = "https://files.pythonhosted.org/packages/66/79/b1eda4d4eeefa51f3b75e51f332e3837b86d063b9b889fdbcb92081f6831/casadi-3.7.2-cp314-none-macosx_11_0_arm64.whl", hash = "sha256:08762169bd464d5a00a15bf28d2ff7deac41d24a1da842a13153a833cd247b61", size = 42295048, upload-time = "2025-09-11T08:15:20.517Z" },
+    { url = "https://files.pythonhosted.org/packages/f2/06/e52fdaee135ebb5d0a004827848890d66e9e05b2148b4beb2a0150e7418d/casadi-3.7.2-cp314-none-manylinux2014_i686.whl", hash = "sha256:9b5683d06f7c5c2bc044585f2d3591d81ec0ad81de84db29765a8bca8247f9d7", size = 72430409, upload-time = "2025-09-10T14:09:48.176Z" },
+    { url = "https://files.pythonhosted.org/packages/92/50/8834ae629e425802b66505c9861061439b4510d1aca1c94ea067b129e3b5/casadi-3.7.2-cp314-none-manylinux2014_x86_64.whl", hash = "sha256:8861213b7fc605a67cf9b46b29c05337b70c773c0b9615939a7c8a3361cabed1", size = 75571314, upload-time = "2025-09-10T14:10:45.54Z" },
+    { url = "https://files.pythonhosted.org/packages/59/3a/aaf951d7921a7b657a3402e1e628ccd2c9dfdc6d29bf5aed209dca93073b/casadi-3.7.2-cp314-none-win_amd64.whl", hash = "sha256:62b7b1f943456447205673865e130ec9d97a6f931239968a46d9a7b40ea8c4c3", size = 50991682, upload-time = "2025-09-10T14:11:24.747Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2026.2.25"
 source = { registry = "https://pypi.org/simple" }
@@ -1308,6 +1324,7 @@ name = "warporacer"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "casadi" },
     { name = "gymnasium" },
     { name = "imageio", extra = ["ffmpeg"] },
     { name = "matplotlib" },
@@ -1326,6 +1343,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "casadi", specifier = ">=3.6.4" },
     { name = "gymnasium", specifier = ">=1.2.3" },
     { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.37.3" },
     { name = "matplotlib", specifier = ">=3.10.9" },
