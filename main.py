@@ -320,21 +320,26 @@ def step_kernel(
     TRACKING_COEF = 2.0
     SPEED_COEF = 1.5
 
-    cpt = centerline[new_wp]
-    target_x = cpt[0]
-    target_y = cpt[1]
-    target_v = cpt[2]
+    # 1. Raceline Tracking Penalty (Cross-track error)
+    offset = wp.abs(-(x - target_x) * wp.sin(cth) + (y - target_y) * wp.cos(cth))
+    tracking_pen = TRACKING_COEF * offset * offset
 
-    dx = x - target_x
-    dy = y - target_y
-    cross_track_error = wp.sqrt(dx * dx + dy * dy)
-    v_error = wp.abs(v - target_v)
+    # 2. Overspeed Penalty (Only punish if v > target_v)
+    # We square it so minor infractions are gentle, but reckless speeding is heavily punished
+    overspeed = wp.max(v - target_v, 0.0)
+    speed_pen = SPEED_COEF * overspeed * overspeed
 
-    progress = wp.float32(d_wp) / wp.float32(n_cl) * PROGRESS_SCALE
-    tracking_penalty = TRACKING_COEF * cross_track_error
-    speed_penalty = SPEED_COEF * v_error
+    # 3. Restored Velocity-Progress Reward
+    # This naturally incentivizes the car to accelerate up to the target_v
+    v_along = v * wp.cos(beta + psi - cth)
+    progress = (
+        wp.float32(d_wp)
+        / wp.float32(n_cl)
+        * PROGRESS_SCALE
+        * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
+    )
 
-    reward[i] = wp.where(term, -TERM_PENALTY, progress - prox_pen - tracking_penalty - speed_penalty)
+    reward[i] = wp.where(term, -TERM_PENALTY, progress - prox_pen - tracking_pen - speed_pen)
 
     if term:
         done[i] = DONE_TERMINATED
@@ -935,7 +940,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
 def train(
     env,
     agent,
-    iterations=2000,
+    iterations=1000,
     rollouts=24,
     epochs=5,
     minibatches=4,
