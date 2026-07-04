@@ -1,6 +1,8 @@
 import numpy as np
 import casadi as ca
 import pandas as pd
+
+
 g = 9.81
 def compute_raceline(centerline, width, mu): # physics??!?!?! unfamiliar concept
     N = len(centerline)

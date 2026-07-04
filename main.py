@@ -309,14 +309,26 @@ def step_kernel(
         WALL_PROX_COEF * prox_f * prox_f * (1.0 + wp.max(v, 0.0) / PROGRESS_V_COEF)
     )
 
-    # Symmetric centerline-offset penalty: perpendicular distance from the
-    # nearest centerline point, pulling the car toward the middle of the track
-    # everywhere (not just near walls). Quadratic, abs -> no left/right bias.
-    cpt = centerline[new_wp]
-    offset = wp.abs(-(x - cpt[0]) * wp.sin(cth) + (y - cpt[1]) * wp.cos(cth))
-    center_pen = CENTER_COEF * offset * offset
+    # centerline tracking rewards. 
 
-    reward[i] = wp.where(term, -TERM_PENALTY, progress - prox_pen - center_pen)
+    TRACKING_COEF = 2.0
+    SPEED_COEF = 1.5
+
+    cpt = centerline[new_wp]
+    target_x = cpt[0]
+    target_y = cpt[1]
+    target_v = cpt[2]
+
+    dx = x - target_x
+    dy = y - target_y
+    cross_track_error = wp.sqrt(dx * dx + dy * dy)
+    v_error = wp.abs(v - target_v)
+
+    progress = wp.float32(d_wp) / wp.float32(n_cl) * PROGRESS_SCALE
+    tracking_penalty = TRACKING_COEF * cross_track_error
+    speed_penalty = SPEED_COEF * v_error
+
+    reward[i] = wp.where(term, -TERM_PENALTY, progress - prox_pen - tracking_penalty - speed_penalty)
 
     if term:
         done[i] = DONE_TERMINATED
