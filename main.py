@@ -1,6 +1,7 @@
 import time
 from collections import deque
 from pathlib import Path
+from turtle
 
 import gymnasium as gym
 import imageio.v2 as imageio
@@ -9,6 +10,7 @@ import torch
 import torch.nn as nn
 import wandb
 import warp as wp
+import pandas as pd
 from cv2 import (
     COLOR_GRAY2RGB,
     IMREAD_GRAYSCALE,
@@ -215,7 +217,7 @@ def step_kernel(
     res: float,
     dt_map: wp.array2d(dtype=wp.float32),
     cl_lut: wp.array2d(dtype=wp.int32),
-    centerline: wp.array(dtype=wp.vec3),
+    centerline: wp.array(dtype=wp.vec4),
     n_cl: int,
     lidar_dirs: wp.array(dtype=wp.vec2),
     seed_base: int,
@@ -290,7 +292,11 @@ def step_kernel(
     elif 2 * d_wp < -n_cl:
         d_wp += n_cl
 
-    cth = centerline[new_wp][2]
+    cpt = centerline[new_wp]
+    target_x = cpt[0]
+    target_y = cpt[1]
+    cth = cpt[2]
+    target_v = cpt[3]
     v_along = v * wp.cos(beta + psi - cth)
     progress = (
         wp.float32(d_wp)
@@ -398,7 +404,7 @@ def step_kernel(
 
 # Map
 class Map:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, force_geometric: bool = False):
         self.meta = safe_load(path.read_text())
         img_path = path.parent / self.meta["image"]
         self.raw = imread(str(img_path), IMREAD_GRAYSCALE)
@@ -409,7 +415,23 @@ class Map:
         self.ox, self.oy, _ = self.meta["origin"]
         self.h, self.w = self.raw.shape
         self.res = float(self.meta["resolution"])
-        self._compute_centerline(free)
+
+        # load optimal raceline / compute if not present
+        raceline_dir = Path("racelines")
+        raceline_path = raceline_dir / f"{path.stem}_raceline.csv"
+        if raceline_path.exists() and not force_geometric:
+            print(f"Loading optimal raceline from: {raceline_path}")
+            df = pd.read_csv(raceline_path)
+            self.centerline = np.column_stack((df['x'], df['y']))
+            diffs = np.diff(self.centerline, axis=0, append=self.centerline[:1])
+            self.angles = np.arctan2(diffs[:, 1], diffs[:, 0])
+            self.v_target = df['v_target'].values.astype(np.float32)
+        else:
+            if not force_geometric:
+                print(f"No optimal raceline found for {path.stem}. Defaulting to geometric centerline.")
+            self._compute_centerline(free)
+            self.v_target = np.full(len(self.centerline), V_MAX, dtype=np.float32)
+            
         self._build_lut()
 
     @staticmethod
@@ -625,8 +647,8 @@ class RacingEnv:
                     "dt": wp.array(m.dt.T.astype(np.float32), dtype=float, device=d),
                     "lut": wp.array(m.lut.T.astype(np.int32), dtype=int, device=d),
                     "cl": wp.array(
-                        np.column_stack([m.centerline, m.angles]).astype(np.float32),
-                        dtype=wp.vec3,
+                        np.column_stack([m.centerline, m.angles, m.v_target]).astype(np.float32),
+                        dtype=wp.vec4,
                         device=d,
                     ),
                     "cars_v": wp.from_torch(self.cars_buf[a:b]),
