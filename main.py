@@ -1,7 +1,6 @@
 import time
 from collections import deque
 from pathlib import Path
-from turtle
 
 import gymnasium as gym
 import imageio.v2 as imageio
@@ -320,17 +319,15 @@ def step_kernel(
     TRACKING_COEF = 2.0
     SPEED_COEF = 1.5
 
-    # 1. Raceline Tracking Penalty (Cross-track error)
+    # Raceline Tracking Penalty (Cross-track error)
     offset = wp.abs(-(x - target_x) * wp.sin(cth) + (y - target_y) * wp.cos(cth))
     tracking_pen = TRACKING_COEF * offset * offset
 
-    # 2. Overspeed Penalty (Only punish if v > target_v)
-    # We square it so minor infractions are gentle, but reckless speeding is heavily punished
+    # speeding penalty
     overspeed = wp.max(v - target_v, 0.0)
     speed_pen = SPEED_COEF * overspeed * overspeed
 
-    # 3. Restored Velocity-Progress Reward
-    # This naturally incentivizes the car to accelerate up to the target_v
+    # velocity rewards
     v_along = v * wp.cos(beta + psi - cth)
     progress = (
         wp.float32(d_wp)
