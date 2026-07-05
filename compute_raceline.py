@@ -8,7 +8,7 @@ from main import Map
 g = 9.81
 
 # Optimizes centerline of a track to find optimal raceline by solving for minimum curve
-def compute_raceline(map_yaml, width = 0.4, mu = 1.0489): # physics??!?!?! unfamiliar concept
+def compute_raceline(map_yaml: str, width: float = 0.4, mu: float = 1.0489): # physics??!?!?! unfamiliar concept
     
 
     path = Path(map_yaml)
