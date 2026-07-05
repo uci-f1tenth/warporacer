@@ -9,6 +9,8 @@ g = 9.81
 
 # Optimizes centerline of a track to find optimal raceline by solving for minimum curve
 def compute_raceline(map_yaml, width = 0.4, mu = 1.0489): # physics??!?!?! unfamiliar concept
+    
+
     path = Path(map_yaml)
     track_map = Map(path, force_geometric = True)
     centerline = track_map.centerline
@@ -76,6 +78,6 @@ def compute_raceline(map_yaml, width = 0.4, mu = 1.0489): # physics??!?!?! unfam
     df.to_csv(output_file, index=False)
     print(f"Optimal raceline saved to '{output_file}'.")
 
-
+from typer import run
 if __name__ == "__main__":
-    compute_raceline("maps/berlin.yaml")
+    run(compute_raceline)
