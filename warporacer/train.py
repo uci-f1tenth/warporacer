@@ -66,9 +66,13 @@ def main(
             out = log_dir / f"rollout_{it + 1:06d}.mp4"
             try:
                 record_rollout(env, agent, ppo.obs_rms, record_steps, out)
-                wandb.log({"rollout": wandb.Video(str(out), format="mp4")}, step=ppo.global_step)
             except Exception as e:
                 print(f"[rollout {it + 1}] failed: {e}")
+            else:
+                try:
+                    wandb.log({"rollout": wandb.Video(str(out), format="mp4")}, step=ppo.global_step)
+                except Exception:
+                    pass
     print(f"[done] {time.time() - t0:.1f}s")
 
     save_checkpoint(agent, ppo, log_dir / "agent_final.npz")
@@ -81,7 +85,7 @@ def save_checkpoint(agent, ppo, path):
         **{f"agent/{k}": v.numpy() for k, v in agent.state_dict().items()},
         obs_mean=ppo.obs_rms.mean.numpy(),
         obs_var=ppo.obs_rms.var.numpy(),
-        obs_count=ppo.obs_rms.count,
+        obs_count=ppo.obs_rms.count.numpy()[0],
     )
     print(f"[checkpoint] {path}")
 

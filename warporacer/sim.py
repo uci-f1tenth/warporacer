@@ -79,6 +79,11 @@ def raycast(edt: wp.array2d(dtype=float), p: wp.vec2, d: wp.vec2, max_px: float)
 
 
 @wp.kernel
+def bump_kernel(tick: wp.array(dtype=wp.int32)):
+    tick[0] += 1
+
+
+@wp.kernel
 def step_kernel(
     actions: wp.array2d(dtype=float),
     cars: wp.array2d(dtype=float),  # x, y, psi, v, delta
@@ -91,6 +96,7 @@ def step_kernel(
     origin: wp.vec2,
     res: float,
     seed: int,
+    tick: wp.array(dtype=wp.int32),  # device RNG clock: keeps randomness fresh across CUDA graph replays
     obs: wp.array2d(dtype=float),
     rew: wp.array(dtype=float),
     done: wp.array(dtype=wp.int32),
@@ -143,7 +149,7 @@ def step_kernel(
 
     if crashed or steps >= MAX_STEPS:  # respawn at a random waypoint with fresh randomization
         done[i] = 1
-        rng = wp.rand_init(seed, i)
+        rng = wp.rand_init(seed, tick[0] * actions.shape[0] + i)
         wpt = wp.int32(wp.randf(rng) * float(n_cl)) % n_cl
         rpt = centerline[wpt]
         s = wp.vec4(rpt[0], rpt[1], rpt[2], 0.0)
@@ -184,8 +190,9 @@ class Env:
         self.track = track
         self.num_envs = num_envs
         self.device = wp.get_device(device)
-        self._tick = seed
+        self.seed = seed
         d = self.device
+        self.tick = wp.zeros(1, dtype=wp.int32, device=d)
 
         rng = np.random.default_rng(seed)
         idx = rng.integers(0, len(track.centerline), num_envs)
@@ -219,18 +226,18 @@ class Env:
         self.step(self.zero_actions, self.obs, self.rew, self.done)  # v=0, so cars stay put
 
     def step(self, actions, obs, rew, done):
-        self._tick += 1
         wp.launch(
             step_kernel,
             dim=self.num_envs,
             inputs=[
                 actions, self.cars, self.cars_i, self.dr, self.edt, self.lut,
                 self.centerline, self.lidar_dirs, self.origin, self.track.res,
-                (self._tick * 2654435761) & 0x7FFFFFFF,
+                self.seed, self.tick,
             ],
             outputs=[obs, rew, done],
             device=self.device,
         )
+        wp.launch(bump_kernel, dim=1, inputs=[self.tick], device=self.device)
 
     def snapshot(self):
         return [wp.clone(a) for a in (self.cars, self.cars_i, self.dr)]

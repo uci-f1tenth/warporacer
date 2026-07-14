@@ -49,11 +49,12 @@ def sample_kernel(
     mean: wp.array2d(dtype=float),
     log_std: wp.array(dtype=float),
     seed: int,
+    tick: wp.array(dtype=wp.int32),  # device RNG clock: keeps randomness fresh across CUDA graph replays
     act: wp.array2d(dtype=float),
     logp: wp.array(dtype=float),
 ):
     i = wp.tid()
-    rng = wp.rand_init(seed, i)
+    rng = wp.rand_init(seed, tick[0] * mean.shape[0] + i)
     lp = float(0.0)
     for j in range(ACT_DIM):
         ls = wp.clamp(log_std[j], LOGSTD_MIN, LOGSTD_MAX)

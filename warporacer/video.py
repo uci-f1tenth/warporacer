@@ -25,7 +25,7 @@ def record_rollout(env, agent, obs_rms, num_steps: int, out_path):
     env.step(env.zero_actions, env.obs, env.rew, env.done)  # refresh obs from current state
     with imageio.get_writer(str(out_path), fps=round(1 / DT), macro_block_size=2) as writer:
         for _ in range(num_steps):
-            obs_rms.normalize_(env.obs)
+            obs_rms.normalize(env.obs, env.obs)
             action = agent.actor(env.obs)
             env.step(action, env.obs, env.rew, env.done)
             x, y, psi = env.cars.numpy()[0, :3]
