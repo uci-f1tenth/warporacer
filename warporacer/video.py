@@ -4,6 +4,7 @@ from collections import deque
 
 import imageio.v2 as imageio
 import numpy as np
+import torch
 from cv2 import COLOR_GRAY2RGB, cvtColor, fillPoly, polylines
 
 from warporacer.sim import DT, LENGTH, WIDTH
@@ -11,6 +12,7 @@ from warporacer.sim import DT, LENGTH, WIDTH
 TRAIL_LEN = 300
 
 
+@torch.no_grad()
 def record_rollout(env, agent, obs_rms, num_steps: int, out_path):
     snap = env.snapshot()
     track = env.track
@@ -22,14 +24,13 @@ def record_rollout(env, agent, obs_rms, num_steps: int, out_path):
         cols, rows = track.world_to_px(pts[:, 0], pts[:, 1])
         return np.column_stack([cols, rows]).astype(np.int32)
 
-    env.step(env.zero_actions, env.obs, env.rew, env.done)  # refresh obs from current state
+    env._launch()  # refresh obs from current state
     with imageio.get_writer(str(out_path), fps=round(1 / DT), macro_block_size=2) as writer:
         for _ in range(num_steps):
-            obs_rms.normalize(env.obs, env.obs)
-            action = agent.actor(env.obs)
-            env.step(action, env.obs, env.rew, env.done)
-            x, y, psi = env.cars.numpy()[0, :3]
-            if env.done.numpy()[0]:
+            action = agent.actor(obs_rms.normalize(env.obs))
+            _, _, done = env.step(action)
+            x, y, psi = env.cars_t[0, :3].tolist()
+            if done[0]:
                 trail.clear()
             trail.append((x, y))
 

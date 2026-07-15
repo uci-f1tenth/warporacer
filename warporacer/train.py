@@ -4,11 +4,12 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 import wandb
 import warp as wp
 from typer import run
 
-from warporacer.agent import Agent, orthogonal_init
+from warporacer.agent import Agent
 from warporacer.ppo import PPO
 from warporacer.sim import Env
 from warporacer.track import Track
@@ -27,14 +28,16 @@ def main(
     use_wandb: bool = True,
 ):
     wp.init()
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    torch.set_float32_matmul_precision("high")  # TF32 tensor cores for the update GEMMs
     dev = wp.get_device(device or None)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     track = Track(map_yaml)
     env = Env(track, num_envs, seed=seed, device=dev)
-    agent = Agent().to(dev)
-    orthogonal_init(agent, np.random.default_rng(seed))
-    ppo = PPO(env, agent, seed=seed)
+    agent = Agent().to(env.torch_device)
+    ppo = PPO(env, agent)
 
     if use_wandb:
         try:
@@ -75,19 +78,17 @@ def main(
                     pass
     print(f"[done] {time.time() - t0:.1f}s")
 
-    save_checkpoint(agent, ppo, log_dir / "agent_final.npz")
-    record_rollout(env, agent, ppo.obs_rms, record_steps, log_dir / "rollout_final.mp4")
-
-
-def save_checkpoint(agent, ppo, path):
-    np.savez(
-        path,
-        **{f"agent/{k}": v.numpy() for k, v in agent.state_dict().items()},
-        obs_mean=ppo.obs_rms.mean.numpy(),
-        obs_var=ppo.obs_rms.var.numpy(),
-        obs_count=ppo.obs_rms.count.numpy()[0],
+    torch.save(
+        {
+            "agent": agent.state_dict(),
+            "obs_mean": ppo.obs_rms.mean.cpu(),
+            "obs_var": ppo.obs_rms.var.cpu(),
+            "obs_count": ppo.obs_rms.count,
+        },
+        log_dir / "agent_final.pt",
     )
-    print(f"[checkpoint] {path}")
+    print(f"[checkpoint] {log_dir / 'agent_final.pt'}")
+    record_rollout(env, agent, ppo.obs_rms, record_steps, log_dir / "rollout_final.mp4")
 
 
 if __name__ == "__main__":

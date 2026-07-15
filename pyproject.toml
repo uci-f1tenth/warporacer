@@ -12,8 +12,8 @@ dependencies = [
     "pyyaml>=6.0.3",
     "scikit-image>=0.26.0",
     "scipy>=1.17.1",
+    "torch>=2.11.0",
     "typer>=0.24.1",
     "wandb>=0.26.0",
     "warp-lang>=1.12.1",
-    "warp-nn>=0.1.0",
 ]

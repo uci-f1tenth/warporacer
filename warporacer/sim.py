@@ -1,6 +1,9 @@
-"""Vectorized racing sim: one Warp kernel steps physics, reward, lidar, and respawns."""
+"""Vectorized racing sim on Warp: one kernel steps physics/reward/respawn, one raycasts
+lidar. The Env speaks torch — obs/reward/done live in zero-copy torch views, and on CUDA
+the kernels launch on torch's stream so no synchronization is needed."""
 
 import numpy as np
+import torch
 import warp as wp
 
 # Car (F1TENTH)
@@ -92,11 +95,10 @@ def step_kernel(
     edt: wp.array2d(dtype=float),  # (h, w) px distance to nearest wall
     lut: wp.array2d(dtype=wp.int32),  # (h, w) nearest centerline waypoint
     centerline: wp.array(dtype=wp.vec3),  # x, y, theta
-    lidar_dirs: wp.array(dtype=wp.vec2),
     origin: wp.vec2,
     res: float,
     seed: int,
-    tick: wp.array(dtype=wp.int32),  # device RNG clock: keeps randomness fresh across CUDA graph replays
+    tick: wp.array(dtype=wp.int32),  # device RNG clock: fresh respawn randomness every step
     obs: wp.array2d(dtype=float),
     rew: wp.array(dtype=float),
     done: wp.array(dtype=wp.int32),
@@ -158,22 +160,8 @@ def step_kernel(
         dr[i, 0] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         dr[i, 1] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
 
-    # Lidar from the mount point, beams rotated into the heading frame (row axis flips y).
-    ch = wp.cos(s[2])
-    sh = wp.sin(s[2])
-    p = wp.vec2(
-        (s[0] + LIDAR_MOUNT_X * ch - origin[0]) / res,
-        wp.float32(h - 1) - (s[1] + LIDAR_MOUNT_X * sh - origin[1]) / res,
-    )
-    for j in range(NUM_LIDAR):
-        d = wp.vec2(
-            ch * lidar_dirs[j][0] - sh * lidar_dirs[j][1],
-            -(sh * lidar_dirs[j][0] + ch * lidar_dirs[j][1]),
-        )
-        obs[i, 2 + j] = raycast(edt, p, d, LIDAR_RANGE / res) * res
     obs[i, 0] = delta
     obs[i, 1] = s[3]
-
     cars[i, 0] = s[0]
     cars[i, 1] = s[1]
     cars[i, 2] = s[2]
@@ -183,13 +171,39 @@ def step_kernel(
     cars_i[i, 1] = wpt
 
 
+@wp.kernel
+def lidar_kernel(
+    cars: wp.array2d(dtype=float),
+    edt: wp.array2d(dtype=float),
+    lidar_dirs: wp.array(dtype=wp.vec2),
+    origin: wp.vec2,
+    res: float,
+    obs: wp.array2d(dtype=float),
+):
+    """One thread per (car, beam): rays from the mount point, rotated into the heading
+    frame (row axis flips y). Runs after step_kernel so respawned poses are used."""
+    i, j = wp.tid()
+    ch = wp.cos(cars[i, 2])
+    sh = wp.sin(cars[i, 2])
+    p = wp.vec2(
+        (cars[i, 0] + LIDAR_MOUNT_X * ch - origin[0]) / res,
+        wp.float32(edt.shape[0] - 1) - (cars[i, 1] + LIDAR_MOUNT_X * sh - origin[1]) / res,
+    )
+    d = wp.vec2(
+        ch * lidar_dirs[j][0] - sh * lidar_dirs[j][1],
+        -(sh * lidar_dirs[j][0] + ch * lidar_dirs[j][1]),
+    )
+    obs[i, 2 + j] = raycast(edt, p, d, LIDAR_RANGE / res) * res
+
+
 class Env:
-    """num_envs cars on one track; step() writes obs/rew/done into caller-provided buffers."""
+    """num_envs cars on one track. step(actions) -> (obs, reward, done) torch tensors."""
 
     def __init__(self, track, num_envs: int, seed: int = 0, device=None):
         self.track = track
         self.num_envs = num_envs
         self.device = wp.get_device(device)
+        self.torch_device = wp.device_to_torch(self.device)
         self.seed = seed
         d = self.device
         self.tick = wp.zeros(1, dtype=wp.int32, device=d)
@@ -218,30 +232,55 @@ class Env:
         )
         self.origin = wp.vec2(track.ox, track.oy)
 
-        # Scratch outputs, used for the initial observation and by video recording.
-        self.obs = wp.zeros((num_envs, OBS_DIM), dtype=float, device=d)
-        self.rew = wp.zeros(num_envs, dtype=float, device=d)
-        self.done = wp.zeros(num_envs, dtype=wp.int32, device=d)
-        self.zero_actions = wp.zeros((num_envs, ACT_DIM), dtype=float, device=d)
-        self.step(self.zero_actions, self.obs, self.rew, self.done)  # v=0, so cars stay put
+        self.act = wp.zeros((num_envs, ACT_DIM), dtype=float, device=d)
+        self.obs_w = wp.zeros((num_envs, OBS_DIM), dtype=float, device=d)
+        self.rew_w = wp.zeros(num_envs, dtype=float, device=d)
+        self.done_w = wp.zeros(num_envs, dtype=wp.int32, device=d)
+        # Zero-copy torch views over the warp buffers.
+        self.act_t = wp.to_torch(self.act)
+        self.obs = wp.to_torch(self.obs_w)
+        self.rew = wp.to_torch(self.rew_w)
+        self.done = wp.to_torch(self.done_w)
+        self.cars_t = wp.to_torch(self.cars)
 
-    def step(self, actions, obs, rew, done):
+        # Launch on torch's stream so torch reads warp results without syncing.
+        self.stream = (
+            wp.stream_from_torch(torch.cuda.current_stream(self.torch_device))
+            if self.device.is_cuda
+            else None
+        )
+        self._launch()  # initial observation (v=0, so cars stay put)
+
+    def _launch(self):
+        kw = {"stream": self.stream} if self.stream else {"device": self.device}
         wp.launch(
             step_kernel,
             dim=self.num_envs,
             inputs=[
-                actions, self.cars, self.cars_i, self.dr, self.edt, self.lut,
-                self.centerline, self.lidar_dirs, self.origin, self.track.res,
-                self.seed, self.tick,
+                self.act, self.cars, self.cars_i, self.dr, self.edt, self.lut,
+                self.centerline, self.origin, self.track.res, self.seed, self.tick,
             ],
-            outputs=[obs, rew, done],
-            device=self.device,
+            outputs=[self.obs_w, self.rew_w, self.done_w],
+            **kw,
         )
-        wp.launch(bump_kernel, dim=1, inputs=[self.tick], device=self.device)
+        wp.launch(
+            lidar_kernel,
+            dim=(self.num_envs, NUM_LIDAR),
+            inputs=[self.cars, self.edt, self.lidar_dirs, self.origin, self.track.res, self.obs_w],
+            **kw,
+        )
+        wp.launch(bump_kernel, dim=1, inputs=[self.tick], **kw)
+
+    def step(self, actions: torch.Tensor):
+        self.act_t.copy_(actions.detach())
+        self._launch()
+        return self.obs, self.rew, self.done
 
     def snapshot(self):
+        torch.cuda.synchronize() if self.device.is_cuda else None
         return [wp.clone(a) for a in (self.cars, self.cars_i, self.dr)]
 
     def restore(self, snap):
+        torch.cuda.synchronize() if self.device.is_cuda else None
         for dst, src in zip((self.cars, self.cars_i, self.dr), snap):
             wp.copy(dst, src)
