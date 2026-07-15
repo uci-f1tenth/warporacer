@@ -1,6 +1,7 @@
 """Vectorized racing sim on Warp: one kernel steps physics/reward/respawn, one raycasts
-lidar. The Env speaks torch — obs/reward/done live in zero-copy torch views, and on CUDA
-the kernels launch on torch's stream so no synchronization is needed."""
+lidar. Supports many tracks at once — map rasters are stacked into padded (n_maps, H, W)
+buffers and each env carries a map id. The Env speaks torch: obs/reward/done live in
+zero-copy torch views, and on CUDA the kernels launch on torch's stream."""
 
 import numpy as np
 import torch
@@ -65,15 +66,16 @@ def rk4(s: wp.vec4, delta: float, steer_v: float, accel: float, mu: float, lwb: 
 
 
 @wp.func
-def raycast(edt: wp.array2d(dtype=float), p: wp.vec2, d: wp.vec2, max_px: float) -> float:
-    """Sphere-march from pixel p along unit direction d (col, row); returns distance in px."""
+def raycast(edt: wp.array3d(dtype=float), mid: int, p: wp.vec2, d: wp.vec2, max_px: float) -> float:
+    """Sphere-march from pixel p along unit direction d (col, row); returns distance in px.
+    Padding rows/cols are zero (= wall), so rays stop at each map's true bounds."""
     dist = float(0.0)
     while dist < max_px:
         col = wp.int32(p[0])
         row = wp.int32(p[1])
-        if col < 0 or col >= edt.shape[1] or row < 0 or row >= edt.shape[0]:
+        if col < 0 or col >= edt.shape[2] or row < 0 or row >= edt.shape[1]:
             break
-        step = edt[row, col]
+        step = edt[mid, row, col]
         if step == 0.0:
             break
         p += d * step
@@ -92,11 +94,15 @@ def step_kernel(
     cars: wp.array2d(dtype=float),  # x, y, psi, v, delta
     cars_i: wp.array2d(dtype=wp.int32),  # steps, waypoint
     dr: wp.array2d(dtype=float),  # mu scale, wheelbase scale
-    edt: wp.array2d(dtype=float),  # (h, w) px distance to nearest wall
-    lut: wp.array2d(dtype=wp.int32),  # (h, w) nearest centerline waypoint
-    centerline: wp.array(dtype=wp.vec3),  # x, y, theta
-    origin: wp.vec2,
-    res: float,
+    map_id: wp.array(dtype=wp.int32),
+    edt: wp.array3d(dtype=float),  # (n_maps, H, W) px distance to nearest wall
+    lut: wp.array3d(dtype=wp.int32),  # (n_maps, H, W) nearest centerline waypoint
+    centerline: wp.array2d(dtype=wp.vec3),  # (n_maps, CL) x, y, theta (padded)
+    n_cl: wp.array(dtype=wp.int32),  # centerline length per map
+    origin: wp.array(dtype=wp.vec2),  # world origin per map
+    res: wp.array(dtype=float),  # meters/px per map
+    map_h: wp.array(dtype=wp.int32),  # unpadded rows per map
+    map_w: wp.array(dtype=wp.int32),  # unpadded cols per map
     seed: int,
     tick: wp.array(dtype=wp.int32),  # device RNG clock: fresh respawn randomness every step
     obs: wp.array2d(dtype=float),
@@ -104,6 +110,7 @@ def step_kernel(
     done: wp.array(dtype=wp.int32),
 ):
     i = wp.tid()
+    mid = map_id[i]
     s = wp.vec4(cars[i, 0], cars[i, 1], cars[i, 2], cars[i, 3])
     delta = cars[i, 4]
     mu = MU * dr[i, 0]
@@ -122,24 +129,24 @@ def step_kernel(
     delta = wp.clamp(delta, -STEER_MAX, STEER_MAX)
     s[3] = wp.clamp(s[3], V_MIN, V_MAX)
 
-    h = edt.shape[0]
-    w = edt.shape[1]
-    col = wp.clamp(wp.int32((s[0] - origin[0]) / res), 0, w - 1)
-    row = wp.clamp(wp.int32(wp.float32(h - 1) - (s[1] - origin[1]) / res), 0, h - 1)
-    clearance = edt[row, col] * res - HALF_DIAG
+    r = res[mid]
+    org = origin[mid]
+    col = wp.clamp(wp.int32((s[0] - org[0]) / r), 0, map_w[mid] - 1)
+    row = wp.clamp(wp.int32(wp.float32(map_h[mid] - 1) - (s[1] - org[1]) / r), 0, map_h[mid] - 1)
+    clearance = edt[mid, row, col] * r - HALF_DIAG
 
     # Signed centerline progress, wrapped to the shorter way around the loop.
-    n_cl = centerline.shape[0]
-    wpt = lut[row, col]
+    ncl = n_cl[mid]
+    wpt = lut[mid, row, col]
     d_wp = wpt - cars_i[i, 1]
-    if 2 * d_wp > n_cl:
-        d_wp -= n_cl
-    elif 2 * d_wp < -n_cl:
-        d_wp += n_cl
+    if 2 * d_wp > ncl:
+        d_wp -= ncl
+    elif 2 * d_wp < -ncl:
+        d_wp += ncl
 
-    cpt = centerline[wpt]
+    cpt = centerline[mid, wpt]
     v_along = s[3] * wp.cos(s[2] - cpt[2])
-    progress = float(d_wp) / float(n_cl) * PROGRESS_SCALE * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
+    progress = float(d_wp) / float(ncl) * PROGRESS_SCALE * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
     prox = wp.max((WALL_MARGIN - clearance) / WALL_MARGIN, 0.0)
     prox_pen = WALL_PROX_COEF * prox * prox * (1.0 + wp.max(s[3], 0.0) / PROGRESS_V_COEF)
     offset = wp.abs(-(s[0] - cpt[0]) * wp.sin(cpt[2]) + (s[1] - cpt[1]) * wp.cos(cpt[2]))
@@ -152,8 +159,8 @@ def step_kernel(
     if crashed or steps >= MAX_STEPS:  # respawn at a random waypoint with fresh randomization
         done[i] = 1
         rng = wp.rand_init(seed, tick[0] * actions.shape[0] + i)
-        wpt = wp.int32(wp.randf(rng) * float(n_cl)) % n_cl
-        rpt = centerline[wpt]
+        wpt = wp.int32(wp.randf(rng) * float(ncl)) % ncl
+        rpt = centerline[mid, wpt]
         s = wp.vec4(rpt[0], rpt[1], rpt[2], 0.0)
         delta = 0.0
         steps = 0
@@ -174,74 +181,66 @@ def step_kernel(
 @wp.kernel
 def lidar_kernel(
     cars: wp.array2d(dtype=float),
-    edt: wp.array2d(dtype=float),
+    map_id: wp.array(dtype=wp.int32),
+    edt: wp.array3d(dtype=float),
     lidar_dirs: wp.array(dtype=wp.vec2),
-    origin: wp.vec2,
-    res: float,
+    origin: wp.array(dtype=wp.vec2),
+    res: wp.array(dtype=float),
+    map_h: wp.array(dtype=wp.int32),
     obs: wp.array2d(dtype=float),
 ):
     """One thread per (car, beam): rays from the mount point, rotated into the heading
     frame (row axis flips y). Runs after step_kernel so respawned poses are used."""
     i, j = wp.tid()
+    mid = map_id[i]
+    r = res[mid]
+    org = origin[mid]
     ch = wp.cos(cars[i, 2])
     sh = wp.sin(cars[i, 2])
     p = wp.vec2(
-        (cars[i, 0] + LIDAR_MOUNT_X * ch - origin[0]) / res,
-        wp.float32(edt.shape[0] - 1) - (cars[i, 1] + LIDAR_MOUNT_X * sh - origin[1]) / res,
+        (cars[i, 0] + LIDAR_MOUNT_X * ch - org[0]) / r,
+        wp.float32(map_h[mid] - 1) - (cars[i, 1] + LIDAR_MOUNT_X * sh - org[1]) / r,
     )
     d = wp.vec2(
         ch * lidar_dirs[j][0] - sh * lidar_dirs[j][1],
         -(sh * lidar_dirs[j][0] + ch * lidar_dirs[j][1]),
     )
-    obs[i, 2 + j] = raycast(edt, p, d, LIDAR_RANGE / res) * res
+    obs[i, 2 + j] = raycast(edt, mid, p, d, LIDAR_RANGE / r) * r
 
 
 class Env:
-    """num_envs cars on one track. step(actions) -> (obs, reward, done) torch tensors."""
+    """num_envs cars spread across one or more tracks.
+    step(actions) -> (obs, reward, done) torch tensors; rotate() swaps the track pool."""
 
-    def __init__(self, track, num_envs: int, seed: int = 0, device=None):
-        self.track = track
+    def __init__(self, tracks, num_envs: int, seed: int = 0, device=None):
         self.num_envs = num_envs
         self.device = wp.get_device(device)
         self.torch_device = wp.device_to_torch(self.device)
         self.seed = seed
+        self._loads = 0
         d = self.device
         self.tick = wp.zeros(1, dtype=wp.int32, device=d)
 
-        rng = np.random.default_rng(seed)
-        idx = rng.integers(0, len(track.centerline), num_envs)
-        cars = np.zeros((num_envs, 5), np.float32)
-        cars[:, :2] = track.centerline[idx]
-        cars[:, 2] = track.angles[idx]
-        cars_i = np.zeros((num_envs, 2), np.int32)
-        cars_i[:, 1] = idx
-        self.cars = wp.array(cars, device=d)
-        self.cars_i = wp.array(cars_i, device=d)
-        self.dr = wp.array(
-            (1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((num_envs, 2))).astype(np.float32), device=d
-        )
-
-        self.edt = wp.array(track.edt.astype(np.float32), device=d)
-        self.lut = wp.array(track.lut, device=d)
-        self.centerline = wp.array(
-            np.column_stack([track.centerline, track.angles]).astype(np.float32), dtype=wp.vec3, device=d
-        )
-        beams = np.linspace(-LIDAR_FOV / 2, LIDAR_FOV / 2, NUM_LIDAR)
-        self.lidar_dirs = wp.array(
-            np.column_stack([np.cos(beams), np.sin(beams)]).astype(np.float32), dtype=wp.vec2, device=d
-        )
-        self.origin = wp.vec2(track.ox, track.oy)
-
+        # Persistent per-env buffers (zero-copy torch views must stay valid across rotate()).
+        self.cars = wp.zeros((num_envs, 5), dtype=float, device=d)
+        self.cars_i = wp.zeros((num_envs, 2), dtype=wp.int32, device=d)
+        self.dr = wp.zeros((num_envs, 2), dtype=float, device=d)
+        self.map_id = wp.zeros(num_envs, dtype=wp.int32, device=d)
         self.act = wp.zeros((num_envs, ACT_DIM), dtype=float, device=d)
         self.obs_w = wp.zeros((num_envs, OBS_DIM), dtype=float, device=d)
         self.rew_w = wp.zeros(num_envs, dtype=float, device=d)
         self.done_w = wp.zeros(num_envs, dtype=wp.int32, device=d)
-        # Zero-copy torch views over the warp buffers.
         self.act_t = wp.to_torch(self.act)
         self.obs = wp.to_torch(self.obs_w)
         self.rew = wp.to_torch(self.rew_w)
         self.done = wp.to_torch(self.done_w)
         self.cars_t = wp.to_torch(self.cars)
+        self.map_id_t = wp.to_torch(self.map_id)
+
+        beams = np.linspace(-LIDAR_FOV / 2, LIDAR_FOV / 2, NUM_LIDAR)
+        self.lidar_dirs = wp.array(
+            np.column_stack([np.cos(beams), np.sin(beams)]).astype(np.float32), dtype=wp.vec2, device=d
+        )
 
         # Launch on torch's stream so torch reads warp results without syncing.
         self.stream = (
@@ -249,6 +248,53 @@ class Env:
             if self.device.is_cuda
             else None
         )
+        self.rotate(tracks)
+
+    def rotate(self, tracks):
+        """Load a track pool: stack rasters into padded buffers, respawn every env."""
+        if not isinstance(tracks, (list, tuple)):
+            tracks = [tracks]
+        self.tracks = list(tracks)
+        d = self.device
+        m = len(self.tracks)
+        hmax = max(t.h for t in self.tracks)
+        wmax = max(t.w for t in self.tracks)
+        clmax = max(len(t.centerline) for t in self.tracks)
+
+        edt = np.zeros((m, hmax, wmax), np.float32)
+        lut = np.zeros((m, hmax, wmax), np.int32)
+        cl = np.zeros((m, clmax, 3), np.float32)
+        for k, t in enumerate(self.tracks):
+            edt[k, : t.h, : t.w] = t.edt
+            lut[k, : t.h, : t.w] = t.lut
+            cl[k, : len(t.centerline), :2] = t.centerline
+            cl[k, : len(t.centerline), 2] = t.angles
+        self.edt = wp.array(edt, device=d)
+        self.lut = wp.array(lut, device=d)
+        self.centerline = wp.array(cl, dtype=wp.vec3, device=d)
+        self.n_cl = wp.array([len(t.centerline) for t in self.tracks], dtype=wp.int32, device=d)
+        self.origin = wp.array([wp.vec2(t.ox, t.oy) for t in self.tracks], dtype=wp.vec2, device=d)
+        self.res = wp.array([t.res for t in self.tracks], dtype=float, device=d)
+        self.map_h = wp.array([t.h for t in self.tracks], dtype=wp.int32, device=d)
+        self.map_w = wp.array([t.w for t in self.tracks], dtype=wp.int32, device=d)
+
+        # Assign envs to maps and spawn on random waypoints (host-side; rotation is rare).
+        self._loads += 1
+        rng = np.random.default_rng(self.seed + self._loads)
+        mids = rng.integers(0, m, self.num_envs).astype(np.int32)
+        cars = np.zeros((self.num_envs, 5), np.float32)
+        cars_i = np.zeros((self.num_envs, 2), np.int32)
+        for k, t in enumerate(self.tracks):
+            mask = mids == k
+            idx = rng.integers(0, len(t.centerline), int(mask.sum()))
+            cars[mask, :2] = t.centerline[idx]
+            cars[mask, 2] = t.angles[idx]
+            cars_i[mask, 1] = idx
+        self.map_id.assign(mids)
+        self.cars.assign(cars)
+        self.cars_i.assign(cars_i)
+        self.dr.assign((1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((self.num_envs, 2))).astype(np.float32))
+        self.act_t.zero_()
         self._launch()  # initial observation (v=0, so cars stay put)
 
     def _launch(self):
@@ -257,8 +303,9 @@ class Env:
             step_kernel,
             dim=self.num_envs,
             inputs=[
-                self.act, self.cars, self.cars_i, self.dr, self.edt, self.lut,
-                self.centerline, self.origin, self.track.res, self.seed, self.tick,
+                self.act, self.cars, self.cars_i, self.dr, self.map_id, self.edt, self.lut,
+                self.centerline, self.n_cl, self.origin, self.res, self.map_h, self.map_w,
+                self.seed, self.tick,
             ],
             outputs=[self.obs_w, self.rew_w, self.done_w],
             **kw,
@@ -266,7 +313,8 @@ class Env:
         wp.launch(
             lidar_kernel,
             dim=(self.num_envs, NUM_LIDAR),
-            inputs=[self.cars, self.edt, self.lidar_dirs, self.origin, self.track.res, self.obs_w],
+            inputs=[self.cars, self.map_id, self.edt, self.lidar_dirs, self.origin, self.res,
+                    self.map_h, self.obs_w],
             **kw,
         )
         wp.launch(bump_kernel, dim=1, inputs=[self.tick], **kw)

@@ -821,6 +821,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pyglet"
+version = "2.1.15"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/26/ee/5caebffaf0345e5ccf342c30605898bd07654cee626154f7af2e465cc81c/pyglet-2.1.15.tar.gz", hash = "sha256:0ef34fe730808a97e48c24dd6ed4ff614024b980955ed8dbc2dd01ededaa08cb", size = 6597005, upload-time = "2026-06-28T11:39:09.98Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1e/a8/9a203001fa496934708baf6cadc54b62e453f1256d5d88589c71019dd751/pyglet-2.1.15-py3-none-any.whl", hash = "sha256:8709131baf5e96c496d38197ff9f9207ad06f273c9694570008b145c58bf51ae", size = 1036800, upload-time = "2026-06-28T11:39:04.717Z" },
+]
+
+[[package]]
 name = "pygments"
 version = "2.20.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1190,12 +1199,18 @@ dependencies = [
     { name = "warp-lang" },
 ]
 
+[package.optional-dependencies]
+viz = [
+    { name = "pyglet" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.37.3" },
     { name = "matplotlib", specifier = ">=3.10.9" },
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "opencv-python", specifier = ">=4.13.0.92" },
+    { name = "pyglet", marker = "extra == 'viz'", specifier = ">=2.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "scikit-image", specifier = ">=0.26.0" },
     { name = "scipy", specifier = ">=1.17.1" },
@@ -1204,3 +1219,4 @@ requires-dist = [
     { name = "wandb", specifier = ">=0.26.0" },
     { name = "warp-lang", specifier = ">=1.12.1" },
 ]
+provides-extras = ["viz"]

@@ -15,7 +15,7 @@ TRAIL_LEN = 300
 @torch.no_grad()
 def record_rollout(env, agent, obs_rms, num_steps: int, out_path):
     snap = env.snapshot()
-    track = env.track
+    track = env.tracks[int(env.map_id_t[0])]  # render env 0 on its current map
     corners = np.array([[-LENGTH, -WIDTH], [LENGTH, -WIDTH], [LENGTH, WIDTH], [-LENGTH, WIDTH]]) / 2.0
     trail = deque(maxlen=TRAIL_LEN)
     out_path.parent.mkdir(parents=True, exist_ok=True)

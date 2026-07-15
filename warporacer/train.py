@@ -1,6 +1,7 @@
-"""CLI: PPO-train a racing agent on a track image."""
+"""CLI: PPO-train a racing agent on one track image or a directory of them."""
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -16,8 +17,32 @@ from warporacer.track import Track
 from warporacer.video import record_rollout
 
 
+_track_cache = {}
+
+
+def load_tracks(paths, k, rng):
+    """Sample up to k maps and build Tracks concurrently (skeletonization is CPU-heavy),
+    caching by path so later rotations are cheap. Unloadable maps are skipped."""
+    chosen = list(rng.choice(paths, size=min(k, len(paths)), replace=False))
+
+    def build(p):
+        if p not in _track_cache:
+            try:
+                _track_cache[p] = Track(p)
+            except Exception as e:
+                print(f"[maps] skipping {p.name}: {e}")
+                _track_cache[p] = None
+        return _track_cache[p]
+
+    with ThreadPoolExecutor() as pool:
+        tracks = [t for t in pool.map(build, chosen) if t is not None]
+    if not tracks:
+        raise RuntimeError("no loadable maps in sample")
+    return tracks
+
+
 def main(
-    map_yaml: Path,
+    maps: Path,
     num_envs: int = 4096,
     iterations: int = 2000,
     seed: int = 0,
@@ -25,6 +50,11 @@ def main(
     device: str = "",
     record_every: int = 100,
     record_steps: int = 1800,
+    max_active_maps: int = 8,
+    switch_map_iter: int = 0,
+    compile: bool = True,
+    live_viewer: bool = False,
+    interactive: bool = False,
     use_wandb: bool = True,
 ):
     wp.init()
@@ -34,17 +64,34 @@ def main(
     dev = wp.get_device(device or None)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    track = Track(map_yaml)
-    env = Env(track, num_envs, seed=seed, device=dev)
+    map_paths = sorted(maps.glob("*.yaml")) if maps.is_dir() else [maps]
+    if not map_paths:
+        raise FileNotFoundError(f"no map yamls under {maps}")
+    rng = np.random.default_rng(seed)
+
+    if interactive:
+        env = Env(load_tracks(map_paths, 1, rng), 1, seed=seed, device=dev)
+        from warporacer.viewer import Viewer
+
+        Viewer(env).interactive()
+        return
+
+    env = Env(load_tracks(map_paths, max_active_maps, rng), num_envs, seed=seed, device=dev)
+    env.viewer = None
+    if live_viewer:
+        from warporacer.viewer import Viewer
+
+        env.viewer = Viewer(env)
     agent = Agent().to(env.torch_device)
-    ppo = PPO(env, agent)
+    ppo = PPO(env, agent, compile=compile and dev.is_cuda)
 
     if use_wandb:
         try:
             wandb.init(
                 project="warporacer",
                 name=f"seed{seed}_n{num_envs}",
-                config={"num_envs": num_envs, "iterations": iterations, "seed": seed, "map": str(map_yaml)},
+                config={"num_envs": num_envs, "iterations": iterations, "seed": seed,
+                        "maps": str(maps), "switch_map_iter": switch_map_iter},
             )
         except Exception as e:
             print(f"[wandb] init failed: {e}")
@@ -61,7 +108,7 @@ def main(
             pass
         if it % 10 == 0:
             print(
-                f"[it {it:4d}] step={ppo.global_step:>9d} sps={log['sps']:>6d} "
+                f"[it {it:4d}] step={ppo.global_step:>9d} sps={log['sps']:>7d} "
                 f"ret={log.get('ep_return', float('nan')):8.2f} kl={log['approx_kl']:.4f} "
                 f"lr={log['lr']:.2e}{' KL-STOP' if log['kl_stop'] else ''}"
             )
@@ -76,6 +123,11 @@ def main(
                     wandb.log({"rollout": wandb.Video(str(out), format="mp4")}, step=ppo.global_step)
                 except Exception:
                     pass
+        if switch_map_iter > 0 and (it + 1) % switch_map_iter == 0 and len(map_paths) > 1:
+            env.rotate(load_tracks(map_paths, max_active_maps, rng))
+            ppo.reset_env_stats()
+            if env.viewer is not None:
+                env.viewer.reset()
     print(f"[done] {time.time() - t0:.1f}s")
 
     torch.save(

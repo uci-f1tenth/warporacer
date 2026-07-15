@@ -17,3 +17,6 @@ dependencies = [
     "wandb>=0.26.0",
     "warp-lang>=1.12.1",
 ]
+
+[project.optional-dependencies]
+viz = ["pyglet>=2.0"]
