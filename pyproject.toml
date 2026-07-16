@@ -9,6 +9,7 @@ dependencies = [
     "matplotlib>=3.10.9",
     "numpy>=2.4.4",
     "opencv-python>=4.13.0.92",
+    "opencv-contrib-python>=4.13.0",
     "pyyaml>=6.0.3",
     "scikit-image>=0.26.0",
     "scipy>=1.17.1",
@@ -16,7 +17,27 @@ dependencies = [
     "typer>=0.24.1",
     "wandb>=0.26.0",
     "warp-lang>=1.12.1",
+
+    # Platform-specific Triton rules:
+    "triton-windows>=3.7.0.post26; sys_platform == 'win32'",
+    "triton; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
 viz = ["pyglet>=2.0"]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform == 'macos'" },
+  { index = "pytorch-cu132", marker = "sys_platform != 'macos'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
