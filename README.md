@@ -2,7 +2,7 @@
 
 GPU-parallel autonomous racing RL: the sim is [NVIDIA Warp](https://github.com/NVIDIA/warp) kernels, the
 learning is PyTorch. Give it a ROS-style track image and it PPO-trains a lidar-driven racing policy at
-~4M env-steps/s at 4k envs (~5M at 16k) on a single GPU.
+~7M env-steps/s at 8k envs (~10M at 16k) on a single GPU.
 
 ```bash
 uv run python main.py maps/my_map.yaml            # train on one track (wandb on by default)
@@ -26,7 +26,8 @@ uv run python viz_centerline.py maps/my_map.yaml  # debug centerline extraction
 | `warporacer/train.py` | CLI, logging, checkpoints (`.pt`) |
 
 The env writes obs/reward/done into warp buffers that torch reads zero-copy; on CUDA the kernels launch on
-torch's stream, so there are no cross-framework syncs. The policy and loss steps are torch.compile'd into
-CUDA graphs, Adam runs fused, and the hot loops never block on the host (episode stats stream to pinned
+torch's stream, so there are no cross-framework syncs. The policy, bookkeeping, and loss are
+torch.compile'd, the update GEMMs run in bf16 under autocast, Adam runs fused, and the hot loops
+never block on the host (episode stats stream to pinned
 memory once per iteration). Values are computed in one batched pass after the rollout. State per car is
 `(x, y, psi, v, delta)`; per-episode domain randomization jitters friction and wheelbase by ±15%.
