@@ -43,7 +43,7 @@ def load_tracks(paths, k, rng):
 
 def main(
     maps: Path,
-    num_envs: int = 4096,
+    num_envs: int = 8192,
     iterations: int = 2000,
     seed: int = 0,
     log_dir: Path = Path("logs"),
@@ -135,7 +135,7 @@ def main(
             "agent": agent.state_dict(),
             "obs_mean": ppo.obs_rms.mean.cpu(),
             "obs_var": ppo.obs_rms.var.cpu(),
-            "obs_count": ppo.obs_rms.count,
+            "obs_count": float(ppo.obs_rms.count),
         },
         log_dir / "agent_final.pt",
     )
