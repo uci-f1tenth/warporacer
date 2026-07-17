@@ -3,6 +3,8 @@ lidar. Supports many tracks at once — map rasters are stacked into padded (n_m
 buffers and each env carries a map id. The Env speaks torch: obs/reward/done live in
 zero-copy torch views, and on CUDA the kernels launch on torch's stream."""
 
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import torch
 import warp as wp
@@ -265,6 +267,10 @@ class Env:
         self.num_envs = num_envs
         self.device = wp.get_device(device)
         self.torch_device = wp.device_to_torch(self.device)
+        # Without CUDA, run the torch side (policy + PPO) on Apple's GPU; the sim stays
+        # on CPU warp and step() bridges the two.
+        if not self.device.is_cuda and torch.backends.mps.is_available():
+            self.torch_device = "mps"
         self.seed = seed
         self._loads = 0
         d = self.device
@@ -280,9 +286,15 @@ class Env:
         self.rew_w = wp.zeros(num_envs, dtype=float, device=d)
         self.done_w = wp.zeros(num_envs, dtype=wp.int32, device=d)
         self.act_t = wp.to_torch(self.act)
-        self.obs = wp.to_torch(self.obs_w)
-        self.rew = wp.to_torch(self.rew_w)
-        self.done = wp.to_torch(self.done_w)
+        self._obs_v = wp.to_torch(self.obs_w)
+        self._rew_v = wp.to_torch(self.rew_w)
+        self._done_v = wp.to_torch(self.done_w)
+        # Public obs/rew/done live on torch_device: zero-copy aliases of the warp buffers
+        # unless torch runs on a different device (mps), then persistent copies.
+        self._xfer = self.torch_device != wp.device_to_torch(self.device)
+        self.obs = self._obs_v.to(self.torch_device) if self._xfer else self._obs_v
+        self.rew = self._rew_v.to(self.torch_device) if self._xfer else self._rew_v
+        self.done = self._done_v.to(self.torch_device) if self._xfer else self._done_v
         self.cars_t = wp.to_torch(self.cars)
         self.map_id_t = wp.to_torch(self.map_id)
 
@@ -297,6 +309,17 @@ class Env:
             if self.device.is_cuda
             else None
         )
+        # Warp CPU kernels are single-threaded, so shard envs across a thread pool (the
+        # kernel call releases the GIL). torch's thread default tracks the physical/
+        # performance core count, which is also the sweet spot here. CUDA launches the
+        # full range in one shard.
+        if self.device.is_cuda:
+            self._bounds = [0, num_envs]
+            self._pool = None
+        else:
+            n = max(1, min(torch.get_num_threads(), num_envs))
+            self._bounds = np.linspace(0, num_envs, n + 1).astype(int).tolist()
+            self._pool = ThreadPoolExecutor(n)
         self.rotate(tracks)
 
     def rotate(self, tracks):
@@ -351,33 +374,56 @@ class Env:
         self.cars.assign(cars)
         self.cars_i.assign(cars_i)
         self.dr.assign((1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((self.num_envs, 2))).astype(np.float32))
+        # Record per-shard step+lidar launches once (pre-packed args replay much cheaper
+        # than re-slicing and re-packing every step); recording here also serially loads
+        # the module, which isn't thread-safe to do lazily from the pool. Per-shard seed
+        # offset keeps respawn RNG streams distinct; CUDA (one shard) uses the texture
+        # lidar kernel.
+        cuda = self.device.is_cuda
+        kw = {"device": d, "record_cmd": True} | ({"block_dim": 128} if cuda else {})
+        self._launches = []
+        for k in range(len(self._bounds) - 1):
+            s, e = self._bounds[k], self._bounds[k + 1]
+            self._launches.append((
+                wp.launch(
+                    step_kernel,
+                    dim=e - s,
+                    inputs=[
+                        self.act[s:e], self.cars[s:e], self.cars_i[s:e], self.dr[s:e],
+                        self.map_id[s:e], self.edt, self.lut, self.centerline, self.n_cl,
+                        self.origin, self.res, self.map_h, self.map_w, self.seed + s, self.tick,
+                    ],
+                    outputs=[self.obs_w[s:e], self.rew_w[s:e], self.done_w[s:e]],
+                    **kw,
+                ),
+                wp.launch(
+                    lidar_tex_kernel if cuda else lidar_kernel,
+                    dim=(e - s, NUM_LIDAR),
+                    inputs=[self.cars[s:e], self.map_id[s:e], self.edt_tex if cuda else self.edt,
+                            self.lidar_dirs, self.origin, self.res, self.map_h, self.obs_w[s:e]],
+                    **kw,
+                ),
+            ))
+        self._bump = wp.launch(bump_kernel, dim=1, inputs=[self.tick], **kw)
+
         self.act_t.zero_()
         self._launch()  # initial observation (v=0, so cars stay put)
 
+    def _shard(self, k):
+        step, lidar = self._launches[k]
+        step.launch(stream=self.stream)
+        lidar.launch(stream=self.stream)
+
     def _launch(self):
-        cuda = self.device.is_cuda
-        kw = {"stream": self.stream} if self.stream else {"device": self.device}
-        if cuda:
-            kw["block_dim"] = 128
-        wp.launch(
-            step_kernel,
-            dim=self.num_envs,
-            inputs=[
-                self.act, self.cars, self.cars_i, self.dr, self.map_id, self.edt, self.lut,
-                self.centerline, self.n_cl, self.origin, self.res, self.map_h, self.map_w,
-                self.seed, self.tick,
-            ],
-            outputs=[self.obs_w, self.rew_w, self.done_w],
-            **kw,
-        )
-        wp.launch(
-            lidar_tex_kernel if cuda else lidar_kernel,
-            dim=(self.num_envs, NUM_LIDAR),
-            inputs=[self.cars, self.map_id, self.edt_tex if cuda else self.edt,
-                    self.lidar_dirs, self.origin, self.res, self.map_h, self.obs_w],
-            **kw,
-        )
-        wp.launch(bump_kernel, dim=1, inputs=[self.tick], **kw)
+        if self._pool is None:
+            self._shard(0)
+        else:
+            list(self._pool.map(self._shard, range(len(self._launches))))
+        self._bump.launch(stream=self.stream)
+        if self._xfer:
+            self.obs.copy_(self._obs_v)
+            self.rew.copy_(self._rew_v)
+            self.done.copy_(self._done_v)
 
     def step(self, actions: torch.Tensor):
         self.act_t.copy_(actions.detach())

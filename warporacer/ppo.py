@@ -2,10 +2,11 @@
 
 Throughput notes: the policy sample and post-step bookkeeping are torch.compile'd, so no
 eager torch ops sit between warp launches in the rollout. The minibatch update is a
-torch.compile'd loss with autograd and a fused Adam; the GEMMs run in bf16 under autocast
-(fp32 master weights, ~2x tensor-core rate). The only blocking reads are the per-epoch KL
-check and the per-iteration log scalars; episode stats are recorded into GPU ring buffers
-and shipped to pinned host memory once per iteration.
+torch.compile'd loss with autograd and a fused Adam; the GEMMs run in bf16 (fp16 on
+pre-bf16 GPUs) under autocast (fp32 master weights, ~2x tensor-core rate). The only
+blocking reads are the per-epoch KL check and the per-iteration log scalars; episode
+stats are recorded into GPU ring buffers and shipped to pinned host memory once per
+iteration.
 
 The env self-resets on done, so the observation after a done step is the fresh spawn of a
 new episode — the value bootstrap is zeroed there in GAE."""
@@ -93,8 +94,20 @@ class PPO:
         self.batch_size = T * N
         dev = torch.device(env.torch_device)
         self.cuda = dev.type == "cuda"
+        # Autocast the loss GEMMs on any GPU: bf16 where the hardware runs it natively
+        # (Ampere+), else fp16 (T4 5x over its emulated-bf16 fallback, mps 1.8x over
+        # fp32). fp16 only gives up exponent range vs bf16, which this normalized/
+        # clipped loss never needs. Masters stay fp32 either way; no grad scaler.
+        self.amp_dev = dev.type
+        self.amp = dev.type != "cpu"
+        self.amp_dtype = (
+            torch.bfloat16
+            if self.cuda and torch.cuda.is_bf16_supported(including_emulation=False)
+            else torch.float16
+        )
         self.lr = lr
-        self.opt = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5, fused=self.cuda)
+        self.opt = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5,
+                                    fused=dev.type in ("cuda", "mps"))
 
         # Rollout buffers; obs_ext row T holds the bootstrap observation so the value
         # pass runs over all T+1 rows without a cat.
@@ -177,8 +190,8 @@ class PPO:
         self.obs.copy_(self.obs_rms.normalize(raw))
 
     def _loss_fn(self, o, a, logp_old, adv, ret, v_old):
-        """Clipped-surrogate PPO loss; GEMMs in bf16 under autocast (fp32 masters)."""
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.cuda):
+        """Clipped-surrogate PPO loss; GEMMs in bf16/fp16 under autocast (fp32 masters)."""
+        with torch.autocast(self.amp_dev, dtype=self.amp_dtype, enabled=self.amp):
             mean = self.agent.actor(o)
             ls = self.agent.log_std.clamp(LOGSTD_MIN, LOGSTD_MAX)
             z = (a - mean.float()) / ls.exp()
@@ -209,10 +222,11 @@ class PPO:
             if viewer is not None and t % 10 == 0:
                 viewer.render()
 
-        # Ship episode stats host-side in the background; read after the update.
-        self.fin_cpu.copy_(self.fin_hist, non_blocking=True)
-        self.ret_cpu.copy_(self.ret_hist, non_blocking=True)
-        self.len_cpu.copy_(self.len_hist, non_blocking=True)
+        # Ship episode stats host-side in the background (async only on CUDA, where the
+        # event below fences the read); elsewhere the copies block, which is cheap.
+        self.fin_cpu.copy_(self.fin_hist, non_blocking=self.cuda)
+        self.ret_cpu.copy_(self.ret_hist, non_blocking=self.cuda)
+        self.len_cpu.copy_(self.len_hist, non_blocking=self.cuda)
         if self.copy_done is not None:
             self.copy_done.record()
 
