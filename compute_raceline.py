@@ -3,10 +3,11 @@ import casadi as ca
 import pandas as pd
 from pathlib import Path
 from scipy.signal import savgol_filter
+from scipy.ndimage import minimum_filter1d
 
 try:
     from main import Map
-except ImportError as e:
+except ImportError:
     print("Error: Could not import 'Map' from 'main.py'. Ensure main.py is in the same directory.")
     raise SystemExit(1)
 
@@ -53,8 +54,8 @@ def _apply_kinematic_limits(v_target: np.ndarray, ds: float, a_accel: float = 2.
 
 
 def _numpy_curvature_energy(x: np.ndarray, y: np.ndarray) -> float:
-    """Plain-numpy version of the true curvature expression, for sanity checks
-    against forced/perturbed alpha values (no CasADi graph involved)."""
+    """Plain-numpy version of the true dot-product curvature expression, 
+    for sanity checks against forced/perturbed alpha values."""
     # Wrap exactly 1 point to get exactly N segments, matching the CasADi logic
     x_ext = np.concatenate((x, [x[0]]))
     y_ext = np.concatenate((y, [y[0]]))
@@ -69,9 +70,9 @@ def _numpy_curvature_energy(x: np.ndarray, y: np.ndarray) -> float:
     ty_next = np.roll(ty, -1)
     ds_next = np.roll(ds, -1)
     
-    sin_dtheta = tx * ty_next - ty * tx_next
-    kappa = sin_dtheta / (0.5 * (ds + ds_next))
-    return float(np.sum(kappa**2))
+    cos_dtheta = tx * tx_next + ty * ty_next
+    ds_avg = 0.5 * (ds + ds_next)
+    return float(np.sum((1.0 - cos_dtheta) / ds_avg))
 
 
 # Optimizes centerline of a track to find optimal raceline by solving for minimum curvature
@@ -111,10 +112,16 @@ def compute_raceline(
 
     dist_to_wall = track_map.dt[row, col] * res
 
-    # Pad by 0.2m (approx half car width + safety margin) to avoid clipping walls
-    max_shifts = np.clip(dist_to_wall - 0.2, 0.01, None)
+    # --- CONSERVATIVE BOUNDARY SMOOTHING ---
+    # Raw pixel lookups cause discontinuous jumps in the track boundary (especially near pit lanes/spurs).
+    # We apply a rolling minimum to guarantee safety, then smooth it to prevent hard constraint kinks.
+    safe_dist = minimum_filter1d(dist_to_wall, size=9, mode='wrap')
+    smoothed_dist = savgol_filter(safe_dist, window_length=window, polyorder=3)
 
-    # normals perpendicular to centerline (periodic, matches curvature computation)
+    # Pad by 0.2m (approx half car width + safety margin) to avoid clipping walls
+    max_shifts = np.clip(smoothed_dist - 0.2, 0.01, None)
+
+    # normals perpendicular to centerline
     dx = _periodic_first_derivative(centerline[:, 0])
     dy = _periodic_first_derivative(centerline[:, 1])
     ddx_c = _periodic_second_derivative(centerline[:, 0])
@@ -163,7 +170,17 @@ def compute_raceline(
     dx_path = ca.diff(x_ext)
     dy_path = ca.diff(y_ext)
 
+    ds_path = ca.sqrt(dx_path**2 + dy_path**2 + 1e-8)
     ds_nominal = np.linalg.norm(centerline[1] - centerline[0])
+
+    # --- DYNAMIC SPACING & ANTI-SWALLOWTAIL CONSTRAINTS ---
+    # 1. Prevent points from squeezing to 0 (which happens when normals cross at sharp hairpins)
+    opti.subject_to(ds_path >= 0.2 * ds_nominal)
+    # 2. Prevent points from stretching excessively to game the denominator
+    opti.subject_to(ds_path <= 3.0 * ds_nominal)
+    
+    # 3. Penalize uneven point spacing (acts like an elastic band distributing points evenly)
+    spacing_cost = ca.sumsqr(ca.diff(ca.vertcat(ds_path, ds_path[0])))
 
     # --- FORWARD PROGRESS CONSTRAINT (Anti-180 Kink Exploit) ---
     c_x_ext = np.concatenate([centerline[:, 0], [centerline[0, 0]]])
@@ -174,9 +191,9 @@ def compute_raceline(
     forward_progress = dx_path * c_dx + dy_path * c_dy
     opti.subject_to(forward_progress >= 0.1 * (ds_nominal**2))
     
-    # --- TRUE CURVATURE (Scale-Independent) ---
-    ds_path = ca.sqrt(dx_path**2 + dy_path**2 + 1e-8)
-    
+    # --- DOT-PRODUCT CURVATURE (Scale-Independent & Kink-Proof) ---
+    # By using 1 - cos(theta) instead of the cross product, a 180-degree kink 
+    # results in cos(180) = -1, yielding a massive penalty (2.0 / ds), making the exploit impossible.
     tx = dx_path / ds_path
     ty = dy_path / ds_path
     
@@ -184,30 +201,31 @@ def compute_raceline(
     ty_next = ca.vertcat(ty[1:], ty[0])
     ds_next = ca.vertcat(ds_path[1:], ds_path[0])
     
-    sin_dtheta = tx * ty_next - ty * tx_next
-    true_kappa = sin_dtheta / (0.5 * (ds_path + ds_next))
+    cos_dtheta = tx * tx_next + ty * ty_next
+    ds_avg = 0.5 * (ds_path + ds_next)
     
-    curvature_energy = ca.sumsqr(true_kappa)
+    curvature_energy = ca.sum1((1.0 - cos_dtheta) / ds_avg)
 
     # 2. STEERING SMOOTHNESS REGULARIZATION
     d_alpha = ca.diff(ca.vertcat(alpha, alpha[0]))
     dd_alpha = ca.diff(ca.vertcat(d_alpha, d_alpha[0]))
 
-    w_steer = 0.1   # Stops high frequency changes
-    w_jerk = 0.1    # Acts as a shock absorber
+    w_spacing = 0.1  # Enforces uniform point distribution
+    w_steer = 0.1    # Stops high frequency changes
+    w_jerk = 0.1     # Acts as a shock absorber
     w_center = 0.001 # Fixes singular Hessians on perfectly straight sections
 
     steering_cost = (w_steer * ca.sumsqr(d_alpha) + 
                      w_jerk * ca.sumsqr(dd_alpha) + 
                      w_center * ca.sumsqr(alpha))
 
-    opti.minimize(curvature_energy + steering_cost)
+    opti.minimize(curvature_energy + steering_cost + w_spacing * spacing_cost)
 
     # track boundary offset
     opti.subject_to(opti.bounded(min_alpha, alpha, max_alpha))
 
     # solve
-    opti.solver('ipopt', {'expand': True}, {'max_iter': 1000, 'print_level': 0, 'acceptable_tol': 1e-4})
+    opti.solver('ipopt', {'expand': True}, {'max_iter': 1000, 'print_level': 0, 'acceptable_tol': 1e-3})
     
     is_success = True
     try:
@@ -243,10 +261,10 @@ def compute_raceline(
         worst_idx = int(np.argmax(np.abs(kappa_c)))
         
         alpha_forced = opt_alpha.copy()
-        window = max(5, N // 20)
+        window_size = max(5, N // 20)
         indices = np.arange(N)
         dist = np.minimum(np.abs(indices - worst_idx), N - np.abs(indices - worst_idx))
-        bump = np.exp(-0.5 * (dist / (window / 3.0))**2)
+        bump = np.exp(-0.5 * (dist / (window_size / 3.0))**2)
         
         target_alpha = max_alpha if kappa_c[worst_idx] > 0 else min_alpha
         alpha_forced += bump * (target_alpha - opt_alpha) * 0.8
