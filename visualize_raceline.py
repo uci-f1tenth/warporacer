@@ -5,6 +5,10 @@ from pathlib import Path
 from typer import run
 from yaml import safe_load
 
+# Import Map to extract the original geometric centerline
+from main import Map
+
+
 def visualize_raceline(map_yaml: str):
     path = Path(map_yaml)
     
@@ -31,24 +35,44 @@ def visualize_raceline(map_yaml: str):
     y = df['y'].values
     v_target = df['v_target'].values
 
+    # 2b. Load the original centerline for comparison
+    try:
+        track_map = Map(path, force_geometric=True)
+        centerline = track_map.centerline
+    except Exception as e:
+        print(f"Failed to load centerline via Map: {e}")
+        return
+
     # 3. Convert World Coordinates (meters) to Pixel Coordinates
     # Matches the w2p transform logic used in your Warp environment
     px = (x - ox) / res
     py = h - 1 - (y - oy) / res
+    
+    # Convert centerline to pixel coordinates
+    cpx = (centerline[:, 0] - ox) / res
+    cpy = h - 1 - (centerline[:, 1] - oy) / res
 
     # 4. Plotting
-    plt.figure(figsize=(6, 6), dpi=50)
+    # Size the figure dynamically relative to the image dimensions to prevent downsampling
+    dpi = 100
+    plt.figure(figsize=(w / dpi, h / dpi), dpi=dpi)
     
     # Display the track as a dark background
     plt.imshow(track_img, cmap='gray')
     
+    # Plot the original centerline in cyan underneath the raceline
+    plt.plot(cpx, cpy, '-', color='cyan', linewidth=1, alpha=0.6, zorder=1, label='Original Centerline')
+
     # Scatter the raceline points, colored by target velocity
-    scatter = plt.scatter(px, py, c=v_target, cmap='turbo', s=10, zorder=2)
+    scatter = plt.scatter(px, py, c=v_target, cmap='turbo', s=6, zorder=2, label='Optimized Raceline')
     
     # Add a colorbar and labels
     cbar = plt.colorbar(scatter, fraction=0.046, pad=0.04)
     cbar.set_label('Target Velocity (m/s)', rotation=270, labelpad=15)
     
+    # Show legend
+    plt.legend(loc='upper right', fontsize=8)
+
     plt.title(f"Optimal Raceline & Velocity Profile: {path.stem.upper()}")
     plt.axis('off')
     
@@ -59,6 +83,7 @@ def visualize_raceline(map_yaml: str):
     
     # Display in the notebook/UI
     plt.show()
+
 
 if __name__ == "__main__":
     run(visualize_raceline)

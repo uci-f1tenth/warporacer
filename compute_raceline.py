@@ -2,90 +2,89 @@ import numpy as np
 import casadi as ca
 import pandas as pd
 from pathlib import Path
-from scipy.signal import savgol_filter
-from scipy.interpolate import interp1d
-from typer import run
 from main import Map
+
 g = 9.81
 
-def resample_centerline(centerline, step_distance=0.4):
-    """Downsamples path to a uniform spatial distance to keep N < 1500."""
-    diffs = np.diff(centerline, axis=0)
-    segment_lengths = np.linalg.norm(diffs, axis=1)
-    cum_dist = np.insert(np.cumsum(segment_lengths), 0, 0)
-    
-    total_dist = cum_dist[-1]
-    num_points = int(total_dist / step_distance)
-    
-    uniform_dist = np.linspace(0, total_dist, num_points)
-    interp_x = interp1d(cum_dist, centerline[:, 0], kind='cubic')(uniform_dist)
-    interp_y = interp1d(cum_dist, centerline[:, 1], kind='cubic')(uniform_dist)
-    
-    return np.column_stack((interp_x, interp_y))
+
+def _resample_uniform_arclength(centerline: np.ndarray, n_points: int) -> np.ndarray:
+    """Resample a closed polyline to n_points evenly spaced by arc length."""
+    closed = np.vstack([centerline, centerline[:1]])
+    seg_len = np.linalg.norm(np.diff(closed, axis=0), axis=1)
+    s = np.concatenate(([0.0], np.cumsum(seg_len)))[:-1]
+    total_len = s[-1] + seg_len[-1]
+
+    s_uniform = np.linspace(0.0, total_len, n_points, endpoint=False)
+    x_new = np.interp(s_uniform, s, centerline[:, 0], period=total_len)
+    y_new = np.interp(s_uniform, s, centerline[:, 1], period=total_len)
+    return np.column_stack((x_new, y_new))
 
 
-def compute_velocity_profile(opt_x, opt_y, mu, g, max_speed, a_accel, a_decel):
-    """Generates a physical velocity profile respecting braking and acceleration limits."""
-    dx = np.diff(opt_x, prepend=opt_x[-1])
-    dy = np.diff(opt_y, prepend=opt_y[-1])
-    ds = np.sqrt(dx**2 + dy**2)
-    
-    # Base curvature limit (Lateral friction)
-    opt_dx = np.gradient(opt_x)
-    opt_dy = np.gradient(opt_y)
-    opt_ddx = np.gradient(opt_dx)
-    opt_ddy = np.gradient(opt_dy)
-    
-    kappa = np.abs(opt_dx * opt_ddy - opt_dy * opt_ddx) / np.maximum((opt_dx**2 + opt_dy**2)**1.5, 1e-6)
-    v_target = np.minimum(np.sqrt(mu * g / np.maximum(kappa, 1e-6)), max_speed)
-    
+def _periodic_first_derivative(arr: np.ndarray) -> np.ndarray:
+    """Centered first difference that wraps around a closed loop."""
+    return (np.roll(arr, -1) - np.roll(arr, 1)) / 2.0
+
+
+def _periodic_second_derivative(arr: np.ndarray) -> np.ndarray:
+    """Centered second difference that wraps around a closed loop."""
+    return np.roll(arr, -1) - 2.0 * arr + np.roll(arr, 1)
+
+
+def _apply_kinematic_limits(v_target: np.ndarray, ds: float, a_accel: float = 2.0, a_decel: float = 4.0) -> np.ndarray:
+    """Applies forward/backward sweeps to ensure velocity transitions are physically possible."""
     N = len(v_target)
-    
-    # apply braking and acceleration limits using a backward and forward pass
-    # backward pass (braking)
     for _ in range(2): 
         for i in range(N - 2, -1, -1):
-            max_entry_spd = np.sqrt(v_target[i+1]**2 + 2 * a_decel * ds[i+1])
-            v_target[i] = min(v_target[i], max_entry_spd)
-        max_entry_spd = np.sqrt(v_target[0]**2 + 2 * a_decel * ds[0])
-        v_target[-1] = min(v_target[-1], max_entry_spd)
-
-    # forward Pass (accel)
+            v_target[i] = min(v_target[i], np.sqrt(v_target[i+1]**2 + 2 * a_decel * ds))
+        v_target[-1] = min(v_target[-1], np.sqrt(v_target[0]**2 + 2 * a_decel * ds))
+        
     for _ in range(2):
         for i in range(N - 1):
-            max_exit_spd = np.sqrt(v_target[i]**2 + 2 * a_accel * ds[i+1])
-            v_target[i+1] = min(v_target[i+1], max_exit_spd)
-        max_exit_spd = np.sqrt(v_target[-1]**2 + 2 * a_accel * ds[0])
-        v_target[0] = min(v_target[0], max_exit_spd)
+            v_target[i+1] = min(v_target[i+1], np.sqrt(v_target[i]**2 + 2 * a_accel * ds))
+        v_target[0] = min(v_target[0], np.sqrt(v_target[-1]**2 + 2 * a_accel * ds))
         
     return v_target
 
 
-def compute_raceline(map_yaml: str, width: float = 1.0, mu: float = 1.0489, max_speed: float = 5.0, a_accel: float = 2.0, a_decel: float = 4.0):
+# Optimizes centerline of a track to find optimal raceline by solving for minimum curvature
+def compute_raceline(
+    map_yaml: str,
+    mu: float = 1.0489,
+    v_cap: float = 5.0,
+    output_dir: str = "racelines",
+):
     path = Path(map_yaml)
-    
     track_map = Map(path, force_geometric=True)
-    raw_centerline = track_map.centerline
+    centerline = track_map.centerline
 
-    # downscale
-    # centerline = resample_centerline(raw_centerline, step_distance=0.4)
-    centerline = raw_centerline
-    
-    # smoothing filter
-    window = min(21, len(centerline) - (len(centerline) % 2 == 0))
-    centerline[:, 0] = savgol_filter(centerline[:, 0], window_length=window, polyorder=3)
-    centerline[:, 1] = savgol_filter(centerline[:, 1], window_length=window, polyorder=3)
+    # some loaders return the closing point duplicated
+    if np.allclose(centerline[0], centerline[-1]):
+        centerline = centerline[:-1]
 
     N = len(centerline)
+    centerline = _resample_uniform_arclength(centerline, N)
 
-    dx = np.gradient(centerline[:, 0])
-    dy = np.gradient(centerline[:, 1])
-    normals = np.column_stack((-dy, dx))
+    # 1. DYNAMIC TRACK WIDTH CALCULATION
+    # Extract exact distance to the wall for every point using the map's distance transform
+    h, w = track_map.raw.shape
+    res = track_map.res
+    ox, oy = track_map.ox, track_map.oy
     
-    norms = np.linalg.norm(normals, axis=1)
-    norms[norms == 0] = 1e-6
-    normals /= norms[:, np.newaxis]
+    col = np.clip(np.int32((centerline[:, 0] - ox) / res), 0, w - 1)
+    row = np.clip(np.int32(h - 1 - (centerline[:, 1] - oy) / res), 0, h - 1)
+    
+    dist_to_wall = track_map.dt[row, col] * res
+    
+    # Pad by 0.2m (approx half car width + safety margin) to avoid clipping walls
+    max_shifts = np.clip(dist_to_wall - 0.2, 0.01, None)
 
+    # normals perpendicular to centerline
+    dx = _periodic_first_derivative(centerline[:, 0])
+    dy = _periodic_first_derivative(centerline[:, 1])
+    normals = np.column_stack((-dy, dx))
+    normals /= np.linalg.norm(normals, axis=1)[:, np.newaxis]
+
+    # casadi optimization setup
     opti = ca.Opti()
     alpha = opti.variable(N)
     
@@ -94,70 +93,73 @@ def compute_raceline(map_yaml: str, width: float = 1.0, mu: float = 1.0489, max_
     x = centerline[:, 0] + alpha * normals[:, 0]
     y = centerline[:, 1] + alpha * normals[:, 1]
 
-    # curvature
-    x_wrap = ca.vertcat(x, x[0])
-    y_wrap = ca.vertcat(y, y[0])
-    dx_c = ca.diff(x_wrap)
-    dy_c = ca.diff(y_wrap)
-    ds = ca.sqrt(dx_c**2 + dy_c**2) + 1e-4
-    
-    dx_next = ca.vertcat(dx_c[1:], dx_c[0])
-    dy_next = ca.vertcat(dy_c[1:], dy_c[0])
-    ds_next = ca.vertcat(ds[1:], ds[0])
-    
-    tx, ty = dx_c / ds, dy_c / ds
-    tx_next, ty_next = dx_next / ds_next, dy_next / ds_next
-    sin_dtheta = tx * ty_next - ty * tx_next
-    kappa = sin_dtheta / (0.5 * (ds + ds_next))
+    # differentiation to compute curvature of centerline, wrapped around the seam
+    x_ext = ca.vertcat(x[-1], x, x[0])
+    y_ext = ca.vertcat(y[-1], y, y[0])
+    dx_path = ca.diff(x_ext)
+    dy_path = ca.diff(y_ext)
+    ddx_path = ca.diff(dx_path)
+    ddy_path = ca.diff(dy_path)
 
+    ds = np.linalg.norm(centerline[1] - centerline[0])
+    
+    # Pure curvature optimization (widest possible arcs for max speed)
+    bending_energy = (ca.sumsqr(ddx_path) + ca.sumsqr(ddy_path)) / (ds**4)
+    
+    # 2. STEERING SMOOTHNESS REGULARIZATION
+    # Prevents wobbling on straights without pulling the line tight into apexes
     d_alpha = ca.diff(ca.vertcat(alpha, alpha[0]))
-    dd_alpha = ca.diff(ca.vertcat(d_alpha, d_alpha[0]))
-    
-    w_smooth = 0.2   # smoothness weight
-    w_jerk = 0.2     # oscillation penalize weight
-    w_center = 0.001 # pull straights toward centerline weight
+    steering_cost = ca.sumsqr(d_alpha)
 
-    opti.minimize(ca.sumsqr(kappa) + w_smooth * ca.sumsqr(d_alpha) + w_jerk * ca.sumsqr(dd_alpha) + w_center * ca.sumsqr(alpha))
+    w_steer = 0.1   # Stops wobbling on straights
+    opti.minimize(bending_energy + w_steer * steering_cost)
 
-    # distance from wall
-    safety_margin = 0.05
-    max_shift = width - safety_margin
-    opti.subject_to(opti.bounded(-max_shift, alpha, max_shift))
-    
-    # Close the loop
-    opti.subject_to(alpha[0] == alpha[-1])
+    # track boundary offset
+    opti.subject_to(opti.bounded(-max_shifts, alpha, max_shifts))
 
-    # optimize line
-    p_opts = {"expand": True}
-    s_opts = {"max_iter": 1000, "print_level": 0, "acceptable_tol": 1e-3, "tol": 1e-4}
-    opti.solver('ipopt', p_opts, s_opts)
-    
+    # solve
+    opti.solver('ipopt', {'expand': True}, {'max_iter': 1000, 'print_level': 0, 'acceptable_tol': 1e-4})
     try:
         sol = opti.solve()
-        opt_alpha = sol.value(alpha)
-    except Exception as e:
-        print(f"Optimization failed: {e}")
-        opt_alpha = np.zeros(N)
+    except RuntimeError as e:
+        print(f"IPOPT failed to converge: {e}")
+        print(f"Last alpha values before failure: {opti.debug.value(alpha)}")
+        raise
+
+    opt_alpha = sol.value(alpha)
+    print(f"Optimization complete! Alpha shifted by max {opt_alpha.max():.3f}m, min {opt_alpha.min():.3f}m")
 
     opt_x = centerline[:, 0] + opt_alpha * normals[:, 0]
     opt_y = centerline[:, 1] + opt_alpha * normals[:, 1]
 
-    # max velocity profile
-    v_max = compute_velocity_profile(opt_x, opt_y, mu, g, max_speed, a_accel, a_decel)
+    # max velocity calculation based on curvature
+    opt_dx = _periodic_first_derivative(opt_x)
+    opt_dy = _periodic_first_derivative(opt_y)
+    opt_ddx = _periodic_second_derivative(opt_x)
+    opt_ddy = _periodic_second_derivative(opt_y)
 
-    output_dir = Path("racelines")
-    output_dir.mkdir(exist_ok=True)
-    output_file = output_dir / f"{path.stem}_raceline.csv"
+    kappa = np.abs(opt_dx * opt_ddy - opt_dy * opt_ddx) / np.maximum((opt_dx**2 + opt_dy**2)**(1.5), 1e-6)
+    radius = 1.0 / np.maximum(kappa, 1e-6)
+
+    v_max = np.sqrt(mu * g * radius)
+    v_max = np.clip(v_max, 0, v_cap)
     
+    # 3. KINEMATIC SWEEP
+    v_max = _apply_kinematic_limits(v_max, ds, a_accel=2.0, a_decel=4.0)
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_file = out_dir / f"{path.stem}_raceline.csv"
+
     df = pd.DataFrame({
         'x': opt_x,
         'y': opt_y,
         'v_target': v_max,
     })
-    
     df.to_csv(output_file, index=False)
     print(f"Optimal raceline saved to '{output_file}'.")
 
 
+from typer import run
 if __name__ == "__main__":
     run(compute_raceline)
