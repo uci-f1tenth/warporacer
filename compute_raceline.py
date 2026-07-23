@@ -3,12 +3,12 @@ import casadi as ca
 import pandas as pd
 from pathlib import Path
 from scipy.signal import savgol_filter
-from scipy.interpolate import interp1d
 
 try:
     from main import Map
-except ImportError:
-    print("Warning: Could not import 'Map' from 'main.py'. Ensure main.py is in the same directory.")
+except ImportError as e:
+    print("Error: Could not import 'Map' from 'main.py'. Ensure main.py is in the same directory.")
+    raise SystemExit(1)
 
 g = 9.81
 
@@ -39,11 +39,11 @@ def _periodic_second_derivative(arr: np.ndarray) -> np.ndarray:
 def _apply_kinematic_limits(v_target: np.ndarray, ds: float, a_accel: float = 2.0, a_decel: float = 4.0) -> np.ndarray:
     """Applies forward/backward sweeps to ensure velocity transitions are physically possible."""
     N = len(v_target)
-    for _ in range(2): 
+    for _ in range(2):
         for i in range(N - 2, -1, -1):
             v_target[i] = min(v_target[i], np.sqrt(v_target[i+1]**2 + 2 * a_decel * ds))
         v_target[-1] = min(v_target[-1], np.sqrt(v_target[0]**2 + 2 * a_decel * ds))
-        
+
     for _ in range(2):
         for i in range(N - 1):
             v_target[i+1] = min(v_target[i+1], np.sqrt(v_target[i]**2 + 2 * a_accel * ds))
@@ -53,12 +53,15 @@ def _apply_kinematic_limits(v_target: np.ndarray, ds: float, a_accel: float = 2.
 
 
 def _numpy_curvature_energy(x: np.ndarray, y: np.ndarray) -> float:
-    """Plain-numpy version of the true curvature expression, for sanity checks."""
-    x_ext = np.concatenate(([x[-1]], x, [x[0]]))
-    y_ext = np.concatenate(([y[-1]], y, [y[0]]))
+    """Plain-numpy version of the true curvature expression, for sanity checks
+    against forced/perturbed alpha values (no CasADi graph involved)."""
+    # Wrap exactly 1 point to get exactly N segments, matching the CasADi logic
+    x_ext = np.concatenate((x, [x[0]]))
+    y_ext = np.concatenate((y, [y[0]]))
     dx = np.diff(x_ext)
     dy = np.diff(y_ext)
-    ds = np.sqrt(dx**2 + dy**2) + 1e-5
+    
+    ds = np.sqrt(dx**2 + dy**2 + 1e-8)
     tx = dx / ds
     ty = dy / ds
     
@@ -74,8 +77,9 @@ def _numpy_curvature_energy(x: np.ndarray, y: np.ndarray) -> float:
 # Optimizes centerline of a track to find optimal raceline by solving for minimum curvature
 def compute_raceline(
     map_yaml: str,
+    width: float = 0.8,
     mu: float = 1.0489,
-    v_cap: float = 5.0,
+    v_cap: float = 10.0,
     output_dir: str = "racelines",
     debug: bool = True,
 ):
@@ -90,31 +94,27 @@ def compute_raceline(
     N = len(centerline)
     centerline = _resample_uniform_arclength(centerline, N)
 
-    # Pre-smooth jagged grid noise to prevent normal vectors from crossing
+    # --- PRE-SMOOTHING STEP ---
+    # Smooth the uniform centerline BEFORE computing normals.
+    # Removes pixel-aliasing artifacts that cause normal vectors to cross.
     window = min(21, len(centerline) - (len(centerline) % 2 == 0))
     centerline[:, 0] = savgol_filter(centerline[:, 0], window_length=window, polyorder=3)
     centerline[:, 1] = savgol_filter(centerline[:, 1], window_length=window, polyorder=3)
 
     # 1. DYNAMIC TRACK WIDTH CALCULATION
-    # Extract exact distance to the wall for every point using the map's distance transform
     h, w = track_map.raw.shape
     res = track_map.res
     ox, oy = track_map.ox, track_map.oy
-    
+
     col = np.clip(np.int32((centerline[:, 0] - ox) / res), 0, w - 1)
     row = np.clip(np.int32(h - 1 - (centerline[:, 1] - oy) / res), 0, h - 1)
-    
+
     dist_to_wall = track_map.dt[row, col] * res
-    
+
     # Pad by 0.2m (approx half car width + safety margin) to avoid clipping walls
     max_shifts = np.clip(dist_to_wall - 0.2, 0.01, None)
 
-    if debug:
-        print("\n--- [DEBUG] track width / bounds ---")
-        print(f"dist_to_wall: min={dist_to_wall.min():.4f} max={dist_to_wall.max():.4f} mean={dist_to_wall.mean():.4f}")
-        print(f"max_shifts:   min={max_shifts.min():.4f} max={max_shifts.max():.4f}")
-
-    # normals perpendicular to centerline
+    # normals perpendicular to centerline (periodic, matches curvature computation)
     dx = _periodic_first_derivative(centerline[:, 0])
     dy = _periodic_first_derivative(centerline[:, 1])
     ddx_c = _periodic_second_derivative(centerline[:, 0])
@@ -122,24 +122,59 @@ def compute_raceline(
     normals = np.column_stack((-dy, dx))
     normals /= np.linalg.norm(normals, axis=1)[:, np.newaxis]
 
+    # --- GEOMETRIC SINGULARITY BOUNDS (Swallowtail Prevention) ---
+    # If alpha > local radius of curvature (R_c), the offset curve loops backwards 
+    # causing a swallowtail singularity. We cap the shift to prevent this.
+    kappa_c = (dx * ddy_c - dy * ddx_c) / np.maximum((dx**2 + dy**2)**1.5, 1e-6)
+    R_c = 1.0 / (np.abs(kappa_c) + 1e-6)
+    
+    max_alpha = max_shifts.copy()
+    min_alpha = -max_shifts.copy()
+    
+    # Cap shifts at 80% of the local radius of curvature
+    safe_R = R_c * 0.8
+    left_mask = kappa_c > 0  # Turning left, center of curvature is on the inside
+    max_alpha[left_mask] = np.minimum(max_alpha[left_mask], safe_R[left_mask])
+    
+    right_mask = kappa_c < 0 # Turning right
+    min_alpha[right_mask] = np.maximum(min_alpha[right_mask], -safe_R[right_mask])
+
+    if debug:
+        print("\n--- [DEBUG] track width / bounds ---")
+        print(f"dist_to_wall: min={dist_to_wall.min():.4f} max={dist_to_wall.max():.4f} mean={dist_to_wall.mean():.4f}")
+        print(f"alpha_bounds: min={min_alpha.min():.4f} max={max_alpha.max():.4f}")
+        
+        angles = np.arctan2(normals[:, 1], normals[:, 0])
+        dangles = np.abs(np.diff(np.unwrap(angles)))
+        print(f"max angle jump between adjacent normals: {dangles.max():.4f} rad")
+
     # casadi optimization setup
     opti = ca.Opti()
     alpha = opti.variable(N)
-    
+
     opti.set_initial(alpha, np.zeros(N))
 
     x = centerline[:, 0] + alpha * normals[:, 0]
     y = centerline[:, 1] + alpha * normals[:, 1]
 
-    # differentiation to compute curvature of centerline, wrapped around the seam
-    x_ext = ca.vertcat(x[-1], x, x[0])
-    y_ext = ca.vertcat(y[-1], y, y[0])
+    # Exactly N segments (no double-seam weighting)
+    x_ext = ca.vertcat(x, x[0])
+    y_ext = ca.vertcat(y, y[0])
     dx_path = ca.diff(x_ext)
     dy_path = ca.diff(y_ext)
+
+    ds_nominal = np.linalg.norm(centerline[1] - centerline[0])
+
+    # --- FORWARD PROGRESS CONSTRAINT (Anti-180 Kink Exploit) ---
+    c_x_ext = np.concatenate([centerline[:, 0], [centerline[0, 0]]])
+    c_y_ext = np.concatenate([centerline[:, 1], [centerline[0, 1]]])
+    c_dx = np.diff(c_x_ext)
+    c_dy = np.diff(c_y_ext)
+    
+    forward_progress = dx_path * c_dx + dy_path * c_dy
+    opti.subject_to(forward_progress >= 0.1 * (ds_nominal**2))
     
     # --- TRUE CURVATURE (Scale-Independent) ---
-    # Rewards wide arcs instead of punishing path stretching
-    # FIX: Epsilon must be INSIDE the square root to prevent NaN gradients (derivative of sqrt(0) is NaN)
     ds_path = ca.sqrt(dx_path**2 + dy_path**2 + 1e-8)
     
     tx = dx_path / ds_path
@@ -158,44 +193,36 @@ def compute_raceline(
     d_alpha = ca.diff(ca.vertcat(alpha, alpha[0]))
     dd_alpha = ca.diff(ca.vertcat(d_alpha, d_alpha[0]))
 
-    w_jerk = 0.1    # Acts as a shock absorber to prevent straight-line wobble
+    w_steer = 0.1   # Stops high frequency changes
+    w_jerk = 0.1    # Acts as a shock absorber
     w_center = 0.001 # Fixes singular Hessians on perfectly straight sections
 
-    steering_cost = (w_jerk * ca.sumsqr(dd_alpha) + w_center * ca.sumsqr(alpha))
+    steering_cost = (w_steer * ca.sumsqr(d_alpha) + 
+                     w_jerk * ca.sumsqr(dd_alpha) + 
+                     w_center * ca.sumsqr(alpha))
 
     opti.minimize(curvature_energy + steering_cost)
 
     # track boundary offset
-    opti.subject_to(opti.bounded(-max_shifts, alpha, max_shifts))
-
-    # close the loop
-    opti.subject_to(alpha[0] == alpha[-1])
+    opti.subject_to(opti.bounded(min_alpha, alpha, max_alpha))
 
     # solve
-    p_opts = {"expand": True}
-    s_opts = {
-        "max_iter": 2000,
-        "print_level": 0,
-        "tol": 1e-3,
-        "acceptable_tol": 1e-2,
-        "acceptable_iter": 10
-    }
-    opti.solver('ipopt', p_opts, s_opts)
+    opti.solver('ipopt', {'expand': True}, {'max_iter': 1000, 'print_level': 0, 'acceptable_tol': 1e-4})
     
+    is_success = True
     try:
         sol = opti.solve()
         opt_alpha = sol.value(alpha)
-        is_success = True
-    except Exception as e:
+    except RuntimeError as e:
         print(f"\nIPOPT stopped early: {e}")
-        print("Harvesting best-effort solution (usually perfectly valid)...")
+        print("Harvesting best-effort solution (may be suboptimal)...")
         opt_alpha = opti.debug.value(alpha)
         is_success = False
 
     if debug:
         print("\n--- [DEBUG] solver result ---")
         print(f"alpha range: {opt_alpha.min():.4f} to {opt_alpha.max():.4f}")
-        print(f"bound range: -{max_shifts.min():.4f} to {max_shifts.max():.4f}")
+        print(f"bound range: {min_alpha.min():.4f} to {max_alpha.max():.4f}")
         
         if is_success:
             print(f"iterations: {sol.stats()['iter_count']}  status: {sol.stats()['return_status']}")
@@ -203,34 +230,40 @@ def compute_raceline(
             ce_solved = sol.value(curvature_energy)
             sc_solved = sol.value(steering_cost)
         else:
-            print("Status: Maximum_Iterations_Exceeded (Harvested early)")
+            print("Status: Harvested early (Partial Solution)")
             ce_zero = opti.debug.value(ca.substitute(curvature_energy, alpha, np.zeros(N)))
             ce_solved = opti.debug.value(curvature_energy)
             sc_solved = opti.debug.value(steering_cost)
 
         print(f"curvature_energy at alpha=0:      {ce_zero:.4f}")
         print(f"curvature_energy at solved alpha: {ce_solved:.4f}")
-        print(f"steering_cost (weighted) at solved alpha: {sc_solved:.4f}")
+        print(f"steering_cost (weighted) at solved: {sc_solved:.4f}")
 
-        # curvature of the ORIGINAL centerline (numpy, periodic) -> find the tightest corner
-        kappa_center = np.abs(dx * ddy_c - dy * ddx_c) / np.maximum((dx**2 + dy**2) ** 1.5, 1e-6)
-        worst_idx = int(np.argmax(kappa_center))
-        print("\n--- [DEBUG] tightest corner vs. solved alpha there ---")
-        print(f"worst curvature at index {worst_idx}: kappa={kappa_center[worst_idx]:.4f}")
-        print(f"alpha there: {opt_alpha[worst_idx]:.4f}  (bound: +-{max_shifts[worst_idx]:.4f})")
-
-        # manual perturbation test: forcibly push alpha toward the bound at the worst corner
+        # Smooth Gaussian Perturbation Test
+        worst_idx = int(np.argmax(np.abs(kappa_c)))
+        
         alpha_forced = opt_alpha.copy()
-        alpha_forced[worst_idx] = max_shifts[worst_idx] * 0.8
+        window = max(5, N // 20)
+        indices = np.arange(N)
+        dist = np.minimum(np.abs(indices - worst_idx), N - np.abs(indices - worst_idx))
+        bump = np.exp(-0.5 * (dist / (window / 3.0))**2)
+        
+        target_alpha = max_alpha if kappa_c[worst_idx] > 0 else min_alpha
+        alpha_forced += bump * (target_alpha - opt_alpha) * 0.8
+        alpha_forced = np.clip(alpha_forced, min_alpha, max_alpha)
+        
         x_forced = centerline[:, 0] + alpha_forced * normals[:, 0]
         y_forced = centerline[:, 1] + alpha_forced * normals[:, 1]
         ce_forced = _numpy_curvature_energy(x_forced, y_forced)
-        print(f"\ncurvature_energy at solved alpha:               {ce_solved:.4f}")
-        print(f"curvature_energy with worst-corner alpha forced to 80% of bound: {ce_forced:.4f}")
+        
+        print(f"\n--- [DEBUG] Gaussian Perturbation Test ---")
+        print(f"Tightest geometric corner at index {worst_idx} (kappa={kappa_c[worst_idx]:.4f})")
+        print(f"curvature_energy at solved alpha:          {ce_solved:.4f}")
+        print(f"curvature_energy with Gaussian bump pushed: {ce_forced:.4f}")
         if ce_forced < ce_solved:
-            print(">> forcing a bigger apex shift LOWERS the objective -> solver left improvement on the table. Investigate the CasADi formulation.")
+            print(">> The smooth bump LOWERED the objective -> Solver is trapped in a local minimum!")
         else:
-            print(">> forcing a bigger apex shift RAISES the objective -> the small solved alpha appears genuinely optimal for this cost function.")
+            print(">> The smooth bump RAISED the objective -> The solved path is genuinely optimal here.")
         print("--- [END DEBUG] ---\n")
 
     opt_x = centerline[:, 0] + opt_alpha * normals[:, 0]
@@ -249,12 +282,14 @@ def compute_raceline(
     v_max = np.clip(v_max, 0, v_cap)
     
     # 3. KINEMATIC SWEEP
-    ds_nominal = np.linalg.norm(centerline[1] - centerline[0])
     v_max = _apply_kinematic_limits(v_max, ds_nominal, a_accel=2.0, a_decel=4.0)
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    output_file = out_dir / f"{path.stem}_raceline.csv"
+    
+    # Flag filename if solver didn't fully converge
+    suffix = "" if is_success else "_PARTIAL"
+    output_file = out_dir / f"{path.stem}_raceline{suffix}.csv"
 
     df = pd.DataFrame({
         'x': opt_x,
