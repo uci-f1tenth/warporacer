@@ -62,7 +62,7 @@ def visualize_raceline(map_yaml: str):
     
     # Plot the original centerline in cyan underneath the raceline
     plt.plot(cpx, cpy, '-', color='cyan', linewidth=1, alpha=0.6, zorder=1, label='Original Centerline')
-
+    
     # Scatter the raceline points, colored by target velocity
     scatter = plt.scatter(px, py, c=v_target, cmap='turbo', s=6, zorder=2, label='Optimized Raceline')
     
