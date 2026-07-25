@@ -28,8 +28,8 @@ viz = ["pyglet>=2.0"]
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cpu", marker = "sys_platform == 'macos'" },
-  { index = "pytorch-cu132", marker = "sys_platform != 'macos'" },
+  { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" }, # Actual macOS name
+  { index = "pytorch-cu132", marker = "sys_platform != 'darwin'" },
 ]
 
 [[tool.uv.index]]
