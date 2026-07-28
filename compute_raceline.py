@@ -78,7 +78,6 @@ def _numpy_curvature_energy(x: np.ndarray, y: np.ndarray) -> float:
 # Optimizes centerline of a track to find optimal raceline by solving for minimum curvature
 def compute_raceline(
     map_yaml: str,
-    width: float = 0.8,
     mu: float = 1.0489,
     v_cap: float = 10.0,
     output_dir: str = "racelines",
@@ -95,14 +94,13 @@ def compute_raceline(
     N = len(centerline)
     centerline = _resample_uniform_arclength(centerline, N)
 
-    # --- PRE-SMOOTHING STEP ---
     # Smooth the uniform centerline BEFORE computing normals.
     # Removes pixel-aliasing artifacts that cause normal vectors to cross.
-    window = min(21, len(centerline) - (len(centerline) % 2 == 0))
+    window = min(21, len(centerline) - (len(centerline) % 2 == 0))          
     centerline[:, 0] = savgol_filter(centerline[:, 0], window_length=window, polyorder=3)
     centerline[:, 1] = savgol_filter(centerline[:, 1], window_length=window, polyorder=3)
 
-    # 1. DYNAMIC TRACK WIDTH CALCULATION
+    # DYNAMIC TRACK WIDTH CALCULATION
     h, w = track_map.raw.shape
     res = track_map.res
     ox, oy = track_map.ox, track_map.oy
@@ -118,7 +116,6 @@ def compute_raceline(
     safe_dist = minimum_filter1d(dist_to_wall, size=9, mode='wrap')
     smoothed_dist = savgol_filter(safe_dist, window_length=window, polyorder=3)
 
-    # Pad by 0.2m (approx half car width + safety margin) to avoid clipping walls
     max_shifts = np.clip(smoothed_dist - 0.2, 0.01, None)
 
     # normals perpendicular to centerline
@@ -182,7 +179,7 @@ def compute_raceline(
     # 3. Penalize uneven point spacing (acts like an elastic band distributing points evenly)
     spacing_cost = ca.sumsqr(ca.diff(ca.vertcat(ds_path, ds_path[0])))
 
-    # --- FORWARD PROGRESS CONSTRAINT (Anti-180 Kink Exploit) ---
+    # forces the line to go fowards (180 turn technically is no curvature)
     c_x_ext = np.concatenate([centerline[:, 0], [centerline[0, 0]]])
     c_y_ext = np.concatenate([centerline[:, 1], [centerline[0, 1]]])
     c_dx = np.diff(c_x_ext)
@@ -210,14 +207,14 @@ def compute_raceline(
     d_alpha = ca.diff(ca.vertcat(alpha, alpha[0]))
     dd_alpha = ca.diff(ca.vertcat(d_alpha, d_alpha[0]))
 
-    w_spacing = 0.1  # Enforces uniform point distribution
-    w_steer = 0.1    # Stops high frequency changes
-    w_jerk = 0.1     # Acts as a shock absorber
-    w_center = 0.001 # Fixes singular Hessians on perfectly straight sections
+    w_spacing = 0.1  # Penalizes uneven point spacing to prevent clustering and gaps
+    w_steer = 0.1    # Penalizes steering angle changes (2nd derivative) to prevent oscillations
+    w_jerk = 0.1     # Penalizes Jerk (3rd derivative) to prevent oscillations
+    w_center = 0.001 # Penalizes deviation from centerline
 
     steering_cost = (w_steer * ca.sumsqr(d_alpha) + 
                      w_jerk * ca.sumsqr(dd_alpha) + 
-                     w_center * ca.sumsqr(alpha))
+                     w_center * ca.sumsqr(alpha))       # cost = dx + dy + ddx + ddy + alpha^2
 
     opti.minimize(curvature_energy + steering_cost + w_spacing * spacing_cost)
 
@@ -239,8 +236,8 @@ def compute_raceline(
 
     if debug:
         print("\n--- [DEBUG] solver result ---")
-        print(f"alpha range: {opt_alpha.min():.4f} to {opt_alpha.max():.4f}")
-        print(f"bound range: {min_alpha.min():.4f} to {max_alpha.max():.4f}")
+        print(f"alpha range: {opt_alpha.min():.4f} to {opt_alpha.max():.4f}")       # check these values to make sure that IPOPT is indeed
+        print(f"bound range: {min_alpha.min():.4f} to {max_alpha.max():.4f}")       # taking advantage of the allowed track width
         
         if is_success:
             print(f"iterations: {sol.stats()['iter_count']}  status: {sol.stats()['return_status']}")
@@ -296,7 +293,7 @@ def compute_raceline(
     kappa = np.abs(opt_dx * opt_ddy - opt_dy * opt_ddx) / np.maximum((opt_dx**2 + opt_dy**2)**(1.5), 1e-6)
     radius = 1.0 / np.maximum(kappa, 1e-6)
 
-    v_max = np.sqrt(mu * g * radius)
+    v_max = np.sqrt(mu * g * radius)        # v=sqrt(mu * g * R)
     v_max = np.clip(v_max, 0, v_cap)
     
     # 3. KINEMATIC SWEEP
